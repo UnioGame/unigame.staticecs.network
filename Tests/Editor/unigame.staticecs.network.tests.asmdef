@@ -1,0 +1,19 @@
+{
+  "name": "unigame.staticecs.network.tests",
+  "rootNamespace": "UniGame.StaticEcs.Network.Tests",
+  "references": [
+    "unigame.staticecs.network.protocol",
+    "unigame.staticecs.network",
+    "FFS.StaticEcs"
+  ],
+  "includePlatforms": ["Editor"],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "optionalUnityReferences": ["TestAssemblies"],
+  "noEngineReferences": false
+}

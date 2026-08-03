@@ -1,0 +1,13 @@
+{
+  "name": "com.unigame.staticecs.network",
+  "author": "UniGame",
+  "displayName": "UniGame Static ECS Network",
+  "description": "Deterministic transport-neutral network protocol and replication contracts for Static ECS",
+  "unity": "2023.2",
+  "version": "2026.0.1",
+  "license": "MIT",
+  "keywords": ["unigame", "ecs", "network", "replication"],
+  "dependencies": {
+    "com.unigame.staticecs": "2026.0.1"
+  }
+}
