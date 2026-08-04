@@ -41,30 +41,42 @@ namespace UniGame.StaticEcs.Network
         private readonly byte[] _bytes;
 
         /// <summary>Creates an immutable snapshot from exact canonical bytes.</summary>
-        public NetworkSnapshot(uint tick, byte[] bytes, int entities, int records)
+        public NetworkSnapshot(uint tick, SchemaFingerprint fingerprint, ScopeId scope, byte[] bytes, int entities, int records)
         {
             ServerTick = tick;
+            SchemaFingerprint = fingerprint;
+            Scope = scope;
             _bytes = bytes == null ? throw new ArgumentNullException(nameof(bytes)) : (byte[])bytes.Clone();
+            PayloadHash = Hashing.XxHash64(_bytes);
             EntityCount = entities;
             RecordCount = records;
         }
         /// <summary>Gets authoritative simulation time.</summary>
         public uint ServerTick { get; }
+        /// <summary>Gets the schema fingerprint that produced the snapshot.</summary>
+        public SchemaFingerprint SchemaFingerprint { get; }
+        /// <summary>Gets the replication scope.</summary>
+        public ScopeId Scope { get; }
+        /// <summary>Gets xxHash64 of the canonical bytes.</summary>
+        public ulong PayloadHash { get; }
         /// <summary>Gets immutable canonical bytes.</summary>
         public ReadOnlyMemory<byte> Bytes => _bytes;
         /// <summary>Gets the entity count.</summary>
         public int EntityCount { get; }
         /// <summary>Gets the record count.</summary>
         public int RecordCount { get; }
+        /// <summary>Gets exact retained byte length.</summary>
+        public int ByteLength => _bytes.Length;
         internal byte[] ExactBytes => _bytes;
     }
 
     /// <summary>Contains a fully validated snapshot; applying it is the first ECS mutation.</summary>
     public sealed class StagedNetworkSnapshot
     {
-        internal StagedNetworkSnapshot(uint tick, StagedEntity[] entities) { ServerTick = tick; Entities = entities; }
+        internal StagedNetworkSnapshot(NetworkSnapshot snapshot, StagedEntity[] entities) { Snapshot = snapshot; Entities = entities; }
         /// <summary>Gets authoritative simulation time.</summary>
-        public uint ServerTick { get; }
+        public uint ServerTick => Snapshot.ServerTick;
+        internal NetworkSnapshot Snapshot { get; }
         internal StagedEntity[] Entities { get; }
     }
 
@@ -87,13 +99,26 @@ namespace UniGame.StaticEcs.Network
     public sealed class NetworkReplicator<TWorld> where TWorld : struct, IWorldType
     {
         private readonly NetworkSchema<TWorld> _schema;
-        private readonly HashSet<EntityGID> _replicas = new HashSet<EntityGID>();
+        private readonly Dictionary<EntityGID, NetworkTypeId> _replicas = new Dictionary<EntityGID, NetworkTypeId>();
 
         /// <summary>Creates a replicator for one generated schema.</summary>
-        public NetworkReplicator(NetworkSchema<TWorld> schema) => _schema = schema ?? throw new ArgumentNullException(nameof(schema));
+        public NetworkReplicator(NetworkSchema<TWorld> schema, ScopeId scope = default, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024)
+        {
+            _schema = schema ?? throw new ArgumentNullException(nameof(schema));
+            Scope = scope;
+            History = new NetworkHistory<NetworkSnapshot>(historyTicks, historyBytes, value => value.ByteLength);
+        }
+        /// <summary>Gets the isolated replication scope.</summary>
+        public ScopeId Scope { get; }
+        /// <summary>Gets bounded snapshots successfully applied by this client.</summary>
+        public NetworkHistory<NetworkSnapshot> History { get; }
 
         /// <summary>Captures all authority entities marked with NetworkTag into an immutable full snapshot.</summary>
         public SnapshotCaptureResult Capture(uint serverTick, out NetworkSnapshot snapshot)
+            => Capture(serverTick, Scope, out snapshot);
+
+        /// <summary>Captures authority entities for an explicit server replication scope.</summary>
+        public SnapshotCaptureResult Capture(uint serverTick, ScopeId scope, out NetworkSnapshot snapshot)
         {
             snapshot = null;
             if (World<TWorld>.Status != WorldStatus.Initialized || !World<TWorld>.IsTagTypeRegistered<NetworkTag>()) return SnapshotCaptureResult.WorldUnavailable;
@@ -135,7 +160,7 @@ namespace UniGame.StaticEcs.Network
                         writer.Write(entry.TypeId.Value);
                         writer.Write((byte)entry.Kind);
                         writer.Write(entry.Version);
-                        writer.Write(false);
+                        writer.Write(invoker.IsDisabled(entity));
                         writer.Write(payload.Length);
                         writer.Write(payload);
                         records++;
@@ -144,7 +169,7 @@ namespace UniGame.StaticEcs.Network
             }
             catch { return SnapshotCaptureResult.HookFailed; }
             if (stream.Length > ProtocolLimits.MaxDecodedPayloadBytes) return SnapshotCaptureResult.LimitExceeded;
-            snapshot = new NetworkSnapshot(serverTick, stream.ToArray(), entities.Count, records);
+            snapshot = new NetworkSnapshot(serverTick, _schema.Fingerprint, scope, stream.ToArray(), entities.Count, records);
             return SnapshotCaptureResult.Success;
         }
 
@@ -153,6 +178,8 @@ namespace UniGame.StaticEcs.Network
         {
             staged = null;
             if (snapshot == null || snapshot.ExactBytes.Length > ProtocolLimits.MaxDecodedPayloadBytes) return SnapshotApplyResult.LimitExceeded;
+            if (snapshot.SchemaFingerprint != _schema.Fingerprint || snapshot.Scope != Scope) return SnapshotApplyResult.SchemaMismatch;
+            if (Hashing.XxHash64(snapshot.ExactBytes) != snapshot.PayloadHash) return SnapshotApplyResult.Malformed;
             try
             {
                 using var stream = new MemoryStream(snapshot.ExactBytes, false);
@@ -172,28 +199,35 @@ namespace UniGame.StaticEcs.Network
                     var recordCount = reader.ReadUInt16();
                     if (recordCount > ProtocolLimits.MaxRecordsPerEntity) return SnapshotApplyResult.LimitExceeded;
                     var records = new StagedRecord[recordCount];
-                    NetworkTypeId previousType = default;
+                    NetworkSchemaEntry previousEntry = null;
                     for (var j = 0; j < recordCount; j++)
                     {
                         var id = ReadTypeId(reader);
-                        if (j > 0 && previousType.CompareTo(id) >= 0) return SnapshotApplyResult.Malformed;
-                        previousType = id;
                         var wireKind = (NetworkSchemaKind)reader.ReadByte();
                         var version = reader.ReadByte();
                         var recordDisabled = reader.ReadBoolean();
                         var length = reader.ReadInt32();
                         if (length < 0 || length > ProtocolLimits.MaxComponentBytes || stream.Length - stream.Position < length) return SnapshotApplyResult.LimitExceeded;
                         if (!_schema.TryGet(id, out var entry) || entry.Kind != wireKind || entry.Version != version || length > entry.MaxBytes || entry.Invoker is not IRecordNetworkInvoker<TWorld>) return SnapshotApplyResult.SchemaMismatch;
+                        if (previousEntry != null && Compare(previousEntry, entry) >= 0) return SnapshotApplyResult.Malformed;
+                        previousEntry = entry;
                         records[j] = new StagedRecord { Entry = entry, Disabled = recordDisabled, Payload = reader.ReadBytes(length) };
                     }
                     entities[i] = new StagedEntity { Gid = gid, Kind = kind, Disabled = disabled, Records = records };
                 }
-                if (stream.Position != stream.Length) return SnapshotApplyResult.Malformed;
-                staged = new StagedNetworkSnapshot(snapshot.ServerTick, entities);
+                if (stream.Position != stream.Length || count != snapshot.EntityCount || CountRecords(entities) != snapshot.RecordCount) return SnapshotApplyResult.Malformed;
+                for (var i = 0; i < entities.Length; i++)
+                {
+                    var source = entities[i];
+                    if (!source.Gid.TryUnpack<TWorld>(out var existing)) continue;
+                    if (!_replicas.TryGetValue(source.Gid, out var kindId) || kindId != source.Kind.TypeId || !((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Matches(existing)) return SnapshotApplyResult.EntityConflict;
+                }
+                staged = new StagedNetworkSnapshot(snapshot, entities);
                 return SnapshotApplyResult.Success;
             }
             catch (EndOfStreamException) { return SnapshotApplyResult.Malformed; }
             catch (IOException) { return SnapshotApplyResult.Malformed; }
+            catch (Exception) { return SnapshotApplyResult.Malformed; }
         }
 
         /// <summary>Applies a previously staged snapshot. Hook and lifecycle exceptions are not rolled back.</summary>
@@ -202,7 +236,14 @@ namespace UniGame.StaticEcs.Network
             if (staged == null || World<TWorld>.Status != WorldStatus.Initialized) return SnapshotApplyResult.Malformed;
             var incoming = new HashSet<EntityGID>();
             for (var i = 0; i < staged.Entities.Length; i++) incoming.Add(staged.Entities[i].Gid);
-            foreach (var gid in _replicas) if (!incoming.Contains(gid) && gid.TryUnpack<TWorld>(out var removed)) removed.Destroy();
+            for (var i = 0; i < staged.Entities.Length; i++)
+            {
+                var source = staged.Entities[i];
+                if (source.Gid.TryUnpack<TWorld>(out var existing) && (!_replicas.TryGetValue(source.Gid, out var kindId) || kindId != source.Kind.TypeId || !((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Matches(existing))) return SnapshotApplyResult.EntityConflict;
+            }
+            var removedIds = new List<EntityGID>();
+            foreach (var pair in _replicas) if (!incoming.Contains(pair.Key)) removedIds.Add(pair.Key);
+            for (var i = 0; i < removedIds.Count; i++) { var gid = removedIds[i]; if (gid.TryUnpack<TWorld>(out var removed)) removed.Destroy(); _replicas.Remove(gid); }
             for (var i = 0; i < staged.Entities.Length; i++)
             {
                 var source = staged.Entities[i];
@@ -223,9 +264,9 @@ namespace UniGame.StaticEcs.Network
                     ((IRecordNetworkInvoker<TWorld>)record.Entry.Invoker).Apply(entity, record.Payload, record.Entry.Version, record.Disabled);
                 }
                 if (source.Disabled) entity.Disable(); else entity.Enable();
+                _replicas[source.Gid] = source.Kind.TypeId;
             }
-            _replicas.Clear();
-            foreach (var gid in incoming) _replicas.Add(gid);
+            History.Store(staged.ServerTick, staged.Snapshot);
             return SnapshotApplyResult.Success;
         }
 
@@ -235,8 +276,10 @@ namespace UniGame.StaticEcs.Network
             var id = left.Id.CompareTo(right.Id);
             return cluster != 0 ? cluster : id != 0 ? id : left.Version.CompareTo(right.Version);
         }
-        private static void WriteGid(BinaryWriter writer, EntityGID gid) { writer.Write(gid.Id); writer.Write(gid.ClusterId); writer.Write(gid.Version); }
-        private static EntityGID ReadGid(BinaryReader reader) => new EntityGID(reader.ReadUInt32(), reader.ReadUInt16(), reader.ReadUInt16());
+        private static int Compare(NetworkSchemaEntry left, NetworkSchemaEntry right) { var kind = left.Kind.CompareTo(right.Kind); return kind != 0 ? kind : left.TypeId.CompareTo(right.TypeId); }
+        private static int CountRecords(StagedEntity[] entities) { var count = 0; for (var i = 0; i < entities.Length; i++) count += entities[i].Records.Length; return count; }
+        private static void WriteGid(BinaryWriter writer, EntityGID gid) => writer.Write(gid.Raw);
+        private static EntityGID ReadGid(BinaryReader reader) => new EntityGID(reader.ReadUInt64());
         private static NetworkTypeId ReadTypeId(BinaryReader reader) { var value = reader.ReadUInt32(); if (value == 0) throw new InvalidDataException("Zero network type id."); return new NetworkTypeId(value); }
     }
 }

@@ -8,7 +8,7 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Begins protocol negotiation.</summary>
         Hello = 1,
         /// <summary>Completes protocol negotiation.</summary>
-        HelloAck = 2,
+        Ready = 2,
         /// <summary>Carries an ordered batch of commands.</summary>
         CommandBatch = 3,
         /// <summary>Carries a complete independent world snapshot.</summary>

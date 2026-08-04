@@ -99,4 +99,43 @@ namespace UniGame.StaticEcs.Network
             ((byte)value.Flags & ~(byte)PacketFlags.ReliableOrdered) == 0 &&
             value.Compression == NetworkCompression.None && value.PayloadLength <= ProtocolLimits.MaxWirePayloadBytes;
     }
+
+    /// <summary>Encodes and validates exact Network v2 packets.</summary>
+    public static class NetworkPacket
+    {
+        /// <summary>Frames one canonical payload with exact length and xxHash64.</summary>
+        public static bool TryEncode(PacketHeader header, ReadOnlySpan<byte> payload, out byte[] packet)
+        {
+            packet = null;
+            if (payload.Length > ProtocolLimits.MaxWirePayloadBytes) return false;
+            header.PayloadLength = (uint)payload.Length;
+            header.PayloadHash = Hashing.XxHash64(payload);
+            var bytes = new byte[PacketHeader.Size + payload.Length];
+            if (!header.TryWrite(bytes)) return false;
+            payload.CopyTo(bytes.AsSpan(PacketHeader.Size));
+            packet = bytes;
+            return true;
+        }
+
+        /// <summary>Validates framing, exact length, fingerprint and payload hash before exposing payload bytes.</summary>
+        public static bool TryDecode(byte[] packet, SchemaFingerprint expectedFingerprint, out PacketHeader header, out ReadOnlyMemory<byte> payload)
+        {
+            if (!TryDecode(packet, out header, out payload)) return false;
+            if (header.SchemaFingerprint == expectedFingerprint) return true;
+            header = default; payload = default; return false;
+        }
+
+        /// <summary>Validates framing, exact length and payload hash before handshake fingerprint admission.</summary>
+        public static bool TryDecode(byte[] packet, out PacketHeader header, out ReadOnlyMemory<byte> payload)
+        {
+            header = default;
+            payload = default;
+            if (packet == null || packet.Length < PacketHeader.Size || !PacketHeader.TryRead(packet, out header) ||
+                packet.Length != PacketHeader.Size + header.PayloadLength) return false;
+            var body = new ReadOnlySpan<byte>(packet, PacketHeader.Size, (int)header.PayloadLength);
+            if (Hashing.XxHash64(body) != header.PayloadHash) return false;
+            payload = new ReadOnlyMemory<byte>(packet, PacketHeader.Size, (int)header.PayloadLength);
+            return true;
+        }
+    }
 }

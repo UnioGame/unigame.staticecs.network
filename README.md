@@ -68,35 +68,27 @@ World<ServerWorld>.Types().Tag<NetworkTag>().Component<NetworkOwnerComponent>();
 World<ServerWorld>.Initialize();
 
 var schema = GeneratedServerNetwork.CreateSchema();
-var replicator = new NetworkReplicator<ServerWorld>(schema);
-var coordinator = new NetworkServerCoordinator<ServerWorld>(historyCapacity: 64);
+var server = new NetworkServer<ServerWorld>(schema, historyTicks: 64, historyBytes: 32 * 1024 * 1024);
 ```
 
-For each accepted transport connection, create a separate session and complete fingerprint admission. `ConnectionId` comes from the transport; `PeerId` and epoch come from the server.
+Add each server transport with its server-assigned peer, epoch, and scope. The framed Hello/Ready exchange admits the generated fingerprint; malformed, incompatible, or stale packets fail closed and request resynchronization.
 
 ```csharp
-var session = new NetworkSession<ServerWorld>(connectionId, NetworkRole.Server, schema, observer);
-var result = session.Admit(remoteFingerprint, assignedPeerId, epoch, scopeId);
-coordinator.Add(session);
+server.AddConnection(serverTransport, assignedPeerId, epoch, scopeId, observer);
 ```
 
-The server sequence is receive, decode, validate and dispatch commands, gameplay, capture, then send. The client sequence is receive, decode, stage and apply snapshots, gameplay or presentation, then send. `ServerTick` is simulation time, Static ECS `World.CurrentTick` remains tracking time, and `Cycle` is only mock or replay call ordering.
+The server `Tick` is the authoritative simulation boundary: all connections receive and decode before ordered command dispatch, capture, and send. Clients expose `Process()` without a caller-provided tick; `ServerTick` comes only from validated packets. Static ECS `World.CurrentTick` remains tracking time.
 
 ```csharp
-session.Tick(serverTick, cycle);
-coordinator.Queue(commandEnvelope, serverTick);
-coordinator.Dispatch(serverTick);
+server.Tick(serverTick);
 
-if (replicator.Capture(serverTick, out var capture) == SnapshotCaptureResult.Success)
-    coordinator.StoreCapture(scopeId, capture);
+var client = new NetworkClient<ClientWorld>(clientTransport, GeneratedClientNetwork.CreateSchema(), scopeId, observer);
+client.BeginHandshake();
+client.Process();
+client.SendCommand(new MoveCommand { X = 1 }, targetTick);
 ```
 
-On a client, stage every snapshot before applying it. A failed stage never mutates ECS. Hook or lifecycle exceptions after `Apply` starts are not rolled back.
-
-```csharp
-if (replicator.Stage(snapshot, out var staged) == SnapshotApplyResult.Success)
-    replicator.Apply(staged);
-```
+Snapshot metadata includes tick, scope, schema fingerprint, canonical hash, bytes, entity count, and record count. Client and server histories evict oldest ticks until both tick and byte budgets hold. Snapshot staging preflights canonical order, ledger ownership, entity kinds, bounds, and local occupancy before any ECS mutation; only ledger-owned replicas may be updated or despawned.
 
 ## Configuration
 
@@ -107,4 +99,5 @@ if (replicator.Stage(snapshot, out var staged) == SnapshotApplyResult.Success)
 - Endpoint names must be unique valid C# identifiers because they form `Generated{Name}Network`.
 - The generator targets `netstandard2.0`, references Microsoft.CodeAnalysis.CSharp 4.3.1 at build time, and ships only `Analyzers/StaticEcs.Network.Generator.dll` with the `RoslynAnalyzer` label.
 - `NetworkNdjsonLog` contains numeric metadata only. It never records packet payloads, command values, schema manifests, or replicated world bytes.
+- Diagnostics use underscored phase and field names and include packet kind, duration nanoseconds, schema fingerprint, counters, queue/history gauges, tick gap, and error category.
 - See the repository [Static ECS knowledge base](../../../docs/knowledge/static-ecs/) for world lifecycle and type registration.

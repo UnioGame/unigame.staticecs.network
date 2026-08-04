@@ -21,6 +21,12 @@ namespace UniGame.StaticEcs.Network.Generator
         private static readonly DiagnosticDescriptor InvalidShape = Error("NETV2003", "Ambiguous Static ECS shape", "Network wire type '{0}' must implement exactly one supported Static ECS shape");
         private static readonly DiagnosticDescriptor InvalidEndpoint = Error("NETV2004", "Invalid network endpoint", "Endpoint name '{0}' must be a unique C# identifier in this compilation");
         private static readonly DiagnosticDescriptor EndpointWorld = Error("NETV2005", "Invalid endpoint world", "Endpoint '{0}' must reference a concrete struct IWorldType");
+        private static readonly DiagnosticDescriptor SharedOnly = Error("NETV2006", "Wire type outside Shared assembly", "Network wire type '{0}' cannot be declared in an endpoint assembly");
+        private static readonly DiagnosticDescriptor MissingHooks = Error("NETV2007", "Missing serialization hooks", "Network wire type '{0}' does not expose the required Static ECS Write and Read hooks");
+        private static readonly DiagnosticDescriptor ZeroId = Error("NETV2008", "Zero network type id", "Network wire type '{0}' generated the reserved zero id");
+        private static readonly DiagnosticDescriptor MissingPolicy = Error("NETV2009", "Missing server command policy", "Server endpoint '{0}' must have exactly one reachable policy for command '{1}'");
+        private static readonly DiagnosticDescriptor DuplicatePolicy = Error("NETV2010", "Duplicate server command policy", "Server endpoint '{0}' has multiple reachable policies for command '{1}'");
+        private static readonly DiagnosticDescriptor UnknownPolicy = Error("NETV2011", "Policy command is not reachable", "Server policy '{0}' targets command '{1}' which is absent from the aggregated Shared manifest");
 
         public void Initialize(IncrementalGeneratorInitializationContext context)
         {
@@ -38,7 +44,9 @@ namespace UniGame.StaticEcs.Network.Generator
                 compilation.GetTypeByMetadataName("UniGame.StaticEcs.Network.NetworkCompilerSupport") == null) return;
             var records = new List<Record>();
             CollectTypes(compilation.Assembly.GlobalNamespace, compilation.AssemblyName ?? string.Empty, records, context);
-            var referenced = CollectReferenced(compilation);
+            var referenced = CollectReferenced(compilation, context);
+            var hasEndpoints = compilation.Assembly.GetAttributes().Any(a => a.AttributeClass?.ToDisplayString() == EndpointAttribute);
+            if (hasEndpoints) foreach (var record in records) context.ReportDiagnostic(Diagnostic.Create(SharedOnly, record.Symbol.Locations.FirstOrDefault(), record.Symbol.ToDisplayString()));
             ValidateCollisions(records.Concat(referenced), context);
             EmitManifest(records, context);
             EmitEndpoints(compilation, records, referenced, context);
@@ -74,11 +82,18 @@ namespace UniGame.StaticEcs.Network.Generator
                 context.ReportDiagnostic(Diagnostic.Create(InvalidShape, type.Locations.FirstOrDefault(), type.ToDisplayString()));
                 return;
             }
+            if (!HasRequiredHooks(type, shapes[0]))
+            {
+                context.ReportDiagnostic(Diagnostic.Create(MissingHooks, type.Locations.FirstOrDefault(), type.ToDisplayString()));
+                return;
+            }
             var metadataName = MetadataName(type);
-            records.Add(new Record(Hash(Encoding.UTF8.GetBytes(assemblyName + ":" + metadataName)), shapes[0], type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), metadataName, 1));
+            var id = Hash(Encoding.UTF8.GetBytes(assemblyName + ":" + metadataName));
+            if (id == 0) { context.ReportDiagnostic(Diagnostic.Create(ZeroId, type.Locations.FirstOrDefault(), type.ToDisplayString())); return; }
+            records.Add(new Record(id, shapes[0], type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), metadataName, 1, type));
         }
 
-        private static List<Record> CollectReferenced(Compilation compilation)
+        private static List<Record> CollectReferenced(Compilation compilation, SourceProductionContext context)
         {
             var records = new List<Record>();
             foreach (var reference in compilation.SourceModule.ReferencedAssemblySymbols)
@@ -89,7 +104,8 @@ namespace UniGame.StaticEcs.Network.Generator
                 var kind = (Kind)Convert.ToInt32(attribute.ConstructorArguments[1].Value);
                 var type = attribute.ConstructorArguments[2].Value as INamedTypeSymbol;
                 var version = attribute.ConstructorArguments.Length > 3 ? (byte)attribute.ConstructorArguments[3].Value : (byte)1;
-                if (type != null) records.Add(new Record(id, kind, type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), MetadataName(type), version));
+                if (id == 0) { context.ReportDiagnostic(Diagnostic.Create(ZeroId, Location.None, type?.ToDisplayString() ?? "<unknown>")); continue; }
+                if (type != null) records.Add(new Record(id, kind, type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), MetadataName(type), version, type));
             }
             return records;
         }
@@ -134,45 +150,81 @@ namespace UniGame.StaticEcs.Network.Generator
                 source.Append("    public static global::UniGame.StaticEcs.Network.NetworkSchema<").Append(worldName).Append("> CreateSchema()\n    {\n")
                     .Append("        var factory = global::UniGame.StaticEcs.Network.NetworkCompilerSupport.Create<").Append(worldName).Append(">();\n");
                 foreach (var record in local.Concat(referenced).GroupBy(r => r.TypeName).Select(g => g.First()).OrderBy(r => r.Kind).ThenBy(r => r.Id)) AppendRegistration(source, record, "factory", 8);
-                if (role == 2) AppendPolicies(compilation.Assembly.GlobalNamespace, world, source);
+                if (role == 2)
+                {
+                    var commands = local.Concat(referenced).Where(r => r.Kind == Kind.Command).GroupBy(r => r.TypeName).Select(g => g.First()).ToArray();
+                    var policies = CollectPolicies(compilation.Assembly.GlobalNamespace, world);
+                    foreach (var command in commands)
+                    {
+                        var matches = policies.Where(p => p.CommandName == command.TypeName).ToArray();
+                        if (matches.Length == 0) context.ReportDiagnostic(Diagnostic.Create(MissingPolicy, Location.None, name, command.MetadataName));
+                        else if (matches.Length > 1) context.ReportDiagnostic(Diagnostic.Create(DuplicatePolicy, Location.None, name, command.MetadataName));
+                    }
+                    foreach (var policy in policies) if (!commands.Any(c => c.TypeName == policy.CommandName)) context.ReportDiagnostic(Diagnostic.Create(UnknownPolicy, policy.Type.Locations.FirstOrDefault(), policy.Type.ToDisplayString(), policy.CommandName));
+                    AppendPolicies(policies, source);
+                }
                 source.Append("        return factory.Freeze();\n    }\n")
                     .Append("    public static void RegisterTypes(global::FFS.Libraries.StaticEcs.World<").Append(worldName).Append(">.TypeRegistrar registrar)\n    {\n");
-                if (role == 2) AppendPolicyEvents(compilation.Assembly.GlobalNamespace, world, source);
+                if (role == 2) AppendPolicyEvents(CollectPolicies(compilation.Assembly.GlobalNamespace, world), source);
                 source.Append("    }\n}\n");
                 context.AddSource("Generated" + name + "Network.g.cs", SourceText.From(source.ToString(), Encoding.UTF8));
             }
         }
 
-        private static void AppendPolicies(INamespaceSymbol ns, INamedTypeSymbol world, StringBuilder source)
+        private static List<Policy> CollectPolicies(INamespaceSymbol ns, INamedTypeSymbol world)
         {
-            foreach (var child in ns.GetNamespaceMembers()) AppendPolicies(child, world, source);
-            foreach (var type in ns.GetTypeMembers())
-            foreach (var iface in type.AllInterfaces)
-                if (iface.OriginalDefinition.ToDisplayString() == "UniGame.StaticEcs.Network.INetworkCommandPolicy<TWorld, TCommand>" && SymbolEqualityComparer.Default.Equals(iface.TypeArguments[0], world))
-                    source.Append("        factory.Policy<").Append(iface.TypeArguments[1].ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)).Append(", ").Append(type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)).Append(">();\n");
+            var policies = new List<Policy>();
+            CollectPolicies(ns, world, policies);
+            return policies;
         }
 
-        private static void AppendPolicyEvents(INamespaceSymbol ns, INamedTypeSymbol world, StringBuilder source)
+        private static void CollectPolicies(INamespaceSymbol ns, INamedTypeSymbol world, List<Policy> policies)
         {
-            foreach (var child in ns.GetNamespaceMembers()) AppendPolicyEvents(child, world, source);
+            foreach (var child in ns.GetNamespaceMembers()) CollectPolicies(child, world, policies);
             foreach (var type in ns.GetTypeMembers())
             foreach (var iface in type.AllInterfaces)
                 if (iface.OriginalDefinition.ToDisplayString() == "UniGame.StaticEcs.Network.INetworkCommandPolicy<TWorld, TCommand>" && SymbolEqualityComparer.Default.Equals(iface.TypeArguments[0], world))
-                {
-                    var command = iface.TypeArguments[1].ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-                    source.Append("        registrar.Event<global::UniGame.StaticEcs.Network.NetworkCommandAccepted<").Append(command).Append(">>();\n")
-                        .Append("        registrar.Event<global::UniGame.StaticEcs.Network.NetworkCommandRejected<").Append(command).Append(">>();\n");
-                }
+                    policies.Add(new Policy(type, iface.TypeArguments[1].ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)));
+        }
+
+        private static void AppendPolicies(IEnumerable<Policy> policies, StringBuilder source)
+        {
+            foreach (var policy in policies) source.Append("        factory.Policy<").Append(policy.CommandName).Append(", ").Append(policy.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)).Append(">();\n");
+        }
+
+        private static void AppendPolicyEvents(IEnumerable<Policy> policies, StringBuilder source)
+        {
+            foreach (var command in policies.Select(p => p.CommandName).Distinct())
+                source.Append("        registrar.Event<global::UniGame.StaticEcs.Network.NetworkCommandAccepted<").Append(command).Append(">>();\n")
+                    .Append("        registrar.Event<global::UniGame.StaticEcs.Network.NetworkCommandRejected<").Append(command).Append(">>();\n");
         }
 
         private static void AppendRegistration(StringBuilder source, Record record, string factory, int indent = 8)
         {
-            source.Append(' ', indent).Append(factory).Append('.').Append(record.Kind).Append('<').Append(record.TypeName).Append(">(new global::UniGame.StaticEcs.Network.NetworkTypeId(").Append(record.Id).Append("u)");
+            var operation = record.Kind == Kind.Component && Implements(record.Symbol, "FFS.Libraries.StaticEcs.IDisableable") ? "DisableableComponent" : record.Kind.ToString();
+            source.Append(' ', indent).Append(factory).Append('.').Append(operation).Append('<').Append(record.TypeName).Append(">(new global::UniGame.StaticEcs.Network.NetworkTypeId(").Append(record.Id).Append("u)");
             if (record.Kind != Kind.Entity) source.Append(", ").Append(record.Version);
             source.Append(");\n");
         }
 
         private static bool Implements(INamedTypeSymbol type, string metadataName) => type.AllInterfaces.Any(i => i.ToDisplayString() == metadataName);
+        private static bool HasRequiredHooks(INamedTypeSymbol type, Kind kind)
+        {
+            if (kind == Kind.Entity || kind == Kind.Tag || kind == Kind.Link || kind == Kind.Links || kind == Kind.Multi && type.IsUnmanagedType) return true;
+            if (kind == Kind.Component) return HasComponentHooks(type);
+            if (kind == Kind.Command) return HasHook(type, "Write", 0, "FFS.Libraries.StaticPack.BinaryPackWriter") && HasHook(type, "Read", 0, "FFS.Libraries.StaticPack.BinaryPackReader", "System.Byte");
+            return HasHook(type, "Write", 0, "FFS.Libraries.StaticPack.BinaryPackWriter") && HasHook(type, "Read", 0, "FFS.Libraries.StaticPack.BinaryPackReader");
+        }
+        private static bool HasHook(INamedTypeSymbol type, string name, int arity, params string[] parameters) => type.GetMembers(name).OfType<IMethodSymbol>().Any(method =>
+            !method.IsStatic && method.ReturnsVoid && method.Arity == arity && method.Parameters.Length == parameters.Length &&
+            method.Parameters[0].RefKind == RefKind.Ref && Enumerable.Range(0, parameters.Length).All(i => TypeName(method.Parameters[i].Type) == parameters[i]));
+        private static string TypeName(ITypeSymbol type) => type.SpecialType == SpecialType.System_Byte ? "System.Byte" : type.SpecialType == SpecialType.System_Boolean ? "System.Boolean" : type.ToDisplayString();
+        private static bool HasComponentHooks(INamedTypeSymbol type)
+        {
+            var write = type.GetMembers("Write").OfType<IMethodSymbol>().Any(m => !m.IsStatic && m.ReturnsVoid && m.Arity == 1 && m.Parameters.Length == 2 && m.Parameters[0].RefKind == RefKind.Ref && m.Parameters[0].Type.ToDisplayString() == "FFS.Libraries.StaticPack.BinaryPackWriter");
+            var read = type.GetMembers("Read").OfType<IMethodSymbol>().Any(m => !m.IsStatic && m.ReturnsVoid && m.Arity == 1 && m.Parameters.Length == 4 && m.Parameters[0].RefKind == RefKind.Ref && m.Parameters[0].Type.ToDisplayString() == "FFS.Libraries.StaticPack.BinaryPackReader" && m.Parameters[2].Type.SpecialType == SpecialType.System_Byte && m.Parameters[3].Type.SpecialType == SpecialType.System_Boolean);
+            return write && read;
+        }
         private static string MetadataName(INamedTypeSymbol type)
         {
             var names = new Stack<string>();
@@ -203,8 +255,9 @@ namespace UniGame.StaticEcs.Network.Generator
         private enum Kind { Entity, Component, Tag, Link, Links, Multi, Command }
         private readonly struct Record
         {
-            internal Record(uint id, Kind kind, string typeName, string metadataName, byte version) { Id = id; Kind = kind; TypeName = typeName; MetadataName = metadataName; Version = version; }
-            internal uint Id { get; } internal Kind Kind { get; } internal string TypeName { get; } internal string MetadataName { get; } internal byte Version { get; }
+            internal Record(uint id, Kind kind, string typeName, string metadataName, byte version, INamedTypeSymbol symbol) { Id = id; Kind = kind; TypeName = typeName; MetadataName = metadataName; Version = version; Symbol = symbol; }
+            internal uint Id { get; } internal Kind Kind { get; } internal string TypeName { get; } internal string MetadataName { get; } internal byte Version { get; } internal INamedTypeSymbol Symbol { get; }
         }
+        private readonly struct Policy { internal Policy(INamedTypeSymbol type, string commandName) { Type = type; CommandName = commandName; } internal INamedTypeSymbol Type { get; } internal string CommandName { get; } }
     }
 }

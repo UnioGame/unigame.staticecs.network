@@ -8,6 +8,7 @@
     <CompilerGeneratedFilesOutputPath>$(BaseIntermediateOutputPath)generated</CompilerGeneratedFilesOutputPath>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="..\SourceGenerator.Shared.Tests~\SourceGenerator.Shared.Tests.csproj" />
     <ProjectReference Include="..\SourceGenerator~\UniGame.StaticEcs.Network.Generator.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
   </ItemGroup>
 </Project>

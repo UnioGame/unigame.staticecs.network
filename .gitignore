@@ -2,3 +2,9 @@ SourceGenerator~/bin/
 SourceGenerator~/obj/
 SourceGenerator.Tests~/bin/
 SourceGenerator.Tests~/obj/
+SourceGenerator.Shared.Tests~/bin/
+SourceGenerator.Shared.Tests~/obj/
+SourceGenerator.MissingPolicy.Tests~/bin/
+SourceGenerator.MissingPolicy.Tests~/obj/
+SourceGenerator.DuplicatePolicy.Tests~/bin/
+SourceGenerator.DuplicatePolicy.Tests~/obj/

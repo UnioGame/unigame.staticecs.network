@@ -4,6 +4,26 @@ using System.IO;
 
 namespace UniGame.StaticEcs.Network
 {
+    /// <summary>Identifies the packet kind associated with a diagnostic event.</summary>
+    public enum NetworkPacketKind : byte
+    {
+        /// <summary>No packet is associated with the event.</summary>
+        None,
+        /// <summary>A handshake hello packet.</summary>
+        Hello,
+        /// <summary>A handshake ready packet.</summary>
+        Ready,
+        /// <summary>A command batch packet.</summary>
+        CommandBatch,
+        /// <summary>A full snapshot packet.</summary>
+        FullSnapshot,
+        /// <summary>An acknowledgement packet.</summary>
+        Ack,
+        /// <summary>A resynchronization request packet.</summary>
+        ResyncRequest,
+        /// <summary>A disconnect packet.</summary>
+        Disconnect
+    }
     /// <summary>Identifies a measured networking phase.</summary>
     public enum NetworkPhase : byte
     {
@@ -66,13 +86,15 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Creates one immutable trace event.</summary>
         public NetworkTraceEvent(NetworkPhase phase, NetworkTraceKind kind, NetworkResultCategory result,
             NetworkRole role, uint connectionId, uint peerId, uint epoch, uint serverTick, uint targetTick,
-            int bytes, int packets, int entities, int records, int commands, int queueSize, int historySize,
-            int activeConnections, int activePeers, long timestamp)
+            int bytes, int packets, int entities, int records, int commands, int queueSize, int historyTicks,
+            int activeConnections, int activePeers, long timestamp, NetworkPacketKind packetKind = NetworkPacketKind.None,
+            long historyBytes = 0, int clientServerTickGap = 0, long durationNanoseconds = 0, SchemaFingerprint fingerprint = default)
         {
             Phase = phase; Kind = kind; Result = result; Role = role; ConnectionId = connectionId; PeerId = peerId;
             Epoch = epoch; ServerTick = serverTick; TargetTick = targetTick; Bytes = bytes; Packets = packets;
-            Entities = entities; Records = records; Commands = commands; QueueSize = queueSize; HistorySize = historySize;
+            Entities = entities; Records = records; Commands = commands; QueueSize = queueSize; HistoryTicks = historyTicks;
             ActiveConnections = activeConnections; ActivePeers = activePeers; Timestamp = timestamp;
+            PacketKind = packetKind; HistoryBytes = historyBytes; ClientServerTickGap = clientServerTickGap; DurationNanoseconds = durationNanoseconds; SchemaFingerprint = fingerprint;
         }
         /// <summary>Gets the measured phase.</summary>
         public NetworkPhase Phase { get; }
@@ -105,13 +127,23 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Gets queue size.</summary>
         public int QueueSize { get; }
         /// <summary>Gets history size.</summary>
-        public int HistorySize { get; }
+        public int HistoryTicks { get; }
+        /// <summary>Gets retained history bytes.</summary>
+        public long HistoryBytes { get; }
         /// <summary>Gets active connection count.</summary>
         public int ActiveConnections { get; }
         /// <summary>Gets active peer count.</summary>
         public int ActivePeers { get; }
         /// <summary>Gets Stopwatch ticks.</summary>
         public long Timestamp { get; }
+        /// <summary>Gets measured Stopwatch duration ticks.</summary>
+        public long DurationNanoseconds { get; }
+        /// <summary>Gets the packet kind.</summary>
+        public NetworkPacketKind PacketKind { get; }
+        /// <summary>Gets authoritative tick minus the latest client acknowledgement.</summary>
+        public int ClientServerTickGap { get; }
+        /// <summary>Gets the active schema fingerprint.</summary>
+        public SchemaFingerprint SchemaFingerprint { get; }
     }
 
     /// <summary>Buffers strict privacy-safe NDJSON without blocking the producer.</summary>
@@ -161,12 +193,17 @@ namespace UniGame.StaticEcs.Network
         public void Dispose() { if (_disposed) return; Flush(); _disposed = true; _writer.Dispose(); }
 
         private static string ToJson(in NetworkTraceEvent v) =>
-            "{\"phase\":\"" + v.Phase.ToString().ToLowerInvariant() + "\",\"kind\":\"" + v.Kind.ToString().ToLowerInvariant() +
-            "\",\"result\":\"" + v.Result.ToString().ToLowerInvariant() + "\",\"role\":\"" + v.Role.ToString().ToLowerInvariant() +
+            "{\"phase\":\"" + PhaseName(v.Phase) + "\",\"kind\":\"" + v.Kind.ToString().ToLowerInvariant() + "\",\"packet_kind\":\"" + PacketName(v.PacketKind) +
+            "\",\"error_category\":\"" + v.Result.ToString().ToLowerInvariant() + "\",\"role\":\"" + v.Role.ToString().ToLowerInvariant() +
             "\",\"connection\":" + v.ConnectionId + ",\"peer\":" + v.PeerId + ",\"epoch\":" + v.Epoch +
-            ",\"serverTick\":" + v.ServerTick + ",\"targetTick\":" + v.TargetTick + ",\"bytes\":" + v.Bytes +
+            ",\"server_tick\":" + v.ServerTick + ",\"target_tick\":" + v.TargetTick + ",\"bytes\":" + v.Bytes +
             ",\"packets\":" + v.Packets + ",\"entities\":" + v.Entities + ",\"records\":" + v.Records +
-            ",\"commands\":" + v.Commands + ",\"queue\":" + v.QueueSize + ",\"history\":" + v.HistorySize +
-            ",\"connections\":" + v.ActiveConnections + ",\"peers\":" + v.ActivePeers + ",\"timestamp\":" + v.Timestamp + "}";
+            ",\"commands\":" + v.Commands + ",\"queue_size\":" + v.QueueSize + ",\"history_ticks\":" + v.HistoryTicks + ",\"history_bytes\":" + v.HistoryBytes +
+            ",\"active_connections\":" + v.ActiveConnections + ",\"active_peers\":" + v.ActivePeers + ",\"timestamp\":" + v.Timestamp +
+            ",\"client_server_tick_gap\":" + v.ClientServerTickGap + ",\"duration_ns\":" + v.DurationNanoseconds + ",\"schema_fingerprint\":\"" + v.SchemaFingerprint + "\"}";
+
+        private static string PhaseName(NetworkPhase phase) => phase == NetworkPhase.CommandDispatch ? "command_dispatch" :
+            phase == NetworkPhase.SnapshotApply ? "snapshot_apply" : phase == NetworkPhase.SnapshotCapture ? "snapshot_capture" : phase.ToString().ToLowerInvariant();
+        private static string PacketName(NetworkPacketKind kind) => kind == NetworkPacketKind.CommandBatch ? "command_batch" : kind == NetworkPacketKind.FullSnapshot ? "full_snapshot" : kind == NetworkPacketKind.ResyncRequest ? "resync_request" : kind.ToString().ToLowerInvariant();
     }
 }

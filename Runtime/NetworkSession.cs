@@ -37,6 +37,10 @@ namespace UniGame.StaticEcs.Network
         public override bool Equals(object obj) => obj is ScopeId other && Equals(other);
         /// <inheritdoc />
         public override int GetHashCode() => Value.GetHashCode();
+        /// <summary>Tests equality.</summary>
+        public static bool operator ==(ScopeId left, ScopeId right) => left.Equals(right);
+        /// <summary>Tests inequality.</summary>
+        public static bool operator !=(ScopeId left, ScopeId right) => !left.Equals(right);
     }
 
     /// <summary>Reports per-connection admission state.</summary>
@@ -135,8 +139,6 @@ namespace UniGame.StaticEcs.Network
         public uint Epoch { get; private set; }
         /// <summary>Gets caller-selected replication scope.</summary>
         public ScopeId Scope { get; private set; }
-        /// <summary>Gets the latest mock/replay transport call order.</summary>
-        public ulong Cycle { get; private set; }
 
         /// <summary>Completes the v2 handshake after exact shared-manifest fingerprint comparison.</summary>
         public NetworkAdmissionResult Admit(SchemaFingerprint remoteFingerprint, uint peerId, uint epoch, ScopeId scope)
@@ -147,14 +149,6 @@ namespace UniGame.StaticEcs.Network
             if (epoch == 0) return Reject(NetworkAdmissionResult.InvalidEpoch);
             PeerId = peerId; Epoch = epoch; Scope = scope; State = NetworkSessionState.Established;
             return NetworkAdmissionResult.Accepted;
-        }
-
-        /// <summary>Advances connection bookkeeping without conflating cycle ordering with simulation time.</summary>
-        public void Tick(uint serverTick, ulong cycle)
-        {
-            if (cycle <= Cycle) throw new ArgumentOutOfRangeException(nameof(cycle), "Cycle must increase monotonically.");
-            Cycle = cycle;
-            Observe(NetworkPhase.Receive, NetworkTraceKind.Point, NetworkResultCategory.Success, serverTick, 0, 0);
         }
 
         /// <summary>Serializes one client command through its Static ECS event hook.</summary>
@@ -182,7 +176,7 @@ namespace UniGame.StaticEcs.Network
             if (Role != NetworkRole.Server || State != NetworkSessionState.Established || envelope == null || envelope.Connection != Connection || envelope.PeerId != PeerId || envelope.Epoch != Epoch) return NetworkCommandResult.WrongSession;
             if (envelope.Sequence != _nextReceiveSequence) return NetworkCommandResult.Sequence;
             if (envelope.TargetTick < serverTick - Math.Min(serverTick, pastWindow) || envelope.TargetTick > serverTick + futureWindow) return NetworkCommandResult.TickWindow;
-            if (!_schema.TryGet(envelope.TypeId, out entry) || entry.Kind != NetworkSchemaKind.Command || entry.Version != envelope.Version || envelope.ExactPayload.Length > entry.MaxBytes || entry.Invoker is not ICommandNetworkInvoker<TWorld>) return NetworkCommandResult.SchemaMismatch;
+            if (!_schema.TryGet(envelope.TypeId, out entry) || entry.Kind != NetworkSchemaKind.Command || entry.Version != envelope.Version || envelope.ExactPayload.Length > entry.MaxBytes || entry.Invoker is not ICommandNetworkInvoker<TWorld> invoker || !invoker.HasPolicy) return NetworkCommandResult.SchemaMismatch;
             _nextReceiveSequence++;
             return NetworkCommandResult.Queued;
         }
@@ -200,9 +194,12 @@ namespace UniGame.StaticEcs.Network
 
         private NetworkAdmissionResult Reject(NetworkAdmissionResult result) { State = NetworkSessionState.Rejected; return result; }
         private void Observe(NetworkPhase phase, NetworkTraceKind kind, NetworkResultCategory result, uint serverTick, uint targetTick, int bytes)
+            => Trace(phase, kind, result, NetworkPacketKind.None, serverTick, targetTick, bytes, 0, 0, 0, 0);
+
+        internal void Trace(NetworkPhase phase, NetworkTraceKind kind, NetworkResultCategory result, NetworkPacketKind packetKind, uint serverTick, uint targetTick, int bytes, int historyTicks, long historyBytes, int tickGap, long durationNanoseconds)
         {
             if (_observer == null) return;
-            try { var value = new NetworkTraceEvent(phase, kind, result, Role, Connection.Value, PeerId, Epoch, serverTick, targetTick, bytes, bytes > 0 ? 1 : 0, 0, 0, phase == NetworkPhase.CommandDispatch ? 1 : 0, 0, 0, State == NetworkSessionState.Closed ? 0 : 1, PeerId == 0 ? 0 : 1, Stopwatch.GetTimestamp()); _observer.Observe(in value); }
+            try { var value = new NetworkTraceEvent(phase, kind, result, Role, Connection.Value, PeerId, Epoch, serverTick, targetTick, bytes, bytes > 0 ? 1 : 0, 0, 0, phase == NetworkPhase.CommandDispatch ? 1 : 0, 0, historyTicks, State == NetworkSessionState.Closed ? 0 : 1, PeerId == 0 ? 0 : 1, Stopwatch.GetTimestamp(), packetKind, historyBytes, tickGap, durationNanoseconds, _schema.Fingerprint); _observer.Observe(in value); }
             catch { }
         }
     }
@@ -214,9 +211,15 @@ namespace UniGame.StaticEcs.Network
         private readonly Dictionary<ScopeId, NetworkHistory<NetworkSnapshot>> _history = new Dictionary<ScopeId, NetworkHistory<NetworkSnapshot>>();
         private readonly List<PendingCommand> _commands = new List<PendingCommand>();
         private readonly int _historyCapacity;
+        private readonly long _historyBytes;
 
         /// <summary>Creates a server coordinator with bounded per-scope history.</summary>
-        public NetworkServerCoordinator(int historyCapacity = 64) { if (historyCapacity < 1) throw new ArgumentOutOfRangeException(nameof(historyCapacity)); _historyCapacity = historyCapacity; }
+        public NetworkServerCoordinator(int historyCapacity = 64, long historyBytes = 32 * 1024 * 1024)
+        {
+            if (historyCapacity < 1) throw new ArgumentOutOfRangeException(nameof(historyCapacity));
+            if (historyBytes < 1) throw new ArgumentOutOfRangeException(nameof(historyBytes));
+            _historyCapacity = historyCapacity; _historyBytes = historyBytes;
+        }
         /// <summary>Gets active connection count.</summary>
         public int ConnectionCount => _sessions.Count;
 
@@ -226,6 +229,13 @@ namespace UniGame.StaticEcs.Network
             if (session == null || session.Role != NetworkRole.Server) throw new ArgumentException("A server session is required.", nameof(session));
             if (_sessions.ContainsKey(session.Connection)) throw new InvalidOperationException("Connection is already admitted.");
             _sessions.Add(session.Connection, session);
+        }
+
+        /// <summary>Removes one connection and its queued commands without touching shared capture history.</summary>
+        public bool Remove(ConnectionId connection)
+        {
+            for (var i = _commands.Count - 1; i >= 0; i--) if (_commands[i].Session.Connection == connection) _commands.RemoveAt(i);
+            return _sessions.Remove(connection);
         }
 
         /// <summary>Validates and queues one command for canonical cross-peer ordering.</summary>
@@ -251,7 +261,8 @@ namespace UniGame.StaticEcs.Network
         public void StoreCapture(ScopeId scope, NetworkSnapshot snapshot)
         {
             if (snapshot == null) throw new ArgumentNullException(nameof(snapshot));
-            if (!_history.TryGetValue(scope, out var history)) { history = new NetworkHistory<NetworkSnapshot>(_historyCapacity); _history.Add(scope, history); }
+            if (snapshot.Scope != scope) throw new InvalidOperationException("Snapshot scope does not match its history key.");
+            if (!_history.TryGetValue(scope, out var history)) { history = new NetworkHistory<NetworkSnapshot>(_historyCapacity, _historyBytes, value => value.ByteLength); _history.Add(scope, history); }
             history.Store(snapshot.ServerTick, snapshot);
         }
 
