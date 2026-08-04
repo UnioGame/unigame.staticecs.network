@@ -47,6 +47,9 @@ function Invoke-BoundedRun([string]$define = '') {
 }
 
 Assert-Pass 'SourceGenerator.Shared.Tests~/SourceGenerator.Shared.Tests.csproj'
+Assert-Pass 'SourceGenerator.Empty.Tests~/SourceGenerator.Empty.Tests.csproj'
+$emptyGenerated = 'SourceGenerator.Empty.Tests~/obj/generated/StaticEcs.Network.Generator/UniGame.StaticEcs.Network.Generator.NetworkSourceGenerator/NetworkManifest.g.cs'
+if (Test-Path $emptyGenerated) { throw 'Generator emitted a manifest for an assembly without network types or endpoints' }
 Assert-Pass 'SourceGenerator.Tests~/SourceGenerator.Tests.csproj'
 $generated = Get-Content 'SourceGenerator.Tests~/obj/generated/StaticEcs.Network.Generator/UniGame.StaticEcs.Network.Generator.NetworkSourceGenerator/GeneratedServerNetwork.g.cs' -Raw
 foreach ($required in @('ComponentVersion<global::Shared.Position>()', 'EventVersion<global::Shared.Move>()', 'factory.Policy<global::Shared.Move, global::Demo.MovePolicy>()')) {

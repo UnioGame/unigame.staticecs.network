@@ -44,8 +44,9 @@ namespace UniGame.StaticEcs.Network.Generator
                 compilation.GetTypeByMetadataName("UniGame.StaticEcs.Network.NetworkCompilerSupport") == null) return;
             var records = new List<Record>();
             CollectTypes(compilation.Assembly.GlobalNamespace, compilation.AssemblyName ?? string.Empty, records, context);
-            var referenced = CollectReferenced(compilation, context);
             var hasEndpoints = compilation.Assembly.GetAttributes().Any(a => a.AttributeClass?.ToDisplayString() == EndpointAttribute);
+            if (records.Count == 0 && !hasEndpoints) return;
+            var referenced = CollectReferenced(compilation, context);
             if (hasEndpoints) foreach (var record in records) context.ReportDiagnostic(Diagnostic.Create(SharedOnly, record.Symbol.Locations.FirstOrDefault(), record.Symbol.ToDisplayString()));
             ValidateCollisions(records.Concat(referenced), context);
             EmitManifest(records, context);
