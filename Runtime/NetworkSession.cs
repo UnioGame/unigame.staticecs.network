@@ -90,6 +90,15 @@ namespace UniGame.StaticEcs.Network
         Malformed
     }
 
+    internal enum PacketValidationResult : byte
+    {
+        Success,
+        WrongState,
+        WrongRole,
+        WrongEpoch,
+        Sequence
+    }
+
     /// <summary>Owns one immutable validated command payload.</summary>
     public sealed class NetworkCommandEnvelope
     {
@@ -187,21 +196,22 @@ namespace UniGame.StaticEcs.Network
             return ((ICommandNetworkInvoker<TWorld>)entry.Invoker).Dispatch(envelope.ExactPayload, entry.Version, in context);
         }
 
-        internal bool ValidatePacket(in PacketHeader header)
+        internal PacketValidationResult ValidatePacket(in PacketHeader header)
         {
-            if (header.PacketSequence != _nextReceivePacketSequence) return false;
             if (State == NetworkSessionState.Handshaking)
             {
-                if (Role == NetworkRole.Server && (header.Kind != PacketKind.Hello || header.SessionEpoch != 0)) return false;
-                if (Role == NetworkRole.Client && (header.Kind != PacketKind.Ready || header.SessionEpoch == 0)) return false;
+                if (Role == NetworkRole.Server && header.Kind != PacketKind.Hello || Role == NetworkRole.Client && header.Kind != PacketKind.Ready) return PacketValidationResult.WrongRole;
+                if (header.SessionEpoch == 0 != (Role == NetworkRole.Server)) return PacketValidationResult.WrongEpoch;
             }
-            else if (State != NetworkSessionState.Established || header.SessionEpoch != Epoch || !IsAllowedEstablishedPacket(header.Kind))
+            else
             {
-                return false;
+                if (State != NetworkSessionState.Established) return PacketValidationResult.WrongState;
+                if (!IsAllowedEstablishedPacket(header.Kind)) return PacketValidationResult.WrongRole;
+                if (header.SessionEpoch != Epoch) return PacketValidationResult.WrongEpoch;
             }
-
+            if (header.PacketSequence != _nextReceivePacketSequence) return PacketValidationResult.Sequence;
             _nextReceivePacketSequence++;
-            return true;
+            return PacketValidationResult.Success;
         }
 
         private bool IsAllowedEstablishedPacket(PacketKind kind) => Role == NetworkRole.Server
@@ -235,9 +245,6 @@ namespace UniGame.StaticEcs.Network
             if (historyBytes < 1) throw new ArgumentOutOfRangeException(nameof(historyBytes));
             _historyCapacity = historyCapacity; _historyBytes = historyBytes;
         }
-        /// <summary>Gets active connection count.</summary>
-        internal int ActiveConnectionCount { get { var count = 0; foreach (var session in _sessions.Values) if (session.State != NetworkSessionState.Closed) count++; return count; } }
-        internal int ActivePeerCount { get { var count = 0; foreach (var session in _sessions.Values) if (session.State == NetworkSessionState.Established) count++; return count; } }
         internal int PendingCommandCount => _commands.Count;
 
         /// <summary>Adds one independently owned per-connection session.</summary>

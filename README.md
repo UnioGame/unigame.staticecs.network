@@ -11,7 +11,7 @@ Transport-neutral Network v2 runtime and generated AOT-safe schemas for Static E
 - Captures full snapshots from `NetworkTag` authority entities, validates the complete snapshot before mutation, creates replica tags automatically, and despawns absent replicas.
 - Keeps `NetworkSession<TWorld>` state per connection while the server coordinator shares immutable captures only by `(ScopeId, ServerTick)`.
 - Validates commands by connection, peer, epoch, generated schema, sequence, tick window, and server policy before ordering them by `(TargetTick, PeerId, Sequence)`.
-- Enforces role-specific packet kinds before consuming the reliable sequence and reports accepted and policy-rejected command totals separately.
+- Classifies state, direction, epoch, and sequence failures without consuming rejected packet cursors, and reports accepted and policy-rejected command totals once per server tick.
 - Provides bounded history, isolated two-client in-memory transport, privacy-safe observer events, and bounded NDJSON output.
 
 ## Usage
@@ -69,7 +69,7 @@ World<ServerWorld>.Types().Tag<NetworkTag>().Component<NetworkOwnerComponent>();
 World<ServerWorld>.Initialize();
 
 var schema = GeneratedServerNetwork.CreateSchema();
-var server = new NetworkServer<ServerWorld>(schema, (scope, entity) => IsInScope(scope, entity), historyTicks: 64, historyBytes: 32 * 1024 * 1024);
+var server = new NetworkServer<ServerWorld>(schema, (scope, entity) => IsInScope(scope, entity), historyTicks: 64, historyBytes: 32 * 1024 * 1024, observer: observer);
 ```
 
 Add each server transport with its server-assigned peer, epoch, and scope. The framed Hello/Ready exchange admits the generated fingerprint; malformed, incompatible, or stale packets fail closed and request resynchronization.
@@ -101,5 +101,5 @@ Snapshot metadata includes tick, scope, schema fingerprint, canonical hash, byte
 - Endpoint names must be unique valid C# identifiers because they form `Generated{Name}Network`.
 - The generator targets `netstandard2.0`, references Microsoft.CodeAnalysis.CSharp 4.3.1 at build time, and ships only `Analyzers/StaticEcs.Network.Generator.dll` with the `RoslynAnalyzer` label.
 - `NetworkNdjsonLog` contains numeric metadata only. It never records packet payloads, command values, schema manifests, or replicated world bytes.
-- Diagnostics use six measured phases. Decode includes framing and snapshot staging, SnapshotApply contains only ECS mutation, and acknowledgements are separate Send attempts. Fields include packet kind, duration nanoseconds, schema fingerprint, accepted/rejected command counters, state-derived connection/peer gauges, queue/history gauges, tick gap, and error category.
+- Diagnostics use six measured phases. Decode includes framing and snapshot staging, SnapshotApply contains only ECS mutation, and acknowledgements are separate Send attempts. Snapshot failures retain distinct schema, malformed, limit, and world categories. Server dispatch totals are emitted through the server observer once per tick; connection gauges include live handshakes while peer gauges include only established sessions.
 - See the repository [Static ECS knowledge base](../../../docs/knowledge/static-ecs/) for world lifecycle and type registration.

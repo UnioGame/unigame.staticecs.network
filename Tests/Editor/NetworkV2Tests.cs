@@ -251,7 +251,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 {
                     var serverObserver = new TraceCollector();
                     var clientObserver = new TraceCollector();
-                    var server = new NetworkServer<AuthorityWorld>(Schema<AuthorityWorld>(true), (scope, entity) => true);
+                    var server = new NetworkServer<AuthorityWorld>(Schema<AuthorityWorld>(true), (scope, entity) => true, observer: serverObserver);
                     server.AddConnection(serverTransport, 1, 9, new ScopeId(3), serverObserver);
                     var client = new NetworkClient<ClientAWorld>(clientTransport, Schema<ClientAWorld>(false), new ScopeId(3), clientObserver);
                     Assert.That(client.BeginHandshake(), Is.True);
@@ -301,27 +301,33 @@ namespace UniGame.StaticEcs.Network.Tests
                 var clientFactory = NetworkCompilerSupport.Create<RejectWorld>(); clientFactory.Command<TestCommand>(new NetworkTypeId(10)); var clientSchema = clientFactory.Freeze();
                 var serverFactory = NetworkCompilerSupport.Create<RejectWorld>(); serverFactory.Command<TestCommand, RejectPolicy>(new NetworkTypeId(10)); var serverSchema = serverFactory.Freeze();
                 MemoryNetworkTransport.CreatePair(new ConnectionId(77), out var clientTransport, out var serverTransport);
-                using (clientTransport) using (serverTransport)
+                MemoryNetworkTransport.CreatePair(new ConnectionId(78), out var otherClientTransport, out var otherServerTransport);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(79), out var pendingClientTransport, out var pendingServerTransport);
+                using (clientTransport) using (serverTransport) using (otherClientTransport) using (otherServerTransport) using (pendingClientTransport) using (pendingServerTransport)
                 {
                     var observer = new TraceCollector();
-                    var server = new NetworkServer<RejectWorld>(serverSchema, (scope, entity) => false);
+                    var server = new NetworkServer<RejectWorld>(serverSchema, (scope, entity) => false, observer: observer);
                     var session = server.AddConnection(serverTransport, 1, 5, default, observer);
+                    server.AddConnection(otherServerTransport, 2, 6, default, observer);
+                    server.AddConnection(pendingServerTransport, 3, 7, default, observer);
                     var client = new NetworkClient<RejectWorld>(clientTransport, clientSchema);
-                    client.BeginHandshake(); server.Receive(); server.Tick(_ => { }); client.Process();
+                    var otherClient = new NetworkClient<RejectWorld>(otherClientTransport, clientSchema);
+                    client.BeginHandshake(); otherClient.BeginHandshake(); server.Receive(); server.Tick(_ => { }); client.Process(); otherClient.Process();
                     observer.Events.Clear();
                     Assert.That(client.SendCommand(new TestCommand { Value = 7 }, 2), Is.EqualTo(NetworkCommandResult.Queued));
                     server.Receive(); server.Tick(_ => { });
                     var dispatch = observer.Single(NetworkPhase.CommandDispatch);
+                    Assert.That(observer.Count(NetworkPhase.CommandDispatch), Is.EqualTo(1));
                     Assert.That(dispatch.Result, Is.EqualTo(NetworkResultCategory.Policy));
                     Assert.That(dispatch.Commands, Is.EqualTo(1)); Assert.That(dispatch.AcceptedCommands, Is.EqualTo(0)); Assert.That(dispatch.RejectedCommands, Is.EqualTo(1));
-                    Assert.That(dispatch.ActiveConnections, Is.EqualTo(1)); Assert.That(dispatch.ActivePeers, Is.EqualTo(1));
+                    Assert.That(dispatch.ActiveConnections, Is.EqualTo(3)); Assert.That(dispatch.ActivePeers, Is.EqualTo(2));
 
                     var disconnect = Packet(PacketKind.Disconnect, 5, 3); disconnect.SchemaFingerprint = serverSchema.Fingerprint;
                     Assert.That(NetworkPacket.TryEncode(disconnect, ReadOnlySpan<byte>.Empty, out var packet), Is.True);
                     Assert.That(clientTransport.TrySend(packet), Is.True); server.Receive();
                     Assert.That(session.State, Is.EqualTo(NetworkSessionState.Closed));
                     var decoded = observer.Single(NetworkPhase.Decode, NetworkPacketKind.Disconnect);
-                    Assert.That(decoded.ActiveConnections, Is.EqualTo(0)); Assert.That(decoded.ActivePeers, Is.EqualTo(0));
+                    Assert.That(decoded.ActiveConnections, Is.EqualTo(2)); Assert.That(decoded.ActivePeers, Is.EqualTo(1));
                 }
             }
             finally { World<RejectWorld>.Destroy(); }
@@ -332,10 +338,17 @@ namespace UniGame.StaticEcs.Network.Tests
         {
             var schema = NetworkCompilerSupport.Create<TestWorld>().Freeze();
             var handshake = new NetworkSession<TestWorld>(new ConnectionId(1), NetworkRole.Server, schema);
-            var hello = Packet(PacketKind.Hello, 0, 1); Assert.That(handshake.ValidatePacket(in hello), Is.True);
-            Assert.That(handshake.ValidatePacket(in hello), Is.False);
+            var hello = Packet(PacketKind.Hello, 0, 1); Assert.That(handshake.ValidatePacket(in hello), Is.EqualTo(PacketValidationResult.Success));
+            Assert.That(handshake.ValidatePacket(in hello), Is.EqualTo(PacketValidationResult.Sequence));
             var client = new NetworkSession<TestWorld>(new ConnectionId(2), NetworkRole.Client, schema);
-            var ready = Packet(PacketKind.Ready, 7, 1); Assert.That(client.ValidatePacket(in ready), Is.True);
+            var ready = Packet(PacketKind.Ready, 7, 1); Assert.That(client.ValidatePacket(in ready), Is.EqualTo(PacketValidationResult.Success));
+
+            var classified = new NetworkSession<TestWorld>(new ConnectionId(3), NetworkRole.Server, schema);
+            Assert.That(classified.Admit(schema.Fingerprint, 1, 7, default), Is.EqualTo(NetworkAdmissionResult.Accepted));
+            var wrongRoleReplay = Packet(PacketKind.FullSnapshot, 6, 99);
+            Assert.That(classified.ValidatePacket(in wrongRoleReplay), Is.EqualTo(PacketValidationResult.WrongRole));
+            var first = Packet(PacketKind.Ack, 7, 1);
+            Assert.That(classified.ValidatePacket(in first), Is.EqualTo(PacketValidationResult.Success), "wrong-role rejection must not consume the cursor");
 
             var kinds = new[] { PacketKind.Hello, PacketKind.Ready, PacketKind.CommandBatch, PacketKind.FullSnapshot, PacketKind.Ack, PacketKind.ResyncRequest, PacketKind.Disconnect };
             for (var i = 0; i < kinds.Length; i++)
@@ -343,6 +356,32 @@ namespace UniGame.StaticEcs.Network.Tests
                 AssertPacketDirection(schema, NetworkRole.Server, kinds[i], kinds[i] == PacketKind.CommandBatch || kinds[i] == PacketKind.Ack || kinds[i] == PacketKind.ResyncRequest || kinds[i] == PacketKind.Disconnect, (uint)(10 + i));
                 AssertPacketDirection(schema, NetworkRole.Client, kinds[i], kinds[i] == PacketKind.FullSnapshot || kinds[i] == PacketKind.ResyncRequest || kinds[i] == PacketKind.Disconnect, (uint)(30 + i));
             }
+        }
+
+        [Test]
+        public void SnapshotDiagnosticsPreserveEveryApplyResultCategory()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var authorityEntity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                authorityEntity.Set<NetworkTag>(); authorityEntity.Set(new TestComponent { Value = 1 });
+                var authority = new NetworkReplicator<AuthorityWorld>(Schema<AuthorityWorld>(true), (scope, entity) => true, new ScopeId(1));
+                Assert.That(authority.Capture(1, out var capture), Is.EqualTo(SnapshotCaptureResult.Success));
+                var schema = Schema<ClientAWorld>(false);
+                var client = new NetworkReplicator<ClientAWorld>(schema, new ScopeId(1));
+
+                Assert.That(NetworkClient<ClientAWorld>.DiagnosticResult(client.Stage(null, out _)), Is.EqualTo(NetworkResultCategory.Limits));
+                var wrongScope = new NetworkSnapshot(1, schema.Fingerprint, new ScopeId(2), Array.Empty<byte>(), 0, 0);
+                Assert.That(NetworkClient<ClientAWorld>.DiagnosticResult(client.Stage(wrongScope, out _)), Is.EqualTo(NetworkResultCategory.Schema));
+                var malformed = new NetworkSnapshot(1, schema.Fingerprint, new ScopeId(1), new byte[] { 0, 0, 0, 0, 1 }, 0, 0);
+                Assert.That(NetworkClient<ClientAWorld>.DiagnosticResult(client.Stage(malformed, out _)), Is.EqualTo(NetworkResultCategory.Malformed));
+                World<ClientAWorld>.NewEntity<TestEntity>();
+                Assert.That(NetworkClient<ClientAWorld>.DiagnosticResult(client.Stage(capture, out _)), Is.EqualTo(NetworkResultCategory.World));
+                Assert.That(NetworkClient<ClientAWorld>.DiagnosticResult(SnapshotApplyResult.Success), Is.EqualTo(NetworkResultCategory.Success));
+            }
+            finally { World<AuthorityWorld>.Destroy(); World<ClientAWorld>.Destroy(); }
         }
 
         [Test]
@@ -510,14 +549,14 @@ namespace UniGame.StaticEcs.Network.Tests
         {
             var session = new NetworkSession<TestWorld>(new ConnectionId(connection), role, schema);
             Assert.That(session.Admit(schema.Fingerprint, 1, 7, default), Is.EqualTo(NetworkAdmissionResult.Accepted));
-            var wrongEpoch = Packet(kind, 6, 1); Assert.That(session.ValidatePacket(in wrongEpoch), Is.False);
-            var outOfOrder = Packet(kind, 7, 2); Assert.That(session.ValidatePacket(in outOfOrder), Is.False);
-            var candidate = Packet(kind, 7, 1); Assert.That(session.ValidatePacket(in candidate), Is.EqualTo(allowed));
-            if (allowed) Assert.That(session.ValidatePacket(in candidate), Is.False);
+            var wrongEpoch = Packet(kind, 6, 1); Assert.That(session.ValidatePacket(in wrongEpoch), Is.EqualTo(allowed ? PacketValidationResult.WrongEpoch : PacketValidationResult.WrongRole));
+            var outOfOrder = Packet(kind, 7, 2); Assert.That(session.ValidatePacket(in outOfOrder), Is.EqualTo(allowed ? PacketValidationResult.Sequence : PacketValidationResult.WrongRole));
+            var candidate = Packet(kind, 7, 1); Assert.That(session.ValidatePacket(in candidate), Is.EqualTo(allowed ? PacketValidationResult.Success : PacketValidationResult.WrongRole));
+            if (allowed) Assert.That(session.ValidatePacket(in candidate), Is.EqualTo(PacketValidationResult.Sequence));
             else
             {
                 var fallback = Packet(role == NetworkRole.Server ? PacketKind.Ack : PacketKind.FullSnapshot, 7, 1);
-                Assert.That(session.ValidatePacket(in fallback), Is.True, $"{role} rejected {kind} without consuming sequence");
+                Assert.That(session.ValidatePacket(in fallback), Is.EqualTo(PacketValidationResult.Success), $"{role} rejected {kind} without consuming sequence");
             }
             Assert.That(session.State, Is.EqualTo(NetworkSessionState.Established));
         }
