@@ -4,7 +4,8 @@
   "references": [
     "unigame.staticecs.network.protocol",
     "unigame.staticecs",
-    "FFS.StaticEcs"
+    "FFS.StaticEcs",
+    "FFS.StaticPack"
   ],
   "includePlatforms": [],
   "excludePlatforms": [],

@@ -2,7 +2,7 @@ using System;
 
 namespace UniGame.StaticEcs.Network
 {
-    /// <summary>Identifies a packet payload on the version-one wire.</summary>
+    /// <summary>Identifies a packet payload on the version-two wire.</summary>
     public enum PacketKind : byte
     {
         /// <summary>Begins protocol negotiation.</summary>
@@ -64,7 +64,7 @@ namespace UniGame.StaticEcs.Network
     [Flags]
     public enum CommandFlags : ushort
     {
-        /// <summary>Version one defines no command options.</summary>
+        /// <summary>Version two defines no command options.</summary>
         None = 0
     }
 
@@ -121,7 +121,7 @@ namespace UniGame.StaticEcs.Network
         Requested = 8
     }
 
-    /// <summary>Defines immutable version-one protocol limits.</summary>
+    /// <summary>Defines immutable version-two protocol limits.</summary>
     public static class ProtocolLimits
     {
         /// <summary>Maximum encoded payload length.</summary>
@@ -142,100 +142,77 @@ namespace UniGame.StaticEcs.Network
         public const int MaxChunkMappings = 4096;
     }
 
-    /// <summary>Represents a stable RFC 4122 byte-ordered schema identifier.</summary>
-    public readonly struct TypeId : IEquatable<TypeId>, IComparable<TypeId>
+    /// <summary>Identifies a generated wire type by a non-zero xxHash32 value.</summary>
+    public readonly struct NetworkTypeId : IEquatable<NetworkTypeId>, IComparable<NetworkTypeId>
     {
-        private readonly Guid _value;
+        private readonly uint _value;
 
-        /// <summary>Creates an identifier from a UUID.</summary>
-        public TypeId(Guid value) => _value = value;
+        /// <summary>Creates an identifier from a non-zero xxHash32 value.</summary>
+        public NetworkTypeId(uint value)
+        {
+            if (value == 0) throw new ArgumentOutOfRangeException(nameof(value));
+            _value = value;
+        }
 
-        /// <summary>Creates an identifier from a canonical UUID string.</summary>
-        public TypeId(string value) => _value = Guid.Parse(value);
-
-        /// <summary>Gets the empty identifier.</summary>
-        public static TypeId Empty => new(Guid.Empty);
-
-        /// <summary>Gets the UUID value.</summary>
-        public Guid Value => _value;
-
-        /// <summary>Writes the identifier in RFC 4122 canonical byte order.</summary>
-        public void WriteBytes(Span<byte> destination) => UuidBytes.Write(_value, destination);
-
-        /// <summary>Reads an identifier in RFC 4122 canonical byte order.</summary>
-        public static TypeId ReadBytes(ReadOnlySpan<byte> source) => new(UuidBytes.Read(source));
+        /// <summary>Gets the hash value.</summary>
+        public uint Value => _value;
 
         /// <inheritdoc />
-        public bool Equals(TypeId other) => _value.Equals(other._value);
+        public bool Equals(NetworkTypeId other) => _value == other._value;
         /// <inheritdoc />
-        public override bool Equals(object obj) => obj is TypeId other && Equals(other);
+        public override bool Equals(object obj) => obj is NetworkTypeId other && Equals(other);
         /// <inheritdoc />
         public override int GetHashCode() => _value.GetHashCode();
         /// <inheritdoc />
-        public int CompareTo(TypeId other) => UuidBytes.Compare(_value, other._value);
+        public int CompareTo(NetworkTypeId other) => _value.CompareTo(other._value);
         /// <inheritdoc />
-        public override string ToString() => _value.ToString("D");
+        public override string ToString() => _value.ToString("x8");
         /// <summary>Tests identifier equality.</summary>
-        public static bool operator ==(TypeId left, TypeId right) => left.Equals(right);
+        public static bool operator ==(NetworkTypeId left, NetworkTypeId right) => left.Equals(right);
         /// <summary>Tests identifier inequality.</summary>
-        public static bool operator !=(TypeId left, TypeId right) => !left.Equals(right);
+        public static bool operator !=(NetworkTypeId left, NetworkTypeId right) => !left.Equals(right);
     }
 
-    /// <summary>Represents a stable identifier for a bounded value codec.</summary>
-    public readonly struct CodecId : IEquatable<CodecId>
+    /// <summary>Contains the 128-bit schema fingerprint carried by every packet.</summary>
+    public readonly struct SchemaFingerprint : IEquatable<SchemaFingerprint>, IComparable<SchemaFingerprint>
     {
-        private readonly TypeId _value;
-        /// <summary>Creates a codec identifier from a UUID.</summary>
-        public CodecId(Guid value) => _value = new TypeId(value);
-        /// <summary>Creates a codec identifier from a canonical UUID string.</summary>
-        public CodecId(string value) => _value = new TypeId(value);
-        /// <summary>Gets the empty codec identifier.</summary>
-        public static CodecId Empty => new(Guid.Empty);
-        /// <summary>Writes the identifier in RFC 4122 canonical byte order.</summary>
-        public void WriteBytes(Span<byte> destination) => _value.WriteBytes(destination);
+        private readonly ulong _low;
+        private readonly ulong _high;
+
+        /// <summary>Creates a fingerprint from two little-endian halves.</summary>
+        public SchemaFingerprint(ulong low, ulong high) { _low = low; _high = high; }
+
+        /// <summary>Gets the empty fingerprint.</summary>
+        public static SchemaFingerprint Empty => default;
+
+        /// <summary>Writes exactly 16 bytes in canonical little-endian order.</summary>
+        public void WriteBytes(Span<byte> destination)
+        {
+            if (destination.Length < 16) throw new ArgumentException("A schema fingerprint requires 16 bytes.", nameof(destination));
+            Hashing.Write64(destination, 0, _low);
+            Hashing.Write64(destination, 8, _high);
+        }
+
+        /// <summary>Reads exactly 16 bytes in canonical little-endian order.</summary>
+        public static SchemaFingerprint ReadBytes(ReadOnlySpan<byte> source)
+        {
+            if (source.Length < 16) throw new ArgumentException("A schema fingerprint requires 16 bytes.", nameof(source));
+            return new SchemaFingerprint(Hashing.Read64(source, 0), Hashing.Read64(source, 8));
+        }
+
         /// <inheritdoc />
-        public bool Equals(CodecId other) => _value.Equals(other._value);
+        public bool Equals(SchemaFingerprint other) => _low == other._low && _high == other._high;
         /// <inheritdoc />
-        public override bool Equals(object obj) => obj is CodecId other && Equals(other);
+        public override bool Equals(object obj) => obj is SchemaFingerprint other && Equals(other);
         /// <inheritdoc />
-        public override int GetHashCode() => _value.GetHashCode();
+        public override int GetHashCode() => unchecked(_low.GetHashCode() * 397 ^ _high.GetHashCode());
         /// <inheritdoc />
-        public override string ToString() => _value.ToString();
+        public int CompareTo(SchemaFingerprint other) { var high = _high.CompareTo(other._high); return high != 0 ? high : _low.CompareTo(other._low); }
+        /// <inheritdoc />
+        public override string ToString() => $"{_high:x16}{_low:x16}";
         /// <summary>Tests identifier equality.</summary>
-        public static bool operator ==(CodecId left, CodecId right) => left.Equals(right);
+        public static bool operator ==(SchemaFingerprint left, SchemaFingerprint right) => left.Equals(right);
         /// <summary>Tests identifier inequality.</summary>
-        public static bool operator !=(CodecId left, CodecId right) => !left.Equals(right);
-    }
-
-    internal static class UuidBytes
-    {
-        internal static void Write(Guid value, Span<byte> destination)
-        {
-            if (destination.Length < 16) throw new ArgumentException("A UUID requires 16 bytes.", nameof(destination));
-            Span<byte> bytes = stackalloc byte[16];
-            if (!value.TryWriteBytes(bytes)) throw new InvalidOperationException("Unable to write UUID bytes.");
-            destination[0] = bytes[3]; destination[1] = bytes[2]; destination[2] = bytes[1]; destination[3] = bytes[0];
-            destination[4] = bytes[5]; destination[5] = bytes[4];
-            destination[6] = bytes[7]; destination[7] = bytes[6];
-            for (var i = 8; i < 16; i++) destination[i] = bytes[i];
-        }
-
-        internal static Guid Read(ReadOnlySpan<byte> source)
-        {
-            if (source.Length < 16) throw new ArgumentException("A UUID requires 16 bytes.", nameof(source));
-            Span<byte> bytes = stackalloc byte[16];
-            bytes[0] = source[3]; bytes[1] = source[2]; bytes[2] = source[1]; bytes[3] = source[0];
-            bytes[4] = source[5]; bytes[5] = source[4]; bytes[6] = source[7]; bytes[7] = source[6];
-            for (var i = 8; i < 16; i++) bytes[i] = source[i];
-            return new Guid(bytes);
-        }
-
-        internal static int Compare(Guid left, Guid right)
-        {
-            Span<byte> a = stackalloc byte[16]; Span<byte> b = stackalloc byte[16];
-            Write(left, a); Write(right, b);
-            for (var i = 0; i < 16; i++) { var value = a[i].CompareTo(b[i]); if (value != 0) return value; }
-            return 0;
-        }
+        public static bool operator !=(SchemaFingerprint left, SchemaFingerprint right) => !left.Equals(right);
     }
 }

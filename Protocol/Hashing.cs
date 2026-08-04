@@ -18,6 +18,39 @@ namespace UniGame.StaticEcs.Network
             return ~crc;
         }
 
+        internal static uint XxHash32(ReadOnlySpan<byte> data)
+        {
+            const uint prime1 = 2654435761U;
+            const uint prime2 = 2246822519U;
+            const uint prime3 = 3266489917U;
+            const uint prime4 = 668265263U;
+            const uint prime5 = 374761393U;
+            var index = 0;
+            uint hash;
+            if (data.Length >= 16)
+            {
+                var v1 = unchecked(prime1 + prime2);
+                var v2 = prime2;
+                var v3 = 0U;
+                var v4 = unchecked(0U - prime1);
+                var limit = data.Length - 16;
+                do
+                {
+                    v1 = Rotate32(unchecked(v1 + Read32(data, index) * prime2), 13) * prime1; index += 4;
+                    v2 = Rotate32(unchecked(v2 + Read32(data, index) * prime2), 13) * prime1; index += 4;
+                    v3 = Rotate32(unchecked(v3 + Read32(data, index) * prime2), 13) * prime1; index += 4;
+                    v4 = Rotate32(unchecked(v4 + Read32(data, index) * prime2), 13) * prime1; index += 4;
+                } while (index <= limit);
+                hash = Rotate32(v1, 1) + Rotate32(v2, 7) + Rotate32(v3, 12) + Rotate32(v4, 18);
+            }
+            else hash = prime5;
+            hash += (uint)data.Length;
+            while (index <= data.Length - 4) { hash = Rotate32(unchecked(hash + Read32(data, index) * prime3), 17) * prime4; index += 4; }
+            while (index < data.Length) { hash = Rotate32(unchecked(hash + data[index] * prime5), 11) * prime1; index++; }
+            hash ^= hash >> 15; hash *= prime2; hash ^= hash >> 13; hash *= prime3; hash ^= hash >> 16;
+            return hash;
+        }
+
         internal static ulong XxHash64(ReadOnlySpan<byte> data)
         {
             var index = 0;
@@ -55,6 +88,7 @@ namespace UniGame.StaticEcs.Network
         private static ulong Round(ulong value, ulong input) { value += input * Prime2; value = Rotate(value, 31); return value * Prime1; }
         private static ulong Merge(ulong hash, ulong value) { hash ^= Round(0, value); return hash * Prime1 + Prime4; }
         private static ulong Rotate(ulong value, int count) => value << count | value >> (64 - count);
+        private static uint Rotate32(uint value, int count) => value << count | value >> (32 - count);
         private static uint[] CreateCrcTable()
         {
             var table = new uint[256];
