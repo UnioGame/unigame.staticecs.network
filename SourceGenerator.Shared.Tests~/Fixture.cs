@@ -9,6 +9,10 @@ namespace FFS.Libraries.StaticEcs
     public interface ILinkType { }
     public interface ILinksType : ILinkType { }
     public interface IMultiComponent { }
+    public readonly struct ComponentTypeConfig<T> where T : struct, IComponent { public readonly byte? Version; public ComponentTypeConfig(byte? version = null) { Version = version; } }
+    public readonly struct EventTypeConfig<T> where T : struct, IEvent { public readonly byte? Version; public EventTypeConfig(byte? version = null) { Version = version; } }
+    public interface IComponentConfig<T> where T : struct, IComponent { ComponentTypeConfig<T> Config(); }
+    public interface IEventConfig<T> where T : struct, IEvent { EventTypeConfig<T> Config(); }
     public static class World<T> where T : struct, IWorldType { public struct Entity { } public struct TypeRegistrar { public TypeRegistrar Event<E>() where E : struct, IEvent => this; } }
 }
 
@@ -33,7 +37,7 @@ namespace UniGame.StaticEcs.Network
         public void Policy<C, P>() where C : struct, FFS.Libraries.StaticEcs.IEvent, INetworkCommand where P : struct, INetworkCommandPolicy<T, C> { }
         public NetworkSchema<T> Freeze() => null;
     }
-    public static class NetworkCompilerSupport { public static NetworkCompilerSchemaFactory<T> Create<T>() where T : struct, FFS.Libraries.StaticEcs.IWorldType => null; }
+    public static class NetworkCompilerSupport { public static NetworkCompilerSchemaFactory<T> Create<T>() where T : struct, FFS.Libraries.StaticEcs.IWorldType => null; public static byte ComponentVersion<T>() where T : struct, FFS.Libraries.StaticEcs.IComponent, FFS.Libraries.StaticEcs.IComponentConfig<T> => default(T).Config().Version ?? 0; public static byte EventVersion<T>() where T : struct, FFS.Libraries.StaticEcs.IEvent, FFS.Libraries.StaticEcs.IEventConfig<T> => default(T).Config().Version ?? 0; }
     public struct NetworkCommandAccepted<T> : FFS.Libraries.StaticEcs.IEvent where T : struct, FFS.Libraries.StaticEcs.IEvent, INetworkCommand { }
     public struct NetworkCommandRejected<T> : FFS.Libraries.StaticEcs.IEvent where T : struct, FFS.Libraries.StaticEcs.IEvent, INetworkCommand { }
     public interface INetworkCommandPolicy<TWorld, TCommand> where TWorld : struct, FFS.Libraries.StaticEcs.IWorldType where TCommand : struct, FFS.Libraries.StaticEcs.IEvent, INetworkCommand { }
@@ -41,13 +45,15 @@ namespace UniGame.StaticEcs.Network
 
 namespace Shared
 {
-    public struct Position : FFS.Libraries.StaticEcs.IComponent, FFS.Libraries.StaticEcs.IDisableable, UniGame.StaticEcs.Network.INetworkType
+    public struct Position : FFS.Libraries.StaticEcs.IComponent, FFS.Libraries.StaticEcs.IDisableable, FFS.Libraries.StaticEcs.IComponentConfig<Position>, UniGame.StaticEcs.Network.INetworkType
     {
+        public FFS.Libraries.StaticEcs.ComponentTypeConfig<Position> Config() => new FFS.Libraries.StaticEcs.ComponentTypeConfig<Position>(7);
         public void Write<TWorld>(ref FFS.Libraries.StaticPack.BinaryPackWriter writer, FFS.Libraries.StaticEcs.World<TWorld>.Entity self) where TWorld : struct, FFS.Libraries.StaticEcs.IWorldType { }
         public void Read<TWorld>(ref FFS.Libraries.StaticPack.BinaryPackReader reader, FFS.Libraries.StaticEcs.World<TWorld>.Entity self, byte version, bool disabled) where TWorld : struct, FFS.Libraries.StaticEcs.IWorldType { }
     }
-    public struct Move : FFS.Libraries.StaticEcs.IEvent, UniGame.StaticEcs.Network.INetworkCommand
+    public struct Move : FFS.Libraries.StaticEcs.IEvent, FFS.Libraries.StaticEcs.IEventConfig<Move>, UniGame.StaticEcs.Network.INetworkCommand
     {
+        public FFS.Libraries.StaticEcs.EventTypeConfig<Move> Config() => new FFS.Libraries.StaticEcs.EventTypeConfig<Move>(9);
         public void Write(ref FFS.Libraries.StaticPack.BinaryPackWriter writer) { }
         public void Read(ref FFS.Libraries.StaticPack.BinaryPackReader reader, byte version) { }
     }

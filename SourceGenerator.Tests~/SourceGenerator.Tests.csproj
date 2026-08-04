@@ -9,6 +9,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\SourceGenerator.Shared.Tests~\SourceGenerator.Shared.Tests.csproj" />
-    <ProjectReference Include="..\SourceGenerator~\UniGame.StaticEcs.Network.Generator.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+    <Analyzer Include="..\Analyzers\StaticEcs.Network.Generator.dll" />
   </ItemGroup>
 </Project>

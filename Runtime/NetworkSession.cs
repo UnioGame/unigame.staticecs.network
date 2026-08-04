@@ -123,9 +123,10 @@ namespace UniGame.StaticEcs.Network
         private readonly INetworkObserver _observer;
         private uint _nextSendSequence = 1;
         private uint _nextReceiveSequence = 1;
+        private uint _nextReceivePacketSequence = 1;
 
         /// <summary>Creates a handshaking per-connection session.</summary>
-        public NetworkSession(ConnectionId connection, NetworkRole role, NetworkSchema<TWorld> schema, INetworkObserver observer = null)
+        internal NetworkSession(ConnectionId connection, NetworkRole role, NetworkSchema<TWorld> schema, INetworkObserver observer = null)
         { Connection = connection; Role = role; _schema = schema ?? throw new ArgumentNullException(nameof(schema)); _observer = observer; State = NetworkSessionState.Handshaking; }
         /// <summary>Gets transport-owned connection.</summary>
         public ConnectionId Connection { get; }
@@ -141,7 +142,7 @@ namespace UniGame.StaticEcs.Network
         public ScopeId Scope { get; private set; }
 
         /// <summary>Completes the v2 handshake after exact shared-manifest fingerprint comparison.</summary>
-        public NetworkAdmissionResult Admit(SchemaFingerprint remoteFingerprint, uint peerId, uint epoch, ScopeId scope)
+        internal NetworkAdmissionResult Admit(SchemaFingerprint remoteFingerprint, uint peerId, uint epoch, ScopeId scope)
         {
             if (State != NetworkSessionState.Handshaking) return NetworkAdmissionResult.WrongRole;
             if (remoteFingerprint != _schema.Fingerprint) return Reject(NetworkAdmissionResult.SchemaMismatch);
@@ -152,7 +153,7 @@ namespace UniGame.StaticEcs.Network
         }
 
         /// <summary>Serializes one client command through its Static ECS event hook.</summary>
-        public NetworkCommandResult CreateCommand<TCommand>(in TCommand command, uint targetTick, out NetworkCommandEnvelope envelope)
+        internal NetworkCommandResult CreateCommand<TCommand>(in TCommand command, uint targetTick, out NetworkCommandEnvelope envelope)
             where TCommand : struct, IEvent, INetworkCommand
         {
             envelope = null;
@@ -164,7 +165,6 @@ namespace UniGame.StaticEcs.Network
                 if (entry.Kind != NetworkSchemaKind.Command || entry.RuntimeType != typeof(TCommand) || entry.Invoker is not ICommandNetworkInvoker<TWorld> invoker) continue;
                 var payload = invoker.Capture(command, entry.MaxBytes);
                 envelope = new NetworkCommandEnvelope(Connection, PeerId, Epoch, _nextSendSequence++, targetTick, entry.TypeId, entry.Version, payload);
-                Observe(NetworkPhase.Send, NetworkTraceKind.Point, NetworkResultCategory.Success, 0, targetTick, payload.Length);
                 return NetworkCommandResult.Queued;
             }
             return NetworkCommandResult.SchemaMismatch;
@@ -184,28 +184,40 @@ namespace UniGame.StaticEcs.Network
         internal NetworkCommandResult Dispatch(NetworkCommandEnvelope envelope, NetworkSchemaEntry entry)
         {
             var context = new NetworkCommandContext(PeerId, Epoch, envelope.Sequence, envelope.TargetTick);
-            var sent = ((ICommandNetworkInvoker<TWorld>)entry.Invoker).Dispatch(envelope.ExactPayload, entry.Version, in context);
-            Observe(NetworkPhase.CommandDispatch, NetworkTraceKind.Point, sent ? NetworkResultCategory.Success : NetworkResultCategory.Policy, 0, envelope.TargetTick, envelope.ExactPayload.Length);
-            return sent ? NetworkCommandResult.Dispatched : NetworkCommandResult.PolicyRejected;
+            return ((ICommandNetworkInvoker<TWorld>)entry.Invoker).Dispatch(envelope.ExactPayload, entry.Version, in context);
         }
 
-        /// <summary>Closes this connection without touching shared capture history.</summary>
-        public void Close() => State = NetworkSessionState.Closed;
+        internal bool ValidatePacket(in PacketHeader header)
+        {
+            if (header.PacketSequence != _nextReceivePacketSequence) return false;
+            if (State == NetworkSessionState.Handshaking)
+            {
+                if (Role == NetworkRole.Server && (header.Kind != PacketKind.Hello || header.SessionEpoch != 0)) return false;
+                if (Role == NetworkRole.Client && (header.Kind != PacketKind.Ready || header.SessionEpoch == 0)) return false;
+            }
+            else if (State != NetworkSessionState.Established || header.SessionEpoch != Epoch ||
+                     header.Kind == PacketKind.Hello || header.Kind == PacketKind.Ready)
+            {
+                return false;
+            }
+
+            _nextReceivePacketSequence++;
+            return true;
+        }
+
+        internal void Close() => State = NetworkSessionState.Closed;
 
         private NetworkAdmissionResult Reject(NetworkAdmissionResult result) { State = NetworkSessionState.Rejected; return result; }
-        private void Observe(NetworkPhase phase, NetworkTraceKind kind, NetworkResultCategory result, uint serverTick, uint targetTick, int bytes)
-            => Trace(phase, kind, result, NetworkPacketKind.None, serverTick, targetTick, bytes, 0, 0, 0, 0);
-
-        internal void Trace(NetworkPhase phase, NetworkTraceKind kind, NetworkResultCategory result, NetworkPacketKind packetKind, uint serverTick, uint targetTick, int bytes, int historyTicks, long historyBytes, int tickGap, long durationNanoseconds)
+        internal void Trace(NetworkPhase phase, NetworkTraceKind kind, NetworkResultCategory result, NetworkPacketKind packetKind, uint serverTick, uint targetTick, int bytes, int historyTicks, long historyBytes, int tickGap, long durationNanoseconds, int entities = 0, int records = 0, int commands = 0, int queueSize = 0, int activeConnections = 1, int activePeers = 0)
         {
             if (_observer == null) return;
-            try { var value = new NetworkTraceEvent(phase, kind, result, Role, Connection.Value, PeerId, Epoch, serverTick, targetTick, bytes, bytes > 0 ? 1 : 0, 0, 0, phase == NetworkPhase.CommandDispatch ? 1 : 0, 0, historyTicks, State == NetworkSessionState.Closed ? 0 : 1, PeerId == 0 ? 0 : 1, Stopwatch.GetTimestamp(), packetKind, historyBytes, tickGap, durationNanoseconds, _schema.Fingerprint); _observer.Observe(in value); }
+            try { var packets = phase == NetworkPhase.Receive || phase == NetworkPhase.Decode || phase == NetworkPhase.Send ? 1 : 0; var value = new NetworkTraceEvent(phase, kind, result, Role, Connection.Value, PeerId, Epoch, serverTick, targetTick, bytes, packets, entities, records, commands, queueSize, historyTicks, State == NetworkSessionState.Closed ? 0 : activeConnections, PeerId == 0 ? 0 : activePeers, Stopwatch.GetTimestamp(), packetKind, historyBytes, tickGap, durationNanoseconds, _schema.Fingerprint); _observer.Observe(in value); }
             catch { }
         }
     }
 
     /// <summary>Coordinates sessions, ordered commands, and scope-shared immutable captures.</summary>
-    public sealed class NetworkServerCoordinator<TWorld> where TWorld : struct, IWorldType
+    internal sealed class NetworkServerCoordinator<TWorld> where TWorld : struct, IWorldType
     {
         private readonly Dictionary<ConnectionId, NetworkSession<TWorld>> _sessions = new Dictionary<ConnectionId, NetworkSession<TWorld>>();
         private readonly Dictionary<ScopeId, NetworkHistory<NetworkSnapshot>> _history = new Dictionary<ScopeId, NetworkHistory<NetworkSnapshot>>();
@@ -214,17 +226,18 @@ namespace UniGame.StaticEcs.Network
         private readonly long _historyBytes;
 
         /// <summary>Creates a server coordinator with bounded per-scope history.</summary>
-        public NetworkServerCoordinator(int historyCapacity = 64, long historyBytes = 32 * 1024 * 1024)
+        internal NetworkServerCoordinator(int historyCapacity = 64, long historyBytes = 32 * 1024 * 1024)
         {
             if (historyCapacity < 1) throw new ArgumentOutOfRangeException(nameof(historyCapacity));
             if (historyBytes < 1) throw new ArgumentOutOfRangeException(nameof(historyBytes));
             _historyCapacity = historyCapacity; _historyBytes = historyBytes;
         }
         /// <summary>Gets active connection count.</summary>
-        public int ConnectionCount => _sessions.Count;
+        internal int ConnectionCount => _sessions.Count;
+        internal int PendingCommandCount => _commands.Count;
 
         /// <summary>Adds one independently owned per-connection session.</summary>
-        public void Add(NetworkSession<TWorld> session)
+        internal void Add(NetworkSession<TWorld> session)
         {
             if (session == null || session.Role != NetworkRole.Server) throw new ArgumentException("A server session is required.", nameof(session));
             if (_sessions.ContainsKey(session.Connection)) throw new InvalidOperationException("Connection is already admitted.");
@@ -232,14 +245,14 @@ namespace UniGame.StaticEcs.Network
         }
 
         /// <summary>Removes one connection and its queued commands without touching shared capture history.</summary>
-        public bool Remove(ConnectionId connection)
+        internal bool Remove(ConnectionId connection)
         {
             for (var i = _commands.Count - 1; i >= 0; i--) if (_commands[i].Session.Connection == connection) _commands.RemoveAt(i);
             return _sessions.Remove(connection);
         }
 
         /// <summary>Validates and queues one command for canonical cross-peer ordering.</summary>
-        public NetworkCommandResult Queue(NetworkCommandEnvelope envelope, uint serverTick, uint pastWindow = 2, uint futureWindow = 8)
+        internal NetworkCommandResult Queue(NetworkCommandEnvelope envelope, uint serverTick, uint pastWindow = 2, uint futureWindow = 8)
         {
             if (envelope == null || !_sessions.TryGetValue(envelope.Connection, out var session)) return NetworkCommandResult.WrongSession;
             var result = session.Validate(envelope, serverTick, pastWindow, futureWindow, out var entry);
@@ -248,7 +261,7 @@ namespace UniGame.StaticEcs.Network
         }
 
         /// <summary>Dispatches queued commands ordered by target tick, trusted peer, then sequence.</summary>
-        public int Dispatch(uint serverTick)
+        internal int Dispatch(uint serverTick)
         {
             _commands.Sort((a, b) => { var tick = a.Envelope.TargetTick.CompareTo(b.Envelope.TargetTick); if (tick != 0) return tick; var peer = a.Envelope.PeerId.CompareTo(b.Envelope.PeerId); return peer != 0 ? peer : a.Envelope.Sequence.CompareTo(b.Envelope.Sequence); });
             var count = 0;
@@ -258,7 +271,7 @@ namespace UniGame.StaticEcs.Network
         }
 
         /// <summary>Stores one immutable capture shared only within the specified scope.</summary>
-        public void StoreCapture(ScopeId scope, NetworkSnapshot snapshot)
+        internal void StoreCapture(ScopeId scope, NetworkSnapshot snapshot)
         {
             if (snapshot == null) throw new ArgumentNullException(nameof(snapshot));
             if (snapshot.Scope != scope) throw new InvalidOperationException("Snapshot scope does not match its history key.");
@@ -267,12 +280,15 @@ namespace UniGame.StaticEcs.Network
         }
 
         /// <summary>Finds one scope-and-tick capture. Per-peer acknowledgement state is never shared here.</summary>
-        public bool TryGetCapture(ScopeId scope, uint serverTick, out NetworkSnapshot snapshot)
+        internal bool TryGetCapture(ScopeId scope, uint serverTick, out NetworkSnapshot snapshot)
         {
             if (_history.TryGetValue(scope, out var history)) return history.TryGet(serverTick, out snapshot);
             snapshot = null;
             return false;
         }
+
+        internal int HistoryCount(ScopeId scope) => _history.TryGetValue(scope, out var history) ? history.Count : 0;
+        internal long HistoryByteCount(ScopeId scope) => _history.TryGetValue(scope, out var history) ? history.Bytes : 0;
 
         private readonly struct PendingCommand
         {

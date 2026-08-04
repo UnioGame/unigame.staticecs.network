@@ -50,7 +50,7 @@ namespace UniGame.StaticEcs.Network
     public sealed class NetworkManifestRecordAttribute : Attribute
     {
         /// <summary>Creates compiler-readable manifest metadata.</summary>
-        public NetworkManifestRecordAttribute(uint typeId, NetworkSchemaKind kind, Type runtimeType, byte version = 1)
+        public NetworkManifestRecordAttribute(uint typeId, NetworkSchemaKind kind, Type runtimeType, byte version = 0)
         { Id = typeId; Kind = kind; RuntimeType = runtimeType; Version = version; }
         /// <summary>Gets generated id.</summary>
         public uint Id { get; }

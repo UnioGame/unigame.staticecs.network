@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using FFS.Libraries.StaticEcs;
 using FFS.Libraries.StaticPack;
@@ -95,7 +96,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 var clientASchema = Schema<ClientAWorld>(false);
                 var clientBSchema = Schema<ClientBWorld>(false);
                 using var mock = new TwoClientNetworkMock();
-                var server = new NetworkServer<AuthorityWorld>(authoritySchema, 4, 1024 * 1024);
+                var server = new NetworkServer<AuthorityWorld>(authoritySchema, (scope, entity) => true, 4, 1024 * 1024);
                 server.AddConnection(mock.ServerA, 2, 11, new ScopeId(7));
                 server.AddConnection(mock.ServerB, 1, 12, new ScopeId(7));
                 var clientA = new NetworkClient<ClientAWorld>(mock.ClientA, clientASchema, new ScopeId(7));
@@ -107,7 +108,7 @@ namespace UniGame.StaticEcs.Network.Tests
 
                 Assert.That(clientA.BeginHandshake(), Is.True);
                 Assert.That(clientB.BeginHandshake(), Is.True);
-                server.Tick(1);
+                server.Receive(); server.Tick(_ => { });
                 clientA.Process(); clientB.Process();
                 Assert.That(clientA.Session.State, Is.EqualTo(NetworkSessionState.Established));
                 Assert.That(clientB.Session.State, Is.EqualTo(NetworkSessionState.Established));
@@ -119,13 +120,13 @@ namespace UniGame.StaticEcs.Network.Tests
                 authority.Set(new TestComponent { Value = 2 });
                 Assert.That(clientA.SendCommand(new TestCommand { Value = 20 }, 2), Is.EqualTo(NetworkCommandResult.Queued));
                 Assert.That(clientB.SendCommand(new TestCommand { Value = 10 }, 2), Is.EqualTo(NetworkCommandResult.Queued));
-                server.Tick(2);
+                server.Receive(); server.Tick(_ => { });
                 clientA.Process(); clientB.Process();
                 Assert.That(replicaA.Read<TestComponent>().Value, Is.EqualTo(2));
                 Assert.That(replicaB.Read<TestComponent>().Value, Is.EqualTo(2));
                 authority.Disable<TestComponent>();
                 Assert.That(authority.HasDisabled<TestComponent>(), Is.True);
-                server.Tick(3); clientA.Process(); clientB.Process();
+                server.Receive(); server.Tick(_ => { }); clientA.Process(); clientB.Process();
                 Assert.That(replicaA.HasDisabled<TestComponent>(), Is.True);
                 Assert.That(replicaB.HasDisabled<TestComponent>(), Is.True);
                 var index = 0;
@@ -139,7 +140,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(clientA.ResyncRequested, Is.True);
 
                 authority.Destroy();
-                server.Tick(4);
+                server.Receive(); server.Tick(_ => { });
                 clientA.Process(); clientB.Process();
                 Assert.That(gid.TryUnpack<ClientAWorld>(out _), Is.False);
                 Assert.That(gid.TryUnpack<ClientBWorld>(out _), Is.False);
@@ -151,7 +152,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 {
                     server.AddConnection(reconnectServer, 2, 22, new ScopeId(7));
                     var reconnect = new NetworkClient<ReconnectWorld>(reconnectTransport, Schema<ReconnectWorld>(false), new ScopeId(7));
-                    reconnect.BeginHandshake(); server.Tick(5); reconnect.Process();
+                    reconnect.BeginHandshake(); server.Receive(); server.Tick(_ => { }); reconnect.Process();
                     Assert.That(reconnect.Session.State, Is.EqualTo(NetworkSessionState.Established));
                     Assert.That(reconnect.Session.Epoch, Is.EqualTo(22));
                 }
@@ -172,15 +173,15 @@ namespace UniGame.StaticEcs.Network.Tests
             {
                 var authoritySchema = Schema<AuthorityWorld>(true);
                 var mismatchFactory = NetworkCompilerSupport.Create<MismatchWorld>();
-                mismatchFactory.Entity<TestEntity>(new NetworkTypeId(1)); mismatchFactory.DisableableComponent<TestComponent>(new NetworkTypeId(2)); mismatchFactory.Tag<TestTag>(new NetworkTypeId(3)); mismatchFactory.Command<TestCommand>(new NetworkTypeId(10));
+                mismatchFactory.Entity<TestEntity>(new NetworkTypeId(1)); mismatchFactory.DisableableComponent<TestComponent>(new NetworkTypeId(2), 1); mismatchFactory.Tag<TestTag>(new NetworkTypeId(3)); mismatchFactory.Command<TestCommand>(new NetworkTypeId(10));
                 var mismatchSchema = mismatchFactory.Freeze();
                 MemoryNetworkTransport.CreatePair(new ConnectionId(99), out var clientTransport, out var serverTransport);
                 using (clientTransport) using (serverTransport)
                 {
-                    var server = new NetworkServer<AuthorityWorld>(authoritySchema);
+                    var server = new NetworkServer<AuthorityWorld>(authoritySchema, (scope, entity) => true);
                     var serverSession = server.AddConnection(serverTransport, 9, 4, new ScopeId(1));
                     var client = new NetworkClient<MismatchWorld>(clientTransport, mismatchSchema, new ScopeId(1));
-                    client.BeginHandshake(); server.Tick(1); client.Process();
+                    client.BeginHandshake(); server.Receive(); server.Tick(_ => { }); client.Process();
                     Assert.That(serverSession.State, Is.EqualTo(NetworkSessionState.Rejected));
                     Assert.That(client.ResyncRequested, Is.True);
                 }
@@ -216,12 +217,11 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
-        public void ServerDispatchIsFailClosedWithoutPolicyAndPublishesRejectionWithPolicy()
+        public void ServerDispatchReturnsPolicyRejectedWithoutRejectedEventReceiver()
         {
             World<RejectWorld>.Create(WorldConfig.Default());
             World<RejectWorld>.Types().Event<TestCommand>().Event<NetworkCommandAccepted<TestCommand>>().Event<NetworkCommandRejected<TestCommand>>();
             World<RejectWorld>.Initialize();
-            var rejected = World<RejectWorld>.RegisterEventReceiver<NetworkCommandRejected<TestCommand>>();
             try
             {
                 var clientFactory = NetworkCompilerSupport.Create<RejectWorld>(); clientFactory.Command<TestCommand>(new NetworkTypeId(10)); var clientSchema = clientFactory.Freeze();
@@ -233,13 +233,141 @@ namespace UniGame.StaticEcs.Network.Tests
                 var rawCoordinator = new NetworkServerCoordinator<RejectWorld>(); rawCoordinator.Add(raw);
                 Assert.That(rawCoordinator.Queue(command, 1), Is.EqualTo(NetworkCommandResult.SchemaMismatch));
                 var server = new NetworkSession<RejectWorld>(new ConnectionId(1), NetworkRole.Server, policySchema); server.Admit(policySchema.Fingerprint, 1, 1, default);
-                var coordinator = new NetworkServerCoordinator<RejectWorld>(); coordinator.Add(server);
-                Assert.That(coordinator.Queue(command, 1), Is.EqualTo(NetworkCommandResult.Queued));
-                Assert.That(coordinator.Dispatch(1), Is.EqualTo(1));
-                var count = 0; foreach (var item in rejected) { Assert.That(item.Value.Command.Value, Is.EqualTo(7)); count++; }
-                Assert.That(count, Is.EqualTo(1));
+                Assert.That(server.Validate(command, 1, 2, 8, out var entry), Is.EqualTo(NetworkCommandResult.Queued));
+                Assert.That(server.Dispatch(command, entry), Is.EqualTo(NetworkCommandResult.PolicyRejected));
             }
-            finally { World<RejectWorld>.DeleteEventReceiver(ref rejected); World<RejectWorld>.Destroy(); }
+            finally { World<RejectWorld>.Destroy(); }
+        }
+
+        [Test]
+        public void ServerOwnsMonotonicTickAndGameplayPrecedesCapture()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                MemoryNetworkTransport.CreatePair(new ConnectionId(44), out var clientTransport, out var serverTransport);
+                using (clientTransport) using (serverTransport)
+                {
+                    var serverObserver = new TraceCollector();
+                    var clientObserver = new TraceCollector();
+                    var server = new NetworkServer<AuthorityWorld>(Schema<AuthorityWorld>(true), (scope, entity) => true);
+                    server.AddConnection(serverTransport, 1, 9, new ScopeId(3), serverObserver);
+                    var client = new NetworkClient<ClientAWorld>(clientTransport, Schema<ClientAWorld>(false), new ScopeId(3), clientObserver);
+                    Assert.That(client.BeginHandshake(), Is.True);
+                    server.Receive();
+                    EntityGID gid = default;
+                    server.Tick(tick =>
+                    {
+                        Assert.That(tick, Is.EqualTo(1));
+                        var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                        entity.Set<NetworkTag>(); entity.Set(new TestComponent { Value = 42 }); gid = entity.GID;
+                    });
+                    client.Process();
+                    Assert.That(server.ServerTick, Is.EqualTo(1));
+                    Assert.That(gid.TryUnpack<ClientAWorld>(out var replica), Is.True);
+                    Assert.That(replica.Read<TestComponent>().Value, Is.EqualTo(42));
+
+                    var phases = new HashSet<NetworkPhase>();
+                    foreach (var value in serverObserver.Events) phases.Add(value.Phase);
+                    foreach (var value in clientObserver.Events) phases.Add(value.Phase);
+                    Assert.That(phases, Is.EquivalentTo(new[] { NetworkPhase.Receive, NetworkPhase.Decode, NetworkPhase.CommandDispatch, NetworkPhase.SnapshotCapture, NetworkPhase.SnapshotApply, NetworkPhase.Send }));
+                    Assert.That(serverObserver.Count(NetworkPhase.Send), Is.EqualTo(2));
+                    Assert.That(clientObserver.Count(NetworkPhase.Send), Is.EqualTo(2));
+                    var captured = serverObserver.Single(NetworkPhase.SnapshotCapture);
+                    Assert.That(captured.Entities, Is.EqualTo(1)); Assert.That(captured.Records, Is.EqualTo(1));
+                    Assert.That(captured.HistoryTicks, Is.EqualTo(1)); Assert.That(captured.HistoryBytes, Is.GreaterThan(0));
+                    var applied = clientObserver.Single(NetworkPhase.SnapshotApply);
+                    Assert.That(applied.Entities, Is.EqualTo(1)); Assert.That(applied.Records, Is.EqualTo(1));
+                }
+            }
+            finally { World<AuthorityWorld>.Destroy(); World<ClientAWorld>.Destroy(); }
+        }
+
+        [Test]
+        public void PacketValidationIsStateEpochAndStrictSequenceBound()
+        {
+            var schema = NetworkCompilerSupport.Create<TestWorld>().Freeze();
+            var handshake = new NetworkSession<TestWorld>(new ConnectionId(1), NetworkRole.Server, schema);
+            var hello = Packet(PacketKind.Hello, 0, 1); Assert.That(handshake.ValidatePacket(in hello), Is.True);
+            Assert.That(handshake.ValidatePacket(in hello), Is.False);
+            var client = new NetworkSession<TestWorld>(new ConnectionId(2), NetworkRole.Client, schema);
+            var ready = Packet(PacketKind.Ready, 7, 1); Assert.That(client.ValidatePacket(in ready), Is.True);
+
+            var kinds = new[] { PacketKind.CommandBatch, PacketKind.Ack, PacketKind.ResyncRequest, PacketKind.Disconnect };
+            for (var i = 0; i < kinds.Length; i++)
+            {
+                var session = new NetworkSession<TestWorld>(new ConnectionId((uint)(10 + i)), NetworkRole.Server, schema);
+                Assert.That(session.Admit(schema.Fingerprint, 1, 7, default), Is.EqualTo(NetworkAdmissionResult.Accepted));
+                var wrongEpoch = Packet(kinds[i], 6, 1); Assert.That(session.ValidatePacket(in wrongEpoch), Is.False);
+                var outOfOrder = Packet(kinds[i], 7, 2); Assert.That(session.ValidatePacket(in outOfOrder), Is.False);
+                var valid = Packet(kinds[i], 7, 1); Assert.That(session.ValidatePacket(in valid), Is.True);
+                Assert.That(session.ValidatePacket(in valid), Is.False);
+                var illegalHello = Packet(PacketKind.Hello, 7, 2); Assert.That(session.ValidatePacket(in illegalHello), Is.False);
+                Assert.That(session.State, Is.EqualTo(NetworkSessionState.Established));
+            }
+        }
+
+        [Test]
+        public void CapturesAreScopeDisjointAndStagedSnapshotsAreOwnerBound()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var authoritySchema = Schema<AuthorityWorld>(true);
+                var first = World<AuthorityWorld>.NewEntity<TestEntity>(); first.Set<NetworkTag>(); first.Set(new TestComponent { Value = 1 });
+                var second = World<AuthorityWorld>.NewEntity<TestEntity>(); second.Set<NetworkTag>(); second.Set(new TestComponent { Value = 2 });
+                var capture = new NetworkReplicator<AuthorityWorld>(authoritySchema, scopeSelector: (scope, entity) => entity.Read<TestComponent>().Value == (int)scope.Value);
+                Assert.That(capture.Capture(1, new ScopeId(1), out var one), Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(capture.Capture(1, new ScopeId(2), out var two), Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(one.EntityCount, Is.EqualTo(1));
+                Assert.That(two.EntityCount, Is.EqualTo(1));
+                Assert.That(one.PayloadHash, Is.Not.EqualTo(two.PayloadHash));
+
+                var clientSchema = Schema<ClientAWorld>(false);
+                var owner = new NetworkReplicator<ClientAWorld>(clientSchema, new ScopeId(1));
+                var other = new NetworkReplicator<ClientAWorld>(clientSchema, new ScopeId(1));
+                Assert.That(owner.Stage(one, out var staged), Is.EqualTo(SnapshotApplyResult.Success));
+                Assert.That(other.Apply(staged), Is.EqualTo(SnapshotApplyResult.SchemaMismatch));
+            }
+            finally { World<AuthorityWorld>.Destroy(); World<ClientAWorld>.Destroy(); }
+        }
+
+        [Test]
+        public void StageRejectsDisabledNonDisableableRecordBeforeWorldMutation()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                entity.Set<NetworkTag>(); entity.Set(new TestComponent { Value = 4 }); entity.Set<TestTag>();
+                var capture = new NetworkReplicator<AuthorityWorld>(Schema<AuthorityWorld>(true), new ScopeId(5));
+                Assert.That(capture.Capture(1, out var snapshot), Is.EqualTo(SnapshotCaptureResult.Success));
+                var bytes = snapshot.Bytes.ToArray();
+                Assert.That(bytes.Length, Is.GreaterThan(40));
+                bytes[40] = 1; // second sorted record is TestTag; byte 40 is its disabled flag.
+                var malformed = new NetworkSnapshot(snapshot.ServerTick, snapshot.SchemaFingerprint, snapshot.Scope, bytes, snapshot.EntityCount, snapshot.RecordCount);
+                var apply = new NetworkReplicator<ClientAWorld>(Schema<ClientAWorld>(false), new ScopeId(5));
+                Assert.That(apply.Stage(malformed, out _), Is.EqualTo(SnapshotApplyResult.Malformed));
+                Assert.That(entity.GID.TryUnpack<ClientAWorld>(out _), Is.False);
+            }
+            finally { World<AuthorityWorld>.Destroy(); World<ClientAWorld>.Destroy(); }
+        }
+
+        [Test]
+        public void DeclaredStaticEcsConfigVersionParticipatesInFingerprint()
+        {
+            var first = NetworkCompilerSupport.Create<TestWorld>();
+            first.Component<VersionOneComponent>(new NetworkTypeId(55), NetworkCompilerSupport.ComponentVersion<VersionOneComponent>());
+            var same = NetworkCompilerSupport.Create<TestWorld>();
+            same.Component<VersionOneComponent>(new NetworkTypeId(55), NetworkCompilerSupport.ComponentVersion<VersionOneComponent>());
+            var changed = NetworkCompilerSupport.Create<TestWorld>();
+            changed.Component<VersionTwoComponent>(new NetworkTypeId(55), NetworkCompilerSupport.ComponentVersion<VersionTwoComponent>());
+            var firstFingerprint = first.Freeze().Fingerprint;
+            Assert.That(firstFingerprint, Is.EqualTo(same.Freeze().Fingerprint));
+            Assert.That(changed.Freeze().Fingerprint, Is.Not.EqualTo(firstFingerprint));
         }
 
         [Test]
@@ -314,7 +442,7 @@ namespace UniGame.StaticEcs.Network.Tests
         {
             World<TWorld>.Create(WorldConfig.Default());
             var types = World<TWorld>.Types();
-            types.EntityType<TestEntity>(); types.Tag<NetworkTag>(); types.Component<TestComponent>(); types.Event<TestCommand>();
+            types.EntityType<TestEntity>(); types.Tag<NetworkTag>(); types.Tag<TestTag>(); types.Component<TestComponent>(); types.Event<TestCommand>();
             if (server) { types.Event<NetworkCommandAccepted<TestCommand>>(); types.Event<NetworkCommandRejected<TestCommand>>(); }
             World<TWorld>.Initialize();
         }
@@ -324,10 +452,18 @@ namespace UniGame.StaticEcs.Network.Tests
             var factory = NetworkCompilerSupport.Create<TWorld>();
             factory.Entity<TestEntity>(new NetworkTypeId(1));
             factory.DisableableComponent<TestComponent>(new NetworkTypeId(2));
+            factory.Tag<TestTag>(new NetworkTypeId(3));
             if (server) factory.Command<TestCommand, AllowAnyPolicy<TWorld>>(new NetworkTypeId(10));
             else factory.Command<TestCommand>(new NetworkTypeId(10));
             return factory.Freeze();
         }
+
+        private static PacketHeader Packet(PacketKind kind, uint epoch, uint sequence) => new PacketHeader
+        {
+            Kind = kind,
+            SessionEpoch = epoch,
+            PacketSequence = sequence
+        };
 
         public struct TestWorld : IWorldType { }
         public struct AuthorityWorld : IWorldType { }
@@ -351,11 +487,31 @@ namespace UniGame.StaticEcs.Network.Tests
             public void Write(ref BinaryPackWriter writer) => writer.WriteInt(Value);
             public void Read(ref BinaryPackReader reader, byte version) => Value = reader.ReadInt();
         }
+        public struct VersionOneComponent : IComponent, IComponentConfig<VersionOneComponent>, INetworkType
+        {
+            public ComponentTypeConfig<VersionOneComponent> Config() => new ComponentTypeConfig<VersionOneComponent>(version: 1);
+            public void Write<TWorld>(ref BinaryPackWriter writer, World<TWorld>.Entity self) where TWorld : struct, IWorldType { }
+            public void Read<TWorld>(ref BinaryPackReader reader, World<TWorld>.Entity self, byte version, bool disabled) where TWorld : struct, IWorldType { }
+        }
+        public struct VersionTwoComponent : IComponent, IComponentConfig<VersionTwoComponent>, INetworkType
+        {
+            public ComponentTypeConfig<VersionTwoComponent> Config() => new ComponentTypeConfig<VersionTwoComponent>(version: 2);
+            public void Write<TWorld>(ref BinaryPackWriter writer, World<TWorld>.Entity self) where TWorld : struct, IWorldType { }
+            public void Read<TWorld>(ref BinaryPackReader reader, World<TWorld>.Entity self, byte version, bool disabled) where TWorld : struct, IWorldType { }
+        }
         public struct AllowPolicy : INetworkCommandPolicy<TestWorld, TestCommand>
         {
             public bool Authorize(in NetworkCommandContext context, in TestCommand command) => true;
         }
         public struct AllowAnyPolicy<TWorld> : INetworkCommandPolicy<TWorld, TestCommand> where TWorld : struct, IWorldType { public bool Authorize(in NetworkCommandContext context, in TestCommand command) => true; }
         public struct RejectPolicy : INetworkCommandPolicy<RejectWorld, TestCommand> { public bool Authorize(in NetworkCommandContext context, in TestCommand command) => false; }
+
+        private sealed class TraceCollector : INetworkObserver
+        {
+            internal readonly List<NetworkTraceEvent> Events = new List<NetworkTraceEvent>();
+            public void Observe(in NetworkTraceEvent value) => Events.Add(value);
+            internal int Count(NetworkPhase phase) { var count = 0; for (var i = 0; i < Events.Count; i++) if (Events[i].Phase == phase) count++; return count; }
+            internal NetworkTraceEvent Single(NetworkPhase phase) { for (var i = 0; i < Events.Count; i++) if (Events[i].Phase == phase) return Events[i]; throw new InvalidOperationException("Missing phase " + phase); }
+        }
     }
 }

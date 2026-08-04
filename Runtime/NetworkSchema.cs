@@ -85,6 +85,16 @@ namespace UniGame.StaticEcs.Network
             if (hash == 0) throw new InvalidOperationException("The generated network type id is zero.");
             return new NetworkTypeId(hash);
         }
+
+        /// <summary>Reads a component's declared Static ECS serialization version.</summary>
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public static byte ComponentVersion<T>() where T : struct, FFS.Libraries.StaticEcs.IComponent, IComponentConfig<T>
+            => default(T).Config().Version ?? 0;
+
+        /// <summary>Reads an event's declared Static ECS serialization version.</summary>
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public static byte EventVersion<T>() where T : struct, IEvent, IEventConfig<T>
+            => default(T).Config().Version ?? 0;
     }
 
     /// <summary>Compiler-facing mutable factory; gameplay code uses generated endpoint classes.</summary>
@@ -100,28 +110,28 @@ namespace UniGame.StaticEcs.Network
         public void Entity<TEntity>(NetworkTypeId id) where TEntity : struct, IEntityType, INetworkType => Add(NetworkSchemaKind.Entity, id, 0, 0, 0, typeof(TEntity), new EntityNetworkInvoker<TWorld, TEntity>());
         /// <summary>Adds a generated component type.</summary>
         [EditorBrowsable(EditorBrowsableState.Never)]
-        public void Component<T>(NetworkTypeId id, byte version = 1, uint maxBytes = ProtocolLimits.MaxComponentBytes) where T : struct, FFS.Libraries.StaticEcs.IComponent, INetworkType => Add(NetworkSchemaKind.Component, id, version, maxBytes, 1, typeof(T), new ComponentNetworkInvoker<TWorld, T>());
+        public void Component<T>(NetworkTypeId id, byte version = 0, uint maxBytes = ProtocolLimits.MaxComponentBytes) where T : struct, FFS.Libraries.StaticEcs.IComponent, INetworkType => Add(NetworkSchemaKind.Component, id, version, maxBytes, 1, typeof(T), new ComponentNetworkInvoker<TWorld, T>());
         /// <summary>Adds a generated disableable component type.</summary>
         [EditorBrowsable(EditorBrowsableState.Never)]
-        public void DisableableComponent<T>(NetworkTypeId id, byte version = 1, uint maxBytes = ProtocolLimits.MaxComponentBytes) where T : struct, FFS.Libraries.StaticEcs.IComponent, IDisableable, INetworkType => Add(NetworkSchemaKind.Component, id, version, maxBytes, 1, typeof(T), new DisableableComponentNetworkInvoker<TWorld, T>());
+        public void DisableableComponent<T>(NetworkTypeId id, byte version = 0, uint maxBytes = ProtocolLimits.MaxComponentBytes) where T : struct, FFS.Libraries.StaticEcs.IComponent, IDisableable, INetworkType => Add(NetworkSchemaKind.Component, id, version, maxBytes, 1, typeof(T), new DisableableComponentNetworkInvoker<TWorld, T>());
         /// <summary>Adds a generated tag type.</summary>
         [EditorBrowsable(EditorBrowsableState.Never)]
-        public void Tag<T>(NetworkTypeId id, byte version = 1) where T : struct, ITag, INetworkType => Add(NetworkSchemaKind.Tag, id, version, 0, 0, typeof(T), new TagNetworkInvoker<TWorld, T>());
+        public void Tag<T>(NetworkTypeId id, byte version = 0) where T : struct, ITag, INetworkType => Add(NetworkSchemaKind.Tag, id, version, 0, 0, typeof(T), new TagNetworkInvoker<TWorld, T>());
         /// <summary>Adds a generated link marker.</summary>
         [EditorBrowsable(EditorBrowsableState.Never)]
-        public void Link<T>(NetworkTypeId id, byte version = 1) where T : unmanaged, ILinkType, INetworkType => Add(NetworkSchemaKind.Link, id, version, 8, 1, typeof(T), new DisableableComponentNetworkInvoker<TWorld, World<TWorld>.Link<T>>());
+        public void Link<T>(NetworkTypeId id, byte version = 0) where T : unmanaged, ILinkType, INetworkType => Add(NetworkSchemaKind.Link, id, version, 8, 1, typeof(T), new DisableableComponentNetworkInvoker<TWorld, World<TWorld>.Link<T>>());
         /// <summary>Adds a generated link-set marker.</summary>
         [EditorBrowsable(EditorBrowsableState.Never)]
-        public void Links<T>(NetworkTypeId id, byte version = 1, uint maxCount = 32768) where T : unmanaged, ILinksType, INetworkType => Add(NetworkSchemaKind.Links, id, version, checked(maxCount * 8), maxCount, typeof(T), new DisableableComponentNetworkInvoker<TWorld, World<TWorld>.Links<T>>());
+        public void Links<T>(NetworkTypeId id, byte version = 0, uint maxCount = 32768) where T : unmanaged, ILinksType, INetworkType => Add(NetworkSchemaKind.Links, id, version, checked(maxCount * 8), maxCount, typeof(T), new DisableableComponentNetworkInvoker<TWorld, World<TWorld>.Links<T>>());
         /// <summary>Adds a generated multi-component value.</summary>
         [EditorBrowsable(EditorBrowsableState.Never)]
-        public void Multi<T>(NetworkTypeId id, byte version = 1, uint maxBytes = ProtocolLimits.MaxComponentBytes, uint maxCount = 32768) where T : struct, IMultiComponent, INetworkType => Add(NetworkSchemaKind.Multi, id, version, maxBytes, maxCount, typeof(T), new DisableableComponentNetworkInvoker<TWorld, World<TWorld>.Multi<T>>());
+        public void Multi<T>(NetworkTypeId id, byte version = 0, uint maxBytes = ProtocolLimits.MaxComponentBytes, uint maxCount = 32768) where T : struct, IMultiComponent, INetworkType => Add(NetworkSchemaKind.Multi, id, version, maxBytes, maxCount, typeof(T), new DisableableComponentNetworkInvoker<TWorld, World<TWorld>.Multi<T>>());
         /// <summary>Adds a generated client command without a server policy.</summary>
         [EditorBrowsable(EditorBrowsableState.Never)]
-        public void Command<T>(NetworkTypeId id, byte version = 1, uint maxBytes = ProtocolLimits.MaxCommandBytes) where T : struct, IEvent, INetworkCommand => Add(NetworkSchemaKind.Command, id, version, maxBytes, 1, typeof(T), new CommandNetworkInvoker<TWorld, T>());
+        public void Command<T>(NetworkTypeId id, byte version = 0, uint maxBytes = ProtocolLimits.MaxCommandBytes) where T : struct, IEvent, INetworkCommand => Add(NetworkSchemaKind.Command, id, version, maxBytes, 1, typeof(T), new CommandNetworkInvoker<TWorld, T>());
         /// <summary>Adds a generated server command policy.</summary>
         [EditorBrowsable(EditorBrowsableState.Never)]
-        public void Command<T, TPolicy>(NetworkTypeId id, byte version = 1, uint maxBytes = ProtocolLimits.MaxCommandBytes)
+        public void Command<T, TPolicy>(NetworkTypeId id, byte version = 0, uint maxBytes = ProtocolLimits.MaxCommandBytes)
             where T : struct, IEvent, INetworkCommand where TPolicy : struct, INetworkCommandPolicy<TWorld, T> =>
             Add(NetworkSchemaKind.Command, id, version, maxBytes, 1, typeof(T), new CommandNetworkInvoker<TWorld, T, TPolicy>());
 
@@ -182,6 +192,7 @@ namespace UniGame.StaticEcs.Network
 
     internal interface IRecordNetworkInvoker<TWorld> where TWorld : struct, IWorldType
     {
+        bool SupportsDisabled { get; }
         bool Has(World<TWorld>.Entity entity);
         bool IsDisabled(World<TWorld>.Entity entity);
         byte[] Capture(World<TWorld>.Entity entity, uint maxBytes);
@@ -199,6 +210,7 @@ namespace UniGame.StaticEcs.Network
     internal class ComponentNetworkInvoker<TWorld, T> : IRecordNetworkInvoker<TWorld>
         where TWorld : struct, IWorldType where T : struct, FFS.Libraries.StaticEcs.IComponent
     {
+        public virtual bool SupportsDisabled => false;
         public bool Has(World<TWorld>.Entity entity) => entity.Has<T>();
         public virtual bool IsDisabled(World<TWorld>.Entity entity) => false;
         public byte[] Capture(World<TWorld>.Entity entity, uint maxBytes)
@@ -228,6 +240,7 @@ namespace UniGame.StaticEcs.Network
     internal sealed class DisableableComponentNetworkInvoker<TWorld, T> : ComponentNetworkInvoker<TWorld, T>
         where TWorld : struct, IWorldType where T : struct, FFS.Libraries.StaticEcs.IComponent, IDisableable
     {
+        public override bool SupportsDisabled => true;
         public override bool IsDisabled(World<TWorld>.Entity entity) => entity.HasDisabled<T>();
         public override void Apply(World<TWorld>.Entity entity, byte[] payload, byte version, bool disabled)
         {
@@ -239,6 +252,7 @@ namespace UniGame.StaticEcs.Network
     internal sealed class TagNetworkInvoker<TWorld, T> : IRecordNetworkInvoker<TWorld>
         where TWorld : struct, IWorldType where T : struct, ITag
     {
+        public bool SupportsDisabled => false;
         public bool Has(World<TWorld>.Entity entity) => entity.Has<T>();
         public bool IsDisabled(World<TWorld>.Entity entity) => false;
         public byte[] Capture(World<TWorld>.Entity entity, uint maxBytes) => Array.Empty<byte>();
@@ -250,7 +264,7 @@ namespace UniGame.StaticEcs.Network
     {
         bool HasPolicy { get; }
         byte[] Capture(object command, uint maxBytes);
-        bool Dispatch(byte[] payload, byte version, in NetworkCommandContext context);
+        NetworkCommandResult Dispatch(byte[] payload, byte version, in NetworkCommandContext context);
     }
 
     internal class CommandNetworkInvoker<TWorld, T> : ICommandNetworkInvoker<TWorld>
@@ -264,7 +278,7 @@ namespace UniGame.StaticEcs.Network
             try { value.Write(ref writer); if (writer.Position > maxBytes) throw new InvalidOperationException("Command hook exceeded its generated protocol limit."); return writer.CopyToBytes(); }
             finally { writer.Dispose(); }
         }
-        public virtual bool Dispatch(byte[] payload, byte version, in NetworkCommandContext context) => false;
+        public virtual NetworkCommandResult Dispatch(byte[] payload, byte version, in NetworkCommandContext context) => NetworkCommandResult.SchemaMismatch;
         protected static T Read(byte[] payload, byte version)
         {
             var reader = new BinaryPackReader(payload, (uint)payload.Length, 0);
@@ -279,13 +293,13 @@ namespace UniGame.StaticEcs.Network
         where TWorld : struct, IWorldType where T : struct, IEvent, INetworkCommand where TPolicy : struct, INetworkCommandPolicy<TWorld, T>
     {
         public override bool HasPolicy => true;
-        public override bool Dispatch(byte[] payload, byte version, in NetworkCommandContext context)
+        public override NetworkCommandResult Dispatch(byte[] payload, byte version, in NetworkCommandContext context)
         {
             var command = Read(payload, version);
             var accepted = default(TPolicy).Authorize(in context, in command);
-            return accepted
-                ? World<TWorld>.SendEvent(new NetworkCommandAccepted<T> { Command = command, Context = context })
-                : World<TWorld>.SendEvent(new NetworkCommandRejected<T> { Command = command, Context = context });
+            if (accepted) World<TWorld>.SendEvent(new NetworkCommandAccepted<T> { Command = command, Context = context });
+            else World<TWorld>.SendEvent(new NetworkCommandRejected<T> { Command = command, Context = context });
+            return accepted ? NetworkCommandResult.Dispatched : NetworkCommandResult.PolicyRejected;
         }
     }
 }

@@ -61,6 +61,8 @@ namespace UniGame.StaticEcs.Network
         Rejected,
         /// <summary>The input was malformed.</summary>
         Malformed,
+        /// <summary>The packet violated session, epoch, or sequence state.</summary>
+        Protocol,
         /// <summary>The schema was incompatible.</summary>
         Schema,
         /// <summary>A negotiated limit was exceeded.</summary>

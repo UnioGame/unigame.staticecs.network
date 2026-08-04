@@ -5,6 +5,10 @@ using FFS.Libraries.StaticEcs;
 
 namespace UniGame.StaticEcs.Network
 {
+    /// <summary>Selects whether one network entity belongs to an active replication scope.</summary>
+    public delegate bool NetworkScopeSelector<TWorld>(ScopeId scope, World<TWorld>.Entity entity)
+        where TWorld : struct, IWorldType;
+
     /// <summary>Reports full snapshot capture results.</summary>
     public enum SnapshotCaptureResult : byte
     {
@@ -73,9 +77,12 @@ namespace UniGame.StaticEcs.Network
     /// <summary>Contains a fully validated snapshot; applying it is the first ECS mutation.</summary>
     public sealed class StagedNetworkSnapshot
     {
-        internal StagedNetworkSnapshot(NetworkSnapshot snapshot, StagedEntity[] entities) { Snapshot = snapshot; Entities = entities; }
+        internal StagedNetworkSnapshot(object owner, NetworkSnapshot snapshot, StagedEntity[] entities) { Owner = owner; Snapshot = snapshot; Entities = entities; }
         /// <summary>Gets authoritative simulation time.</summary>
         public uint ServerTick => Snapshot.ServerTick;
+        internal object Owner { get; }
+        internal SchemaFingerprint Fingerprint => Snapshot.SchemaFingerprint;
+        internal ScopeId Scope => Snapshot.Scope;
         internal NetworkSnapshot Snapshot { get; }
         internal StagedEntity[] Entities { get; }
     }
@@ -100,12 +107,15 @@ namespace UniGame.StaticEcs.Network
     {
         private readonly NetworkSchema<TWorld> _schema;
         private readonly Dictionary<EntityGID, NetworkTypeId> _replicas = new Dictionary<EntityGID, NetworkTypeId>();
+        private readonly object _owner = new object();
+        private readonly NetworkScopeSelector<TWorld> _scopeSelector;
 
         /// <summary>Creates a replicator for one generated schema.</summary>
-        public NetworkReplicator(NetworkSchema<TWorld> schema, ScopeId scope = default, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024)
+        public NetworkReplicator(NetworkSchema<TWorld> schema, ScopeId scope = default, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024, NetworkScopeSelector<TWorld> scopeSelector = null)
         {
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
             Scope = scope;
+            _scopeSelector = scopeSelector;
             History = new NetworkHistory<NetworkSnapshot>(historyTicks, historyBytes, value => value.ByteLength);
         }
         /// <summary>Gets the isolated replication scope.</summary>
@@ -125,6 +135,7 @@ namespace UniGame.StaticEcs.Network
             var entities = new List<World<TWorld>.Entity>();
             foreach (var entity in World<TWorld>.Query<All<NetworkTag>>().Entities(EntityStatusType.Any))
             {
+                if (_scopeSelector != null && !_scopeSelector(scope, entity)) continue;
                 if (entities.Count == ProtocolLimits.MaxEntities) return SnapshotCaptureResult.LimitExceeded;
                 entities.Add(entity);
             }
@@ -208,7 +219,8 @@ namespace UniGame.StaticEcs.Network
                         var recordDisabled = reader.ReadBoolean();
                         var length = reader.ReadInt32();
                         if (length < 0 || length > ProtocolLimits.MaxComponentBytes || stream.Length - stream.Position < length) return SnapshotApplyResult.LimitExceeded;
-                        if (!_schema.TryGet(id, out var entry) || entry.Kind != wireKind || entry.Version != version || length > entry.MaxBytes || entry.Invoker is not IRecordNetworkInvoker<TWorld>) return SnapshotApplyResult.SchemaMismatch;
+                        if (!_schema.TryGet(id, out var entry) || entry.Kind != wireKind || entry.Version != version || length > entry.MaxBytes || entry.Invoker is not IRecordNetworkInvoker<TWorld> invoker) return SnapshotApplyResult.SchemaMismatch;
+                        if (recordDisabled && !invoker.SupportsDisabled) return SnapshotApplyResult.Malformed;
                         if (previousEntry != null && Compare(previousEntry, entry) >= 0) return SnapshotApplyResult.Malformed;
                         previousEntry = entry;
                         records[j] = new StagedRecord { Entry = entry, Disabled = recordDisabled, Payload = reader.ReadBytes(length) };
@@ -222,7 +234,7 @@ namespace UniGame.StaticEcs.Network
                     if (!source.Gid.TryUnpack<TWorld>(out var existing)) continue;
                     if (!_replicas.TryGetValue(source.Gid, out var kindId) || kindId != source.Kind.TypeId || !((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Matches(existing)) return SnapshotApplyResult.EntityConflict;
                 }
-                staged = new StagedNetworkSnapshot(snapshot, entities);
+                staged = new StagedNetworkSnapshot(_owner, snapshot, entities);
                 return SnapshotApplyResult.Success;
             }
             catch (EndOfStreamException) { return SnapshotApplyResult.Malformed; }
@@ -233,7 +245,8 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Applies a previously staged snapshot. Hook and lifecycle exceptions are not rolled back.</summary>
         public SnapshotApplyResult Apply(StagedNetworkSnapshot staged)
         {
-            if (staged == null || World<TWorld>.Status != WorldStatus.Initialized) return SnapshotApplyResult.Malformed;
+            if (staged == null || !ReferenceEquals(staged.Owner, _owner) || staged.Fingerprint != _schema.Fingerprint || staged.Scope != Scope) return SnapshotApplyResult.SchemaMismatch;
+            if (World<TWorld>.Status != WorldStatus.Initialized) return SnapshotApplyResult.Malformed;
             var incoming = new HashSet<EntityGID>();
             for (var i = 0; i < staged.Entities.Length; i++) incoming.Add(staged.Entities[i].Gid);
             for (var i = 0; i < staged.Entities.Length; i++)

@@ -90,7 +90,7 @@ namespace UniGame.StaticEcs.Network.Generator
             var metadataName = MetadataName(type);
             var id = Hash(Encoding.UTF8.GetBytes(assemblyName + ":" + metadataName));
             if (id == 0) { context.ReportDiagnostic(Diagnostic.Create(ZeroId, type.Locations.FirstOrDefault(), type.ToDisplayString())); return; }
-            records.Add(new Record(id, shapes[0], type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), metadataName, 1, type));
+            records.Add(new Record(id, shapes[0], type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), metadataName, 0, type));
         }
 
         private static List<Record> CollectReferenced(Compilation compilation, SourceProductionContext context)
@@ -103,7 +103,7 @@ namespace UniGame.StaticEcs.Network.Generator
                 var id = (uint)attribute.ConstructorArguments[0].Value;
                 var kind = (Kind)Convert.ToInt32(attribute.ConstructorArguments[1].Value);
                 var type = attribute.ConstructorArguments[2].Value as INamedTypeSymbol;
-                var version = attribute.ConstructorArguments.Length > 3 ? (byte)attribute.ConstructorArguments[3].Value : (byte)1;
+                var version = attribute.ConstructorArguments.Length > 3 ? (byte)attribute.ConstructorArguments[3].Value : (byte)0;
                 if (id == 0) { context.ReportDiagnostic(Diagnostic.Create(ZeroId, Location.None, type?.ToDisplayString() ?? "<unknown>")); continue; }
                 if (type != null) records.Add(new Record(id, kind, type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), MetadataName(type), version, type));
             }
@@ -203,11 +203,21 @@ namespace UniGame.StaticEcs.Network.Generator
         {
             var operation = record.Kind == Kind.Component && Implements(record.Symbol, "FFS.Libraries.StaticEcs.IDisableable") ? "DisableableComponent" : record.Kind.ToString();
             source.Append(' ', indent).Append(factory).Append('.').Append(operation).Append('<').Append(record.TypeName).Append(">(new global::UniGame.StaticEcs.Network.NetworkTypeId(").Append(record.Id).Append("u)");
-            if (record.Kind != Kind.Entity) source.Append(", ").Append(record.Version);
+            if (record.Kind != Kind.Entity) source.Append(", ").Append(VersionExpression(record));
             source.Append(");\n");
         }
 
+        private static string VersionExpression(Record record)
+        {
+            if (record.Kind == Kind.Component && ImplementsGeneric(record.Symbol, "FFS.Libraries.StaticEcs.IComponentConfig<T>"))
+                return "global::UniGame.StaticEcs.Network.NetworkCompilerSupport.ComponentVersion<" + record.TypeName + ">()";
+            if (record.Kind == Kind.Command && ImplementsGeneric(record.Symbol, "FFS.Libraries.StaticEcs.IEventConfig<T>"))
+                return "global::UniGame.StaticEcs.Network.NetworkCompilerSupport.EventVersion<" + record.TypeName + ">()";
+            return record.Version.ToString();
+        }
+
         private static bool Implements(INamedTypeSymbol type, string metadataName) => type.AllInterfaces.Any(i => i.ToDisplayString() == metadataName);
+        private static bool ImplementsGeneric(INamedTypeSymbol type, string metadataName) => type.AllInterfaces.Any(i => i.OriginalDefinition.ToDisplayString() == metadataName);
         private static bool HasRequiredHooks(INamedTypeSymbol type, Kind kind)
         {
             if (kind == Kind.Entity || kind == Kind.Tag || kind == Kind.Link || kind == Kind.Links || kind == Kind.Multi && type.IsUnmanagedType) return true;

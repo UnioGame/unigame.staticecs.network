@@ -68,7 +68,7 @@ World<ServerWorld>.Types().Tag<NetworkTag>().Component<NetworkOwnerComponent>();
 World<ServerWorld>.Initialize();
 
 var schema = GeneratedServerNetwork.CreateSchema();
-var server = new NetworkServer<ServerWorld>(schema, historyTicks: 64, historyBytes: 32 * 1024 * 1024);
+var server = new NetworkServer<ServerWorld>(schema, (scope, entity) => IsInScope(scope, entity), historyTicks: 64, historyBytes: 32 * 1024 * 1024);
 ```
 
 Add each server transport with its server-assigned peer, epoch, and scope. The framed Hello/Ready exchange admits the generated fingerprint; malformed, incompatible, or stale packets fail closed and request resynchronization.
@@ -77,10 +77,11 @@ Add each server transport with its server-assigned peer, epoch, and scope. The f
 server.AddConnection(serverTransport, assignedPeerId, epoch, scopeId, observer);
 ```
 
-The server `Tick` is the authoritative simulation boundary: all connections receive and decode before ordered command dispatch, capture, and send. Clients expose `Process()` without a caller-provided tick; `ServerTick` comes only from validated packets. Static ECS `World.CurrentTick` remains tracking time.
+The server `Receive()` dequeues and decodes current transport input without advancing time. `Tick(gameplay)` owns the authoritative clock, advances exactly once, dispatches commands, invokes gameplay, then captures and sends the resulting state. Clients expose `Process()` without a caller-provided tick; `ServerTick` comes only from validated packets. Static ECS `World.CurrentTick` remains tracking time.
 
 ```csharp
-server.Tick(serverTick);
+server.Receive();
+server.Tick(serverTick => RunGameplay(serverTick));
 
 var client = new NetworkClient<ClientWorld>(clientTransport, GeneratedClientNetwork.CreateSchema(), scopeId, observer);
 client.BeginHandshake();

@@ -1,0 +1,47 @@
+$ErrorActionPreference = 'Stop'
+$root = Split-Path $PSScriptRoot -Parent
+
+function Invoke-BoundedBuild([string]$project, [int]$timeoutSeconds = 30) {
+    $stdout = New-TemporaryFile
+    $stderr = New-TemporaryFile
+    try {
+        $process = Start-Process dotnet -ArgumentList @('build', $project, '--nologo') -WorkingDirectory $root -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        if (-not $process.WaitForExit($timeoutSeconds * 1000)) {
+            $process.Kill($true)
+            throw "Timed out building $project"
+        }
+        return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = (Get-Content $stdout -Raw) + (Get-Content $stderr -Raw) }
+    }
+    finally {
+        Remove-Item -LiteralPath $stdout, $stderr -Force
+    }
+}
+
+function Assert-Pass([string]$project) {
+    $result = Invoke-BoundedBuild $project
+    if ($result.ExitCode -ne 0) { throw "Expected PASS for $project`n$($result.Output)" }
+}
+
+function Assert-Diagnostic([string]$project, [string[]]$ids) {
+    $result = Invoke-BoundedBuild $project
+    if ($result.ExitCode -eq 0) { throw "Expected compiler failure for $project" }
+    foreach ($id in $ids) {
+        if ($result.Output -notmatch [regex]::Escape($id)) { throw "Missing $id from $project`n$($result.Output)" }
+    }
+}
+
+Assert-Pass 'SourceGenerator.Shared.Tests~/SourceGenerator.Shared.Tests.csproj'
+Assert-Pass 'SourceGenerator.Tests~/SourceGenerator.Tests.csproj'
+$generated = Get-Content 'SourceGenerator.Tests~/obj/generated/StaticEcs.Network.Generator/UniGame.StaticEcs.Network.Generator.NetworkSourceGenerator/GeneratedServerNetwork.g.cs' -Raw
+foreach ($required in @('ComponentVersion<global::Shared.Position>()', 'EventVersion<global::Shared.Move>()', 'factory.Policy<global::Shared.Move, global::Demo.MovePolicy>()')) {
+    if (-not $generated.Contains($required)) { throw "Missing generated AOT/version assertion: $required" }
+}
+
+Assert-Diagnostic 'SourceGenerator.MissingPolicy.Tests~/SourceGenerator.MissingPolicy.Tests.csproj' @('NETV2009')
+Assert-Diagnostic 'SourceGenerator.DuplicatePolicy.Tests~/SourceGenerator.DuplicatePolicy.Tests.csproj' @('NETV2010')
+Assert-Diagnostic 'SourceGenerator.MissingHooks.Tests~/SourceGenerator.MissingHooks.Tests.csproj' @('NETV2007')
+Assert-Diagnostic 'SourceGenerator.SharedOnly.Tests~/SourceGenerator.SharedOnly.Tests.csproj' @('NETV2006')
+Assert-Pass 'SourceGenerator.BadManifest.Tests~/SourceGenerator.BadManifest.Tests.csproj'
+Assert-Diagnostic 'SourceGenerator.InvalidManifest.Tests~/SourceGenerator.InvalidManifest.Tests.csproj' @('NETV2002', 'NETV2008')
+
+Write-Host 'PASS: generator positive AOT/version fixtures and exact diagnostics NETV2002, NETV2006-NETV2010.'
