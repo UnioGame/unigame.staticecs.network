@@ -27,17 +27,18 @@ namespace UniGame.StaticEcs.Network
     [System.AttributeUsage(System.AttributeTargets.Assembly, AllowMultiple = true)] public sealed class NetworkEndpointAttribute : System.Attribute { public NetworkEndpointAttribute(string name, System.Type world, NetworkRole role) { } }
     [System.AttributeUsage(System.AttributeTargets.Class)] public sealed class NetworkManifestAttribute : System.Attribute { }
     [System.AttributeUsage(System.AttributeTargets.Assembly, AllowMultiple = true)] public sealed class NetworkManifestRecordAttribute : System.Attribute { public NetworkManifestRecordAttribute(uint id, NetworkSchemaKind kind, System.Type type, byte version = 1) { } }
-    public readonly struct NetworkTypeId { public NetworkTypeId(uint value) { } }
-    public sealed class NetworkSchema<T> where T : struct, FFS.Libraries.StaticEcs.IWorldType { }
+    public readonly struct NetworkTypeId { public NetworkTypeId(uint value) { Value = value; } public uint Value { get; } }
+    public sealed class NetworkSchema<T> where T : struct, FFS.Libraries.StaticEcs.IWorldType { public NetworkSchema(string fingerprint, byte[] versions) { Fingerprint = fingerprint; Versions = versions; } public string Fingerprint { get; } public byte[] Versions { get; } }
     public sealed class NetworkCompilerSchemaFactory<T> where T : struct, FFS.Libraries.StaticEcs.IWorldType
     {
-        public void Component<C>(NetworkTypeId id, byte version = 1, uint max = 0) where C : struct, FFS.Libraries.StaticEcs.IComponent, INetworkType { }
-        public void DisableableComponent<C>(NetworkTypeId id, byte version = 1, uint max = 0) where C : struct, FFS.Libraries.StaticEcs.IComponent, FFS.Libraries.StaticEcs.IDisableable, INetworkType { }
-        public void Command<C>(NetworkTypeId id, byte version = 1, uint max = 0) where C : struct, FFS.Libraries.StaticEcs.IEvent, INetworkCommand { }
+        private readonly System.Collections.Generic.List<(uint Id, byte Version)> _entries = new System.Collections.Generic.List<(uint, byte)>();
+        public void Component<C>(NetworkTypeId id, byte version = 1, uint max = 0) where C : struct, FFS.Libraries.StaticEcs.IComponent, INetworkType => _entries.Add((id.Value, version));
+        public void DisableableComponent<C>(NetworkTypeId id, byte version = 1, uint max = 0) where C : struct, FFS.Libraries.StaticEcs.IComponent, FFS.Libraries.StaticEcs.IDisableable, INetworkType => _entries.Add((id.Value, version));
+        public void Command<C>(NetworkTypeId id, byte version = 1, uint max = 0) where C : struct, FFS.Libraries.StaticEcs.IEvent, INetworkCommand => _entries.Add((id.Value, version));
         public void Policy<C, P>() where C : struct, FFS.Libraries.StaticEcs.IEvent, INetworkCommand where P : struct, INetworkCommandPolicy<T, C> { }
-        public NetworkSchema<T> Freeze() => null;
+        public NetworkSchema<T> Freeze() { _entries.Sort((left, right) => left.Id.CompareTo(right.Id)); var versions = _entries.ConvertAll(value => value.Version).ToArray(); return new NetworkSchema<T>(string.Join(";", _entries), versions); }
     }
-    public static class NetworkCompilerSupport { public static NetworkCompilerSchemaFactory<T> Create<T>() where T : struct, FFS.Libraries.StaticEcs.IWorldType => null; public static byte ComponentVersion<T>() where T : struct, FFS.Libraries.StaticEcs.IComponent, FFS.Libraries.StaticEcs.IComponentConfig<T> => default(T).Config().Version ?? 0; public static byte EventVersion<T>() where T : struct, FFS.Libraries.StaticEcs.IEvent, FFS.Libraries.StaticEcs.IEventConfig<T> => default(T).Config().Version ?? 0; }
+    public static class NetworkCompilerSupport { public static NetworkCompilerSchemaFactory<T> Create<T>() where T : struct, FFS.Libraries.StaticEcs.IWorldType => new NetworkCompilerSchemaFactory<T>(); public static byte ComponentVersion<T>() where T : struct, FFS.Libraries.StaticEcs.IComponent, FFS.Libraries.StaticEcs.IComponentConfig<T> => default(T).Config().Version ?? 0; public static byte EventVersion<T>() where T : struct, FFS.Libraries.StaticEcs.IEvent, FFS.Libraries.StaticEcs.IEventConfig<T> => default(T).Config().Version ?? 0; }
     public struct NetworkCommandAccepted<T> : FFS.Libraries.StaticEcs.IEvent where T : struct, FFS.Libraries.StaticEcs.IEvent, INetworkCommand { }
     public struct NetworkCommandRejected<T> : FFS.Libraries.StaticEcs.IEvent where T : struct, FFS.Libraries.StaticEcs.IEvent, INetworkCommand { }
     public interface INetworkCommandPolicy<TWorld, TCommand> where TWorld : struct, FFS.Libraries.StaticEcs.IWorldType where TCommand : struct, FFS.Libraries.StaticEcs.IEvent, INetworkCommand { }
@@ -47,7 +48,12 @@ namespace Shared
 {
     public struct Position : FFS.Libraries.StaticEcs.IComponent, FFS.Libraries.StaticEcs.IDisableable, FFS.Libraries.StaticEcs.IComponentConfig<Position>, UniGame.StaticEcs.Network.INetworkType
     {
-        public FFS.Libraries.StaticEcs.ComponentTypeConfig<Position> Config() => new FFS.Libraries.StaticEcs.ComponentTypeConfig<Position>(7);
+        public FFS.Libraries.StaticEcs.ComponentTypeConfig<Position> Config() => new FFS.Libraries.StaticEcs.ComponentTypeConfig<Position>(Version);
+#if NETWORK_VERSION_MISMATCH
+        private const byte Version = 8;
+#else
+        private const byte Version = 7;
+#endif
         public void Write<TWorld>(ref FFS.Libraries.StaticPack.BinaryPackWriter writer, FFS.Libraries.StaticEcs.World<TWorld>.Entity self) where TWorld : struct, FFS.Libraries.StaticEcs.IWorldType { }
         public void Read<TWorld>(ref FFS.Libraries.StaticPack.BinaryPackReader reader, FFS.Libraries.StaticEcs.World<TWorld>.Entity self, byte version, bool disabled) where TWorld : struct, FFS.Libraries.StaticEcs.IWorldType { }
     }

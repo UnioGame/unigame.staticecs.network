@@ -90,13 +90,15 @@ namespace UniGame.StaticEcs.Network
             NetworkRole role, uint connectionId, uint peerId, uint epoch, uint serverTick, uint targetTick,
             int bytes, int packets, int entities, int records, int commands, int queueSize, int historyTicks,
             int activeConnections, int activePeers, long timestamp, NetworkPacketKind packetKind = NetworkPacketKind.None,
-            long historyBytes = 0, int clientServerTickGap = 0, long durationNanoseconds = 0, SchemaFingerprint fingerprint = default)
+            long historyBytes = 0, int clientServerTickGap = 0, long durationNanoseconds = 0, SchemaFingerprint fingerprint = default,
+            int acceptedCommands = 0, int rejectedCommands = 0)
         {
             Phase = phase; Kind = kind; Result = result; Role = role; ConnectionId = connectionId; PeerId = peerId;
             Epoch = epoch; ServerTick = serverTick; TargetTick = targetTick; Bytes = bytes; Packets = packets;
             Entities = entities; Records = records; Commands = commands; QueueSize = queueSize; HistoryTicks = historyTicks;
             ActiveConnections = activeConnections; ActivePeers = activePeers; Timestamp = timestamp;
             PacketKind = packetKind; HistoryBytes = historyBytes; ClientServerTickGap = clientServerTickGap; DurationNanoseconds = durationNanoseconds; SchemaFingerprint = fingerprint;
+            AcceptedCommands = acceptedCommands; RejectedCommands = rejectedCommands;
         }
         /// <summary>Gets the measured phase.</summary>
         public NetworkPhase Phase { get; }
@@ -126,6 +128,10 @@ namespace UniGame.StaticEcs.Network
         public int Records { get; }
         /// <summary>Gets command count.</summary>
         public int Commands { get; }
+        /// <summary>Gets accepted command count.</summary>
+        public int AcceptedCommands { get; }
+        /// <summary>Gets policy-rejected command count.</summary>
+        public int RejectedCommands { get; }
         /// <summary>Gets queue size.</summary>
         public int QueueSize { get; }
         /// <summary>Gets history size.</summary>
@@ -200,7 +206,7 @@ namespace UniGame.StaticEcs.Network
             "\",\"connection\":" + v.ConnectionId + ",\"peer\":" + v.PeerId + ",\"epoch\":" + v.Epoch +
             ",\"server_tick\":" + v.ServerTick + ",\"target_tick\":" + v.TargetTick + ",\"bytes\":" + v.Bytes +
             ",\"packets\":" + v.Packets + ",\"entities\":" + v.Entities + ",\"records\":" + v.Records +
-            ",\"commands\":" + v.Commands + ",\"queue_size\":" + v.QueueSize + ",\"history_ticks\":" + v.HistoryTicks + ",\"history_bytes\":" + v.HistoryBytes +
+            ",\"commands\":" + v.Commands + ",\"accepted_commands\":" + v.AcceptedCommands + ",\"rejected_commands\":" + v.RejectedCommands + ",\"queue_size\":" + v.QueueSize + ",\"history_ticks\":" + v.HistoryTicks + ",\"history_bytes\":" + v.HistoryBytes +
             ",\"active_connections\":" + v.ActiveConnections + ",\"active_peers\":" + v.ActivePeers + ",\"timestamp\":" + v.Timestamp +
             ",\"client_server_tick_gap\":" + v.ClientServerTickGap + ",\"duration_ns\":" + v.DurationNanoseconds + ",\"schema_fingerprint\":\"" + v.SchemaFingerprint + "\"}";
 

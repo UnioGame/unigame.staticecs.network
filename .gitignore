@@ -8,3 +8,6 @@ SourceGenerator.MissingPolicy.Tests~/bin/
 SourceGenerator.MissingPolicy.Tests~/obj/
 SourceGenerator.DuplicatePolicy.Tests~/bin/
 SourceGenerator.DuplicatePolicy.Tests~/obj/
+.compile~/
+**/bin/
+**/obj/

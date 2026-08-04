@@ -110,13 +110,19 @@ namespace UniGame.StaticEcs.Network
         private readonly object _owner = new object();
         private readonly NetworkScopeSelector<TWorld> _scopeSelector;
 
-        /// <summary>Creates a replicator for one generated schema.</summary>
-        public NetworkReplicator(NetworkSchema<TWorld> schema, ScopeId scope = default, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024, NetworkScopeSelector<TWorld> scopeSelector = null)
+        /// <summary>Creates a client-side snapshot apply replicator.</summary>
+        public NetworkReplicator(NetworkSchema<TWorld> schema, ScopeId scope = default, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024)
         {
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
             Scope = scope;
-            _scopeSelector = scopeSelector;
             History = new NetworkHistory<NetworkSnapshot>(historyTicks, historyBytes, value => value.ByteLength);
+        }
+
+        /// <summary>Creates an authority capture replicator with an explicit active-scope selector.</summary>
+        public NetworkReplicator(NetworkSchema<TWorld> schema, NetworkScopeSelector<TWorld> scopeSelector, ScopeId scope = default, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024)
+            : this(schema, scope, historyTicks, historyBytes)
+        {
+            _scopeSelector = scopeSelector ?? throw new ArgumentNullException(nameof(scopeSelector));
         }
         /// <summary>Gets the isolated replication scope.</summary>
         public ScopeId Scope { get; }
@@ -130,12 +136,13 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Captures authority entities for an explicit server replication scope.</summary>
         public SnapshotCaptureResult Capture(uint serverTick, ScopeId scope, out NetworkSnapshot snapshot)
         {
+            if (_scopeSelector == null) throw new InvalidOperationException("Authority capture requires an explicit scope selector.");
             snapshot = null;
             if (World<TWorld>.Status != WorldStatus.Initialized || !World<TWorld>.IsTagTypeRegistered<NetworkTag>()) return SnapshotCaptureResult.WorldUnavailable;
             var entities = new List<World<TWorld>.Entity>();
             foreach (var entity in World<TWorld>.Query<All<NetworkTag>>().Entities(EntityStatusType.Any))
             {
-                if (_scopeSelector != null && !_scopeSelector(scope, entity)) continue;
+                if (!_scopeSelector(scope, entity)) continue;
                 if (entities.Count == ProtocolLimits.MaxEntities) return SnapshotCaptureResult.LimitExceeded;
                 entities.Add(entity);
             }

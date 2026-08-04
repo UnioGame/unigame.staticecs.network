@@ -202,7 +202,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 authority.Set<NetworkTag>(); authority.Set(new TestComponent { Value = 5 });
                 var local = World<ConflictWorld>.NewEntityByGID<TestEntity>(authority.GID);
                 local.Set(new TestComponent { Value = 99 });
-                var capture = new NetworkReplicator<AuthorityWorld>(authoritySchema, new ScopeId(3));
+                var capture = new NetworkReplicator<AuthorityWorld>(authoritySchema, (scope, entity) => true, new ScopeId(3));
                 Assert.That(capture.Capture(1, out var snapshot), Is.EqualTo(SnapshotCaptureResult.Success));
                 var apply = new NetworkReplicator<ConflictWorld>(clientSchema, new ScopeId(3));
                 Assert.That(apply.Stage(snapshot, out _), Is.EqualTo(SnapshotApplyResult.EntityConflict));
@@ -279,9 +279,52 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(captured.HistoryTicks, Is.EqualTo(1)); Assert.That(captured.HistoryBytes, Is.GreaterThan(0));
                     var applied = clientObserver.Single(NetworkPhase.SnapshotApply);
                     Assert.That(applied.Entities, Is.EqualTo(1)); Assert.That(applied.Records, Is.EqualTo(1));
+                    var decodedSnapshot = clientObserver.Single(NetworkPhase.Decode, NetworkPacketKind.FullSnapshot);
+                    var ack = clientObserver.Single(NetworkPhase.Send, NetworkPacketKind.Ack);
+                    Assert.That(decodedSnapshot.Timestamp, Is.LessThanOrEqualTo(applied.Timestamp));
+                    Assert.That(applied.Timestamp, Is.LessThanOrEqualTo(ack.Timestamp));
+                    Assert.That(clientObserver.Count(NetworkPhase.SnapshotApply), Is.EqualTo(1));
+                    Assert.That(clientObserver.Count(NetworkPhase.Send, NetworkPacketKind.Ack), Is.EqualTo(1));
                 }
             }
             finally { World<AuthorityWorld>.Destroy(); World<ClientAWorld>.Destroy(); }
+        }
+
+        [Test]
+        public void ServerDispatchTelemetryPreservesPolicyOutcomeAndActiveSessionGauges()
+        {
+            World<RejectWorld>.Create(WorldConfig.Default());
+            World<RejectWorld>.Types().Event<TestCommand>().Event<NetworkCommandAccepted<TestCommand>>().Event<NetworkCommandRejected<TestCommand>>();
+            World<RejectWorld>.Initialize();
+            try
+            {
+                var clientFactory = NetworkCompilerSupport.Create<RejectWorld>(); clientFactory.Command<TestCommand>(new NetworkTypeId(10)); var clientSchema = clientFactory.Freeze();
+                var serverFactory = NetworkCompilerSupport.Create<RejectWorld>(); serverFactory.Command<TestCommand, RejectPolicy>(new NetworkTypeId(10)); var serverSchema = serverFactory.Freeze();
+                MemoryNetworkTransport.CreatePair(new ConnectionId(77), out var clientTransport, out var serverTransport);
+                using (clientTransport) using (serverTransport)
+                {
+                    var observer = new TraceCollector();
+                    var server = new NetworkServer<RejectWorld>(serverSchema, (scope, entity) => false);
+                    var session = server.AddConnection(serverTransport, 1, 5, default, observer);
+                    var client = new NetworkClient<RejectWorld>(clientTransport, clientSchema);
+                    client.BeginHandshake(); server.Receive(); server.Tick(_ => { }); client.Process();
+                    observer.Events.Clear();
+                    Assert.That(client.SendCommand(new TestCommand { Value = 7 }, 2), Is.EqualTo(NetworkCommandResult.Queued));
+                    server.Receive(); server.Tick(_ => { });
+                    var dispatch = observer.Single(NetworkPhase.CommandDispatch);
+                    Assert.That(dispatch.Result, Is.EqualTo(NetworkResultCategory.Policy));
+                    Assert.That(dispatch.Commands, Is.EqualTo(1)); Assert.That(dispatch.AcceptedCommands, Is.EqualTo(0)); Assert.That(dispatch.RejectedCommands, Is.EqualTo(1));
+                    Assert.That(dispatch.ActiveConnections, Is.EqualTo(1)); Assert.That(dispatch.ActivePeers, Is.EqualTo(1));
+
+                    var disconnect = Packet(PacketKind.Disconnect, 5, 3); disconnect.SchemaFingerprint = serverSchema.Fingerprint;
+                    Assert.That(NetworkPacket.TryEncode(disconnect, ReadOnlySpan<byte>.Empty, out var packet), Is.True);
+                    Assert.That(clientTransport.TrySend(packet), Is.True); server.Receive();
+                    Assert.That(session.State, Is.EqualTo(NetworkSessionState.Closed));
+                    var decoded = observer.Single(NetworkPhase.Decode, NetworkPacketKind.Disconnect);
+                    Assert.That(decoded.ActiveConnections, Is.EqualTo(0)); Assert.That(decoded.ActivePeers, Is.EqualTo(0));
+                }
+            }
+            finally { World<RejectWorld>.Destroy(); }
         }
 
         [Test]
@@ -294,17 +337,11 @@ namespace UniGame.StaticEcs.Network.Tests
             var client = new NetworkSession<TestWorld>(new ConnectionId(2), NetworkRole.Client, schema);
             var ready = Packet(PacketKind.Ready, 7, 1); Assert.That(client.ValidatePacket(in ready), Is.True);
 
-            var kinds = new[] { PacketKind.CommandBatch, PacketKind.Ack, PacketKind.ResyncRequest, PacketKind.Disconnect };
+            var kinds = new[] { PacketKind.Hello, PacketKind.Ready, PacketKind.CommandBatch, PacketKind.FullSnapshot, PacketKind.Ack, PacketKind.ResyncRequest, PacketKind.Disconnect };
             for (var i = 0; i < kinds.Length; i++)
             {
-                var session = new NetworkSession<TestWorld>(new ConnectionId((uint)(10 + i)), NetworkRole.Server, schema);
-                Assert.That(session.Admit(schema.Fingerprint, 1, 7, default), Is.EqualTo(NetworkAdmissionResult.Accepted));
-                var wrongEpoch = Packet(kinds[i], 6, 1); Assert.That(session.ValidatePacket(in wrongEpoch), Is.False);
-                var outOfOrder = Packet(kinds[i], 7, 2); Assert.That(session.ValidatePacket(in outOfOrder), Is.False);
-                var valid = Packet(kinds[i], 7, 1); Assert.That(session.ValidatePacket(in valid), Is.True);
-                Assert.That(session.ValidatePacket(in valid), Is.False);
-                var illegalHello = Packet(PacketKind.Hello, 7, 2); Assert.That(session.ValidatePacket(in illegalHello), Is.False);
-                Assert.That(session.State, Is.EqualTo(NetworkSessionState.Established));
+                AssertPacketDirection(schema, NetworkRole.Server, kinds[i], kinds[i] == PacketKind.CommandBatch || kinds[i] == PacketKind.Ack || kinds[i] == PacketKind.ResyncRequest || kinds[i] == PacketKind.Disconnect, (uint)(10 + i));
+                AssertPacketDirection(schema, NetworkRole.Client, kinds[i], kinds[i] == PacketKind.FullSnapshot || kinds[i] == PacketKind.ResyncRequest || kinds[i] == PacketKind.Disconnect, (uint)(30 + i));
             }
         }
 
@@ -316,6 +353,8 @@ namespace UniGame.StaticEcs.Network.Tests
             try
             {
                 var authoritySchema = Schema<AuthorityWorld>(true);
+                var missingSelector = new NetworkReplicator<AuthorityWorld>(authoritySchema);
+                Assert.Throws<InvalidOperationException>(() => missingSelector.Capture(1, out _));
                 var first = World<AuthorityWorld>.NewEntity<TestEntity>(); first.Set<NetworkTag>(); first.Set(new TestComponent { Value = 1 });
                 var second = World<AuthorityWorld>.NewEntity<TestEntity>(); second.Set<NetworkTag>(); second.Set(new TestComponent { Value = 2 });
                 var capture = new NetworkReplicator<AuthorityWorld>(authoritySchema, scopeSelector: (scope, entity) => entity.Read<TestComponent>().Value == (int)scope.Value);
@@ -343,7 +382,7 @@ namespace UniGame.StaticEcs.Network.Tests
             {
                 var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
                 entity.Set<NetworkTag>(); entity.Set(new TestComponent { Value = 4 }); entity.Set<TestTag>();
-                var capture = new NetworkReplicator<AuthorityWorld>(Schema<AuthorityWorld>(true), new ScopeId(5));
+                var capture = new NetworkReplicator<AuthorityWorld>(Schema<AuthorityWorld>(true), (scope, value) => true, new ScopeId(5));
                 Assert.That(capture.Capture(1, out var snapshot), Is.EqualTo(SnapshotCaptureResult.Success));
                 var bytes = snapshot.Bytes.ToArray();
                 Assert.That(bytes.Length, Is.GreaterThan(40));
@@ -401,7 +440,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 coordinator.Add(serverA); coordinator.Add(serverB);
                 Assert.That(coordinator.Queue(a, 10), Is.EqualTo(NetworkCommandResult.Queued));
                 Assert.That(coordinator.Queue(b, 10), Is.EqualTo(NetworkCommandResult.Queued));
-                Assert.That(coordinator.Dispatch(10), Is.EqualTo(2));
+                Assert.That(coordinator.Dispatch(10).Total, Is.EqualTo(2));
                 var index = 0;
                 foreach (var item in receiver)
                 {
@@ -432,6 +471,8 @@ namespace UniGame.StaticEcs.Network.Tests
             StringAssert.Contains("\"packet_kind\":\"none\"", text);
             StringAssert.Contains("\"history_ticks\":0", text);
             StringAssert.Contains("\"history_bytes\":0", text);
+            StringAssert.Contains("\"accepted_commands\":0", text);
+            StringAssert.Contains("\"rejected_commands\":0", text);
             StringAssert.Contains("\"client_server_tick_gap\":0", text);
             StringAssert.Contains("\"duration_ns\":0", text);
             StringAssert.Contains("\"schema_fingerprint\":", text);
@@ -464,6 +505,22 @@ namespace UniGame.StaticEcs.Network.Tests
             SessionEpoch = epoch,
             PacketSequence = sequence
         };
+
+        private static void AssertPacketDirection(NetworkSchema<TestWorld> schema, NetworkRole role, PacketKind kind, bool allowed, uint connection)
+        {
+            var session = new NetworkSession<TestWorld>(new ConnectionId(connection), role, schema);
+            Assert.That(session.Admit(schema.Fingerprint, 1, 7, default), Is.EqualTo(NetworkAdmissionResult.Accepted));
+            var wrongEpoch = Packet(kind, 6, 1); Assert.That(session.ValidatePacket(in wrongEpoch), Is.False);
+            var outOfOrder = Packet(kind, 7, 2); Assert.That(session.ValidatePacket(in outOfOrder), Is.False);
+            var candidate = Packet(kind, 7, 1); Assert.That(session.ValidatePacket(in candidate), Is.EqualTo(allowed));
+            if (allowed) Assert.That(session.ValidatePacket(in candidate), Is.False);
+            else
+            {
+                var fallback = Packet(role == NetworkRole.Server ? PacketKind.Ack : PacketKind.FullSnapshot, 7, 1);
+                Assert.That(session.ValidatePacket(in fallback), Is.True, $"{role} rejected {kind} without consuming sequence");
+            }
+            Assert.That(session.State, Is.EqualTo(NetworkSessionState.Established));
+        }
 
         public struct TestWorld : IWorldType { }
         public struct AuthorityWorld : IWorldType { }
@@ -511,7 +568,9 @@ namespace UniGame.StaticEcs.Network.Tests
             internal readonly List<NetworkTraceEvent> Events = new List<NetworkTraceEvent>();
             public void Observe(in NetworkTraceEvent value) => Events.Add(value);
             internal int Count(NetworkPhase phase) { var count = 0; for (var i = 0; i < Events.Count; i++) if (Events[i].Phase == phase) count++; return count; }
+            internal int Count(NetworkPhase phase, NetworkPacketKind packetKind) { var count = 0; for (var i = 0; i < Events.Count; i++) if (Events[i].Phase == phase && Events[i].PacketKind == packetKind) count++; return count; }
             internal NetworkTraceEvent Single(NetworkPhase phase) { for (var i = 0; i < Events.Count; i++) if (Events[i].Phase == phase) return Events[i]; throw new InvalidOperationException("Missing phase " + phase); }
+            internal NetworkTraceEvent Single(NetworkPhase phase, NetworkPacketKind packetKind) { for (var i = 0; i < Events.Count; i++) if (Events[i].Phase == phase && Events[i].PacketKind == packetKind) return Events[i]; throw new InvalidOperationException("Missing phase " + phase + " / " + packetKind); }
         }
     }
 }

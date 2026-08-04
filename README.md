@@ -11,6 +11,7 @@ Transport-neutral Network v2 runtime and generated AOT-safe schemas for Static E
 - Captures full snapshots from `NetworkTag` authority entities, validates the complete snapshot before mutation, creates replica tags automatically, and despawns absent replicas.
 - Keeps `NetworkSession<TWorld>` state per connection while the server coordinator shares immutable captures only by `(ScopeId, ServerTick)`.
 - Validates commands by connection, peer, epoch, generated schema, sequence, tick window, and server policy before ordering them by `(TargetTick, PeerId, Sequence)`.
+- Enforces role-specific packet kinds before consuming the reliable sequence and reports accepted and policy-rejected command totals separately.
 - Provides bounded history, isolated two-client in-memory transport, privacy-safe observer events, and bounded NDJSON output.
 
 ## Usage
@@ -89,7 +90,7 @@ client.Process();
 client.SendCommand(new MoveCommand { X = 1 }, targetTick);
 ```
 
-Snapshot metadata includes tick, scope, schema fingerprint, canonical hash, bytes, entity count, and record count. Client and server histories evict oldest ticks until both tick and byte budgets hold. Snapshot staging preflights canonical order, ledger ownership, entity kinds, bounds, and local occupancy before any ECS mutation; only ledger-owned replicas may be updated or despawned.
+Snapshot metadata includes tick, scope, schema fingerprint, canonical hash, bytes, entity count, and record count. Authority capture always requires an explicit scope selector; the client-only replicator constructor supports staging and apply but rejects capture. Client and server histories evict oldest ticks until both tick and byte budgets hold. Snapshot staging preflights canonical order, ledger ownership, entity kinds, bounds, and local occupancy before any ECS mutation; only ledger-owned replicas may be updated or despawned.
 
 ## Configuration
 
@@ -100,5 +101,5 @@ Snapshot metadata includes tick, scope, schema fingerprint, canonical hash, byte
 - Endpoint names must be unique valid C# identifiers because they form `Generated{Name}Network`.
 - The generator targets `netstandard2.0`, references Microsoft.CodeAnalysis.CSharp 4.3.1 at build time, and ships only `Analyzers/StaticEcs.Network.Generator.dll` with the `RoslynAnalyzer` label.
 - `NetworkNdjsonLog` contains numeric metadata only. It never records packet payloads, command values, schema manifests, or replicated world bytes.
-- Diagnostics use underscored phase and field names and include packet kind, duration nanoseconds, schema fingerprint, counters, queue/history gauges, tick gap, and error category.
+- Diagnostics use six measured phases. Decode includes framing and snapshot staging, SnapshotApply contains only ECS mutation, and acknowledgements are separate Send attempts. Fields include packet kind, duration nanoseconds, schema fingerprint, accepted/rejected command counters, state-derived connection/peer gauges, queue/history gauges, tick gap, and error category.
 - See the repository [Static ECS knowledge base](../../../docs/knowledge/static-ecs/) for world lifecycle and type registration.

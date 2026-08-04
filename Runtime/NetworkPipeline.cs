@@ -48,12 +48,22 @@ namespace UniGame.StaticEcs.Network
                 _session.Trace(NetworkPhase.Receive, NetworkTraceKind.Point, NetworkResultCategory.Success, NetworkPacketKind.None, AcknowledgedSnapshotTick, 0, packet?.Length ?? 0, History.Count, History.Bytes, 0, ElapsedNanoseconds(receiveStarted));
                 var started = Stopwatch.GetTimestamp();
                 if (!NetworkPacket.TryDecode(packet, out var header, out var payload) || header.SchemaFingerprint != _schema.Fingerprint || !_session.ValidatePacket(in header)) { _session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, NetworkResultCategory.Protocol, NetworkPacketKind.None, AcknowledgedSnapshotTick, 0, packet?.Length ?? 0, History.Count, History.Bytes, 0, ElapsedNanoseconds(started)); RequestResync(AcknowledgedSnapshotTick); continue; }
+                StagedNetworkSnapshot staged = null;
+                var entities = 0;
+                var records = 0;
+                var decodedBytes = packet.Length;
+                var decodeResult = NetworkResultCategory.Success;
                 if (header.Kind == PacketKind.Ready) DecodeReady(header, payload);
-                else if (header.Kind == PacketKind.FullSnapshot) DecodeSnapshot(header, payload);
+                else if (header.Kind == PacketKind.FullSnapshot && !TryStageSnapshot(header, payload, out staged, out entities, out records, out decodedBytes)) decodeResult = NetworkResultCategory.World;
                 else if (header.Kind == PacketKind.ResyncRequest) ResyncRequested = true;
                 else if (header.Kind == PacketKind.Disconnect) _session.Close();
                 AcknowledgedCommandSequence = Math.Max(AcknowledgedCommandSequence, header.AcknowledgedCommandSequence);
-                _session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, NetworkResultCategory.Success, DiagnosticKind(header.Kind), header.ServerTick, header.TargetTick, packet.Length, History.Count, History.Bytes, unchecked((int)(header.ServerTick - AcknowledgedSnapshotTick)), ElapsedNanoseconds(started));
+                _session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, decodeResult, DiagnosticKind(header.Kind), header.ServerTick, header.TargetTick, decodedBytes, History.Count, History.Bytes, unchecked((int)(header.ServerTick - AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), entities, records);
+                if (header.Kind == PacketKind.FullSnapshot)
+                {
+                    if (staged == null) RequestResync(header.ServerTick);
+                    else ApplySnapshot(staged, entities, records);
+                }
             }
         }
 
@@ -80,19 +90,27 @@ namespace UniGame.StaticEcs.Network
             if (_session.Admit(header.SchemaFingerprint, peer, header.SessionEpoch, scope) != NetworkAdmissionResult.Accepted) ResyncRequested = true;
         }
 
-        private void DecodeSnapshot(PacketHeader header, ReadOnlyMemory<byte> payload)
+        private bool TryStageSnapshot(PacketHeader header, ReadOnlyMemory<byte> payload, out StagedNetworkSnapshot staged, out int entities, out int records, out int decodedBytes)
         {
-            if (_session.State != NetworkSessionState.Established || header.SessionEpoch != _session.Epoch || payload.Length < 8) { RequestResync(header.ServerTick); return; }
-            var started = Stopwatch.GetTimestamp();
+            staged = null; entities = 0; records = 0; decodedBytes = payload.Length;
+            if (payload.Length < 8) return false;
             var bytes = payload.Span;
-            var entities = unchecked((int)Hashing.Read32(bytes, 0));
-            var records = unchecked((int)Hashing.Read32(bytes, 4));
+            entities = unchecked((int)Hashing.Read32(bytes, 0));
+            records = unchecked((int)Hashing.Read32(bytes, 4));
             var exact = payload.Slice(8).ToArray();
+            decodedBytes = exact.Length;
             var snapshot = new NetworkSnapshot(header.ServerTick, header.SchemaFingerprint, _session.Scope, exact, entities, records);
-            if (_replicator.Stage(snapshot, out var staged) != SnapshotApplyResult.Success || _replicator.Apply(staged) != SnapshotApplyResult.Success) { _session.Trace(NetworkPhase.SnapshotApply, NetworkTraceKind.Point, NetworkResultCategory.World, NetworkPacketKind.FullSnapshot, header.ServerTick, 0, exact.Length, History.Count, History.Bytes, unchecked((int)(header.ServerTick - AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), entities, records); RequestResync(header.ServerTick); return; }
-            AcknowledgedSnapshotTick = header.ServerTick;
+            return _replicator.Stage(snapshot, out staged) == SnapshotApplyResult.Success;
+        }
+
+        private void ApplySnapshot(StagedNetworkSnapshot staged, int entities, int records)
+        {
+            var started = Stopwatch.GetTimestamp();
+            var result = _replicator.Apply(staged);
+            _session.Trace(NetworkPhase.SnapshotApply, NetworkTraceKind.Point, result == SnapshotApplyResult.Success ? NetworkResultCategory.Success : NetworkResultCategory.World, NetworkPacketKind.FullSnapshot, staged.ServerTick, 0, staged.Snapshot.ByteLength, History.Count, History.Bytes, unchecked((int)(staged.ServerTick - AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), entities, records);
+            if (result != SnapshotApplyResult.Success) { RequestResync(staged.ServerTick); return; }
+            AcknowledgedSnapshotTick = staged.ServerTick;
             ResyncRequested = false;
-            _session.Trace(NetworkPhase.SnapshotApply, NetworkTraceKind.Point, NetworkResultCategory.Success, NetworkPacketKind.FullSnapshot, header.ServerTick, 0, exact.Length, History.Count, History.Bytes, 0, ElapsedNanoseconds(started), entities, records);
             Send(PacketKind.Ack, _session.Epoch, PacketHeader.NoneTick, AcknowledgedSnapshotTick, PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
         }
 
@@ -145,7 +163,7 @@ namespace UniGame.StaticEcs.Network
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
             if (scopeSelector == null) throw new ArgumentNullException(nameof(scopeSelector));
             _coordinator = new NetworkServerCoordinator<TWorld>(historyTicks, historyBytes);
-            _replicator = new NetworkReplicator<TWorld>(schema, scopeSelector: scopeSelector);
+            _replicator = new NetworkReplicator<TWorld>(schema, scopeSelector);
         }
 
         /// <summary>Adds one transport-owned connection with server-assigned identity and scope.</summary>
@@ -180,7 +198,7 @@ namespace UniGame.StaticEcs.Network
                     var receiveStarted = Stopwatch.GetTimestamp();
                     if (!peer.Transport.TryReceive(out var packet)) break;
                     peer.PendingPackets.Enqueue(packet);
-                    peer.Session.Trace(NetworkPhase.Receive, NetworkTraceKind.Point, NetworkResultCategory.Success, NetworkPacketKind.None, ServerTick, 0, packet?.Length ?? 0, 0, 0, unchecked((int)(ServerTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(receiveStarted), activeConnections: _coordinator.ConnectionCount, activePeers: _coordinator.ConnectionCount);
+                    peer.Session.Trace(NetworkPhase.Receive, NetworkTraceKind.Point, NetworkResultCategory.Success, NetworkPacketKind.None, ServerTick, 0, packet?.Length ?? 0, 0, 0, unchecked((int)(ServerTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(receiveStarted), activeConnections: _coordinator.ActiveConnectionCount, activePeers: _coordinator.ActivePeerCount);
                 }
                 DecodePending(peer);
             }
@@ -197,7 +215,7 @@ namespace UniGame.StaticEcs.Network
             {
                 var peer = _peers[i];
                 if (peer.Session.State == NetworkSessionState.Established)
-                    peer.Session.Trace(NetworkPhase.CommandDispatch, NetworkTraceKind.Point, NetworkResultCategory.Success, NetworkPacketKind.CommandBatch, serverTick, 0, 0, 0, 0, unchecked((int)(serverTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(dispatchStarted), commands: dispatched, queueSize: _coordinator.PendingCommandCount, activeConnections: _coordinator.ConnectionCount, activePeers: _coordinator.ConnectionCount);
+                    peer.Session.Trace(NetworkPhase.CommandDispatch, NetworkTraceKind.Point, dispatched.Rejected > 0 ? NetworkResultCategory.Policy : NetworkResultCategory.Success, NetworkPacketKind.CommandBatch, serverTick, 0, 0, 0, 0, unchecked((int)(serverTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(dispatchStarted), commands: dispatched.Total, queueSize: _coordinator.PendingCommandCount, activeConnections: _coordinator.ActiveConnectionCount, activePeers: _coordinator.ActivePeerCount, acceptedCommands: dispatched.Accepted, rejectedCommands: dispatched.Rejected);
             }
             gameplay(serverTick);
             var captures = new Dictionary<ScopeId, NetworkSnapshot>();
@@ -211,7 +229,7 @@ namespace UniGame.StaticEcs.Network
                     if (_replicator.Capture(serverTick, peer.Scope, out capture) != SnapshotCaptureResult.Success) { peer.Session.Trace(NetworkPhase.SnapshotCapture, NetworkTraceKind.Point, NetworkResultCategory.World, NetworkPacketKind.FullSnapshot, serverTick, 0, 0, 0, 0, 0, ElapsedNanoseconds(started)); continue; }
                     captures.Add(peer.Scope, capture);
                     _coordinator.StoreCapture(peer.Scope, capture);
-                    peer.Session.Trace(NetworkPhase.SnapshotCapture, NetworkTraceKind.Point, NetworkResultCategory.Success, NetworkPacketKind.FullSnapshot, serverTick, 0, capture.ByteLength, _coordinator.HistoryCount(peer.Scope), _coordinator.HistoryByteCount(peer.Scope), unchecked((int)(serverTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), capture.EntityCount, capture.RecordCount, activeConnections: _coordinator.ConnectionCount, activePeers: _coordinator.ConnectionCount);
+                    peer.Session.Trace(NetworkPhase.SnapshotCapture, NetworkTraceKind.Point, NetworkResultCategory.Success, NetworkPacketKind.FullSnapshot, serverTick, 0, capture.ByteLength, _coordinator.HistoryCount(peer.Scope), _coordinator.HistoryByteCount(peer.Scope), unchecked((int)(serverTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), capture.EntityCount, capture.RecordCount, activeConnections: _coordinator.ActiveConnectionCount, activePeers: _coordinator.ActivePeerCount);
                 }
                 SendSnapshot(peer, capture);
             }
@@ -228,13 +246,13 @@ namespace UniGame.StaticEcs.Network
             {
                 var packet = peer.PendingPackets.Dequeue();
                 var started = Stopwatch.GetTimestamp();
-                if (!NetworkPacket.TryDecode(packet, out var header, out var payload) || header.Kind != PacketKind.Hello && header.SchemaFingerprint != _schema.Fingerprint || !peer.Session.ValidatePacket(in header)) { peer.Session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, NetworkResultCategory.Protocol, NetworkPacketKind.None, ServerTick, 0, packet?.Length ?? 0, 0, 0, unchecked((int)(ServerTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started)); continue; }
+                if (!NetworkPacket.TryDecode(packet, out var header, out var payload) || header.Kind != PacketKind.Hello && header.SchemaFingerprint != _schema.Fingerprint || !peer.Session.ValidatePacket(in header)) { peer.Session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, NetworkResultCategory.Protocol, NetworkPacketKind.None, ServerTick, 0, packet?.Length ?? 0, 0, 0, unchecked((int)(ServerTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), activeConnections: _coordinator.ActiveConnectionCount, activePeers: _coordinator.ActivePeerCount); continue; }
                 if (header.Kind == PacketKind.Hello) Admit(peer, header.SchemaFingerprint);
                 else if (header.Kind == PacketKind.CommandBatch) DecodeCommand(peer, header, payload, checked(ServerTick + 1));
                 else if (header.Kind == PacketKind.Ack) peer.AcknowledgedSnapshotTick = header.AcknowledgedSnapshotTick;
                 else if (header.Kind == PacketKind.ResyncRequest) peer.ResyncRequested = true;
                 else if (header.Kind == PacketKind.Disconnect) peer.Session.Close();
-                peer.Session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, NetworkResultCategory.Success, DiagnosticKind(header.Kind), ServerTick, header.TargetTick, packet.Length, 0, 0, unchecked((int)(ServerTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started));
+                peer.Session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, NetworkResultCategory.Success, DiagnosticKind(header.Kind), ServerTick, header.TargetTick, packet.Length, 0, 0, unchecked((int)(ServerTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), activeConnections: _coordinator.ActiveConnectionCount, activePeers: _coordinator.ActivePeerCount);
             }
         }
 
@@ -282,7 +300,7 @@ namespace UniGame.StaticEcs.Network
                 AcknowledgedCommandSequence = peer.AcknowledgedCommandSequence, SchemaFingerprint = _schema.Fingerprint
             };
             var sent = NetworkPacket.TryEncode(header, payload, out var packet) && peer.Transport.TrySend(packet);
-            peer.Session.Trace(NetworkPhase.Send, NetworkTraceKind.Point, sent ? NetworkResultCategory.Success : NetworkResultCategory.Transport, DiagnosticKind(kind), serverTick, PacketHeader.NoneTick, packet?.Length ?? 0, _coordinator.HistoryCount(peer.Scope), _coordinator.HistoryByteCount(peer.Scope), unchecked((int)(serverTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), activeConnections: _coordinator.ConnectionCount, activePeers: _coordinator.ConnectionCount);
+            peer.Session.Trace(NetworkPhase.Send, NetworkTraceKind.Point, sent ? NetworkResultCategory.Success : NetworkResultCategory.Transport, DiagnosticKind(kind), serverTick, PacketHeader.NoneTick, packet?.Length ?? 0, _coordinator.HistoryCount(peer.Scope), _coordinator.HistoryByteCount(peer.Scope), unchecked((int)(serverTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), activeConnections: _coordinator.ActiveConnectionCount, activePeers: _coordinator.ActivePeerCount);
             return sent;
         }
 

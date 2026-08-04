@@ -195,8 +195,7 @@ namespace UniGame.StaticEcs.Network
                 if (Role == NetworkRole.Server && (header.Kind != PacketKind.Hello || header.SessionEpoch != 0)) return false;
                 if (Role == NetworkRole.Client && (header.Kind != PacketKind.Ready || header.SessionEpoch == 0)) return false;
             }
-            else if (State != NetworkSessionState.Established || header.SessionEpoch != Epoch ||
-                     header.Kind == PacketKind.Hello || header.Kind == PacketKind.Ready)
+            else if (State != NetworkSessionState.Established || header.SessionEpoch != Epoch || !IsAllowedEstablishedPacket(header.Kind))
             {
                 return false;
             }
@@ -205,13 +204,17 @@ namespace UniGame.StaticEcs.Network
             return true;
         }
 
+        private bool IsAllowedEstablishedPacket(PacketKind kind) => Role == NetworkRole.Server
+            ? kind == PacketKind.CommandBatch || kind == PacketKind.Ack || kind == PacketKind.ResyncRequest || kind == PacketKind.Disconnect
+            : kind == PacketKind.FullSnapshot || kind == PacketKind.ResyncRequest || kind == PacketKind.Disconnect;
+
         internal void Close() => State = NetworkSessionState.Closed;
 
         private NetworkAdmissionResult Reject(NetworkAdmissionResult result) { State = NetworkSessionState.Rejected; return result; }
-        internal void Trace(NetworkPhase phase, NetworkTraceKind kind, NetworkResultCategory result, NetworkPacketKind packetKind, uint serverTick, uint targetTick, int bytes, int historyTicks, long historyBytes, int tickGap, long durationNanoseconds, int entities = 0, int records = 0, int commands = 0, int queueSize = 0, int activeConnections = 1, int activePeers = 0)
+        internal void Trace(NetworkPhase phase, NetworkTraceKind kind, NetworkResultCategory result, NetworkPacketKind packetKind, uint serverTick, uint targetTick, int bytes, int historyTicks, long historyBytes, int tickGap, long durationNanoseconds, int entities = 0, int records = 0, int commands = 0, int queueSize = 0, int activeConnections = -1, int activePeers = -1, int acceptedCommands = 0, int rejectedCommands = 0)
         {
             if (_observer == null) return;
-            try { var packets = phase == NetworkPhase.Receive || phase == NetworkPhase.Decode || phase == NetworkPhase.Send ? 1 : 0; var value = new NetworkTraceEvent(phase, kind, result, Role, Connection.Value, PeerId, Epoch, serverTick, targetTick, bytes, packets, entities, records, commands, queueSize, historyTicks, State == NetworkSessionState.Closed ? 0 : activeConnections, PeerId == 0 ? 0 : activePeers, Stopwatch.GetTimestamp(), packetKind, historyBytes, tickGap, durationNanoseconds, _schema.Fingerprint); _observer.Observe(in value); }
+            try { var packets = phase == NetworkPhase.Receive || phase == NetworkPhase.Decode || phase == NetworkPhase.Send ? 1 : 0; var connections = activeConnections < 0 ? State == NetworkSessionState.Closed ? 0 : 1 : activeConnections; var peers = activePeers < 0 ? State == NetworkSessionState.Established ? 1 : 0 : activePeers; var value = new NetworkTraceEvent(phase, kind, result, Role, Connection.Value, PeerId, Epoch, serverTick, targetTick, bytes, packets, entities, records, commands, queueSize, historyTicks, connections, peers, Stopwatch.GetTimestamp(), packetKind, historyBytes, tickGap, durationNanoseconds, _schema.Fingerprint, acceptedCommands, rejectedCommands); _observer.Observe(in value); }
             catch { }
         }
     }
@@ -233,7 +236,8 @@ namespace UniGame.StaticEcs.Network
             _historyCapacity = historyCapacity; _historyBytes = historyBytes;
         }
         /// <summary>Gets active connection count.</summary>
-        internal int ConnectionCount => _sessions.Count;
+        internal int ActiveConnectionCount { get { var count = 0; foreach (var session in _sessions.Values) if (session.State != NetworkSessionState.Closed) count++; return count; } }
+        internal int ActivePeerCount { get { var count = 0; foreach (var session in _sessions.Values) if (session.State == NetworkSessionState.Established) count++; return count; } }
         internal int PendingCommandCount => _commands.Count;
 
         /// <summary>Adds one independently owned per-connection session.</summary>
@@ -261,13 +265,17 @@ namespace UniGame.StaticEcs.Network
         }
 
         /// <summary>Dispatches queued commands ordered by target tick, trusted peer, then sequence.</summary>
-        internal int Dispatch(uint serverTick)
+        internal NetworkDispatchSummary Dispatch(uint serverTick)
         {
             _commands.Sort((a, b) => { var tick = a.Envelope.TargetTick.CompareTo(b.Envelope.TargetTick); if (tick != 0) return tick; var peer = a.Envelope.PeerId.CompareTo(b.Envelope.PeerId); return peer != 0 ? peer : a.Envelope.Sequence.CompareTo(b.Envelope.Sequence); });
-            var count = 0;
-            for (var i = 0; i < _commands.Count; i++) if (_commands[i].Envelope.TargetTick <= serverTick) { _commands[i].Session.Dispatch(_commands[i].Envelope, _commands[i].Entry); count++; }
-            if (count > 0) _commands.RemoveRange(0, count);
-            return count;
+            var summary = default(NetworkDispatchSummary);
+            for (var i = 0; i < _commands.Count; i++)
+            {
+                if (_commands[i].Envelope.TargetTick > serverTick) continue;
+                summary.Add(_commands[i].Session.Dispatch(_commands[i].Envelope, _commands[i].Entry));
+            }
+            if (summary.Total > 0) _commands.RemoveRange(0, summary.Total);
+            return summary;
         }
 
         /// <summary>Stores one immutable capture shared only within the specified scope.</summary>
@@ -297,5 +305,13 @@ namespace UniGame.StaticEcs.Network
             internal NetworkSchemaEntry Entry { get; }
             internal NetworkCommandEnvelope Envelope { get; }
         }
+    }
+
+    internal struct NetworkDispatchSummary
+    {
+        internal int Total { get; private set; }
+        internal int Accepted { get; private set; }
+        internal int Rejected { get; private set; }
+        internal void Add(NetworkCommandResult result) { Total++; if (result == NetworkCommandResult.Dispatched) Accepted++; else if (result == NetworkCommandResult.PolicyRejected) Rejected++; }
     }
 }
