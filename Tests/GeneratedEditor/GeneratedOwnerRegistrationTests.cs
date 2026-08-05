@@ -22,10 +22,10 @@ namespace UniGame.StaticEcs.Network.GeneratedTests
         [Test]
         public void DocumentedRegistrationPathReplicatesOwnerWithGeneratedSchemas()
         {
-            CreateAuthorityWorld();
-            CreateReplicaWorld();
             try
             {
+                CreateAuthorityWorld();
+                CreateReplicaWorld();
                 var authoritySchema = global::GeneratedOwnerAuthorityNetwork.CreateSchema();
                 var replicaSchema = global::GeneratedOwnerReplicaNetwork.CreateSchema();
                 Assert.That(replicaSchema.Fingerprint, Is.EqualTo(authoritySchema.Fingerprint));
@@ -43,8 +43,8 @@ namespace UniGame.StaticEcs.Network.GeneratedTests
             }
             finally
             {
-                World<OwnerAuthorityWorld>.Destroy();
-                World<OwnerReplicaWorld>.Destroy();
+                if (World<OwnerAuthorityWorld>.Status != WorldStatus.NotCreated) World<OwnerAuthorityWorld>.Destroy();
+                if (World<OwnerReplicaWorld>.Status != WorldStatus.NotCreated) World<OwnerReplicaWorld>.Destroy();
             }
         }
 
