@@ -12,7 +12,7 @@ Transport-neutral Network v2 runtime and generated AOT-safe schemas for Static E
 - Keeps `NetworkSession<TWorld>` state per connection while the server coordinator shares immutable captures only by `(ScopeId, ServerTick)`.
 - Validates commands by connection, peer, epoch, generated schema, sequence, tick window, and server policy before ordering them by `(TargetTick, PeerId, Sequence)`.
 - Classifies state, direction, epoch, and sequence failures without consuming rejected packet cursors, and reports accepted and policy-rejected command totals once per server tick.
-- Provides bounded history, isolated two-client in-memory transport, privacy-safe observer events, and bounded NDJSON output.
+- Provides bounded history, isolated two-client in-memory transport, privacy-safe observer events, and a bounded pending NDJSON queue with explicit gap records.
 
 ## Usage
 
@@ -33,9 +33,10 @@ flowchart LR
     X --> V
 ```
 
-Production roles may both use the same world type in different processes. A sandbox may
-close the same generic runtime on separate world types when both roles coexist in one
-process. See the cross-package
+Production Client and Dedicated Server both close the generic runtime on `World<Main>`
+in separate processes. Only Network Demo Client mode adds a hidden
+`World<DemoServerWorld>` so both roles can coexist in one process; isolated tests use
+dedicated world types. See the cross-package
 [architecture and data-flow guide](../../../docs/guides/static-ecs-network.md) for the
 complete assembly map, packet flow, snapshot shape, clocks, and current limitations.
 
@@ -76,17 +77,21 @@ checks that the hook consumed the exact payload.
 
 ### Declare endpoints and command policy
 
-Declare every endpoint once at assembly level. A sandbox may declare both endpoints in one assembly with different world types.
+Declare every endpoint once at assembly level. Production Client and Server declarations
+live in their respective role assemblies and both use `Main`.
 
 ```csharp
-[assembly: NetworkEndpoint("Client", typeof(ClientWorld), NetworkRole.Client)]
-[assembly: NetworkEndpoint("Server", typeof(ServerWorld), NetworkRole.Server)]
+// Client assembly
+[assembly: NetworkEndpoint("Client", typeof(Main), NetworkRole.Client)]
+
+// Server assembly
+[assembly: NetworkEndpoint("Server", typeof(Main), NetworkRole.Server)]
 ```
 
 Bind authorization in the server assembly. Policies are endpoint behavior and do not change the Shared fingerprint.
 
 ```csharp
-public struct MovePolicy : INetworkCommandPolicy<ServerWorld, MoveCommand>
+public struct MovePolicy : INetworkCommandPolicy<Main, MoveCommand>
 {
     public bool Authorize(in NetworkCommandContext context, in MoveCommand command) =>
         context.PeerId != 0;
@@ -98,14 +103,14 @@ public struct MovePolicy : INetworkCommandPolicy<ServerWorld, MoveCommand>
 Register ordinary ECS types through the normal Static ECS registration path. Generated registration adds only required closed network result events. Create the schema after registration and before constructing endpoint runtime objects.
 
 ```csharp
-World<ServerWorld>.Create(WorldConfig.Default());
-World<ServerWorld>.Types().RegisterAll(typeof(NetworkOwnerComponent).Assembly);
-World<ServerWorld>.Types().RegisterAll(typeof(PositionComponent).Assembly);
-GeneratedServerNetwork.RegisterTypes(World<ServerWorld>.Types());
-World<ServerWorld>.Initialize();
+World<Main>.Create(WorldConfig.Default());
+World<Main>.Types().RegisterAll(typeof(NetworkOwnerComponent).Assembly);
+World<Main>.Types().RegisterAll(typeof(PositionComponent).Assembly);
+GeneratedServerNetwork.RegisterTypes(World<Main>.Types());
+World<Main>.Initialize();
 
 var schema = GeneratedServerNetwork.CreateSchema();
-var server = new NetworkServer<ServerWorld>(schema, (scope, entity) => IsInScope(scope, entity), historyTicks: 64, historyBytes: 32 * 1024 * 1024, observer: observer);
+var server = new NetworkServer<Main>(schema, (scope, entity) => IsInScope(scope, entity), historyTicks: 64, historyBytes: 32 * 1024 * 1024, observer: observer);
 ```
 
 Add each server transport with its server-assigned peer, epoch, and scope. The framed Hello/Ready exchange admits the generated fingerprint; malformed, incompatible, or stale packets fail closed and request resynchronization.
@@ -125,7 +130,7 @@ The server `Receive()` dequeues and decodes current transport input without adva
 server.Receive();
 server.Tick(serverTick => RunGameplay(serverTick));
 
-var client = new NetworkClient<ClientWorld>(clientTransport, GeneratedClientNetwork.CreateSchema(), scopeId, observer);
+var client = new NetworkClient<Main>(clientTransport, GeneratedClientNetwork.CreateSchema(), scopeId, observer);
 client.BeginHandshake();
 client.Process();
 client.SendCommand(new MoveCommand { X = 1 }, targetTick);
