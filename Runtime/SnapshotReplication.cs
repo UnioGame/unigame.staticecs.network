@@ -102,7 +102,7 @@ namespace UniGame.StaticEcs.Network
         internal bool Disabled;
     }
 
-    /// <summary>Captures authority NetworkTag entities and applies two-phase full snapshots.</summary>
+    /// <summary>Captures generated authority entity kinds and applies two-phase full snapshots.</summary>
     public sealed class NetworkReplicator<TWorld> where TWorld : struct, IWorldType
     {
         private readonly NetworkSchema<TWorld> _schema;
@@ -129,7 +129,7 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Gets bounded snapshots successfully applied by this client.</summary>
         public NetworkHistory<NetworkSnapshot> History { get; }
 
-        /// <summary>Captures all authority entities marked with NetworkTag into an immutable full snapshot.</summary>
+        /// <summary>Captures all generated authority entity kinds into an immutable full snapshot.</summary>
         public SnapshotCaptureResult Capture(uint serverTick, out NetworkSnapshot snapshot)
             => Capture(serverTick, Scope, out snapshot);
 
@@ -138,14 +138,16 @@ namespace UniGame.StaticEcs.Network
         {
             if (_scopeSelector == null) throw new InvalidOperationException("Authority capture requires an explicit scope selector.");
             snapshot = null;
-            if (World<TWorld>.Status != WorldStatus.Initialized || !World<TWorld>.IsTagTypeRegistered<NetworkTag>()) return SnapshotCaptureResult.WorldUnavailable;
+            if (World<TWorld>.Status != WorldStatus.Initialized) return SnapshotCaptureResult.WorldUnavailable;
             var entities = new List<World<TWorld>.Entity>();
-            foreach (var entity in World<TWorld>.Query<All<NetworkTag>>().Entities(EntityStatusType.Any))
+            var seen = new HashSet<EntityGID>();
+            var entries = _schema.RetainedEntries;
+            for (var i = 0; i < entries.Length; i++)
             {
-                if (!_scopeSelector(scope, entity)) continue;
-                if (entities.Count == ProtocolLimits.MaxEntities) return SnapshotCaptureResult.LimitExceeded;
-                entities.Add(entity);
+                if (entries[i].Invoker is IEntityNetworkInvoker<TWorld> invoker) invoker.Collect(entities, seen);
             }
+            for (var i = entities.Count - 1; i >= 0; i--) if (!_scopeSelector(scope, entities[i])) entities.RemoveAt(i);
+            if (entities.Count > ProtocolLimits.MaxEntities) return SnapshotCaptureResult.LimitExceeded;
             entities.Sort((a, b) => Compare(a.GID, b.GID));
             using var stream = new MemoryStream();
             using var writer = new BinaryWriter(stream);
@@ -158,7 +160,6 @@ namespace UniGame.StaticEcs.Network
                     var entity = entities[i];
                     if (i > 0 && Compare(entities[i - 1].GID, entity.GID) >= 0) return SnapshotCaptureResult.InvalidEntity;
                     NetworkSchemaEntry kind = null;
-                    var entries = _schema.RetainedEntries;
                     for (var j = 0; j < entries.Length; j++)
                         if (entries[j].Invoker is IEntityNetworkInvoker<TWorld> invoker && invoker.Matches(entity)) { kind = entries[j]; break; }
                     if (kind == null) return SnapshotCaptureResult.InvalidEntity;
@@ -269,7 +270,6 @@ namespace UniGame.StaticEcs.Network
                 var source = staged.Entities[i];
                 if (!source.Gid.TryUnpack<TWorld>(out var entity)) entity = ((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Create(source.Gid);
                 else if (!((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Matches(entity)) return SnapshotApplyResult.EntityConflict;
-                entity.Set<NetworkTag>();
                 var entries = _schema.RetainedEntries;
                 for (var j = 0; j < entries.Length; j++)
                 {

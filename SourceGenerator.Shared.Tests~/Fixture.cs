@@ -32,6 +32,7 @@ namespace UniGame.StaticEcs.Network
     public sealed class NetworkCompilerSchemaFactory<T> where T : struct, FFS.Libraries.StaticEcs.IWorldType
     {
         private readonly System.Collections.Generic.List<(uint Id, byte Version)> _entries = new System.Collections.Generic.List<(uint, byte)>();
+        public void Entity<E>(NetworkTypeId id) where E : struct, FFS.Libraries.StaticEcs.IEntityType, INetworkType { }
         public void Component<C>(NetworkTypeId id, byte version = 1, uint max = 0) where C : struct, FFS.Libraries.StaticEcs.IComponent, INetworkType => _entries.Add((id.Value, version));
         public void DisableableComponent<C>(NetworkTypeId id, byte version = 1, uint max = 0) where C : struct, FFS.Libraries.StaticEcs.IComponent, FFS.Libraries.StaticEcs.IDisableable, INetworkType => _entries.Add((id.Value, version));
         public void Command<C>(NetworkTypeId id, byte version = 1, uint max = 0) where C : struct, FFS.Libraries.StaticEcs.IEvent, INetworkCommand => _entries.Add((id.Value, version));
@@ -46,6 +47,8 @@ namespace UniGame.StaticEcs.Network
 
 namespace Shared
 {
+    public struct PlayerEntity : FFS.Libraries.StaticEcs.IEntityType, UniGame.StaticEcs.Network.INetworkType { }
+    public struct NpcEntity : FFS.Libraries.StaticEcs.IEntityType, UniGame.StaticEcs.Network.INetworkType { }
     public struct Position : FFS.Libraries.StaticEcs.IComponent, FFS.Libraries.StaticEcs.IDisableable, FFS.Libraries.StaticEcs.IComponentConfig<Position>, UniGame.StaticEcs.Network.INetworkType
     {
         public FFS.Libraries.StaticEcs.ComponentTypeConfig<Position> Config() => new FFS.Libraries.StaticEcs.ComponentTypeConfig<Position>(Version);
@@ -60,6 +63,16 @@ namespace Shared
     public struct Move : FFS.Libraries.StaticEcs.IEvent, FFS.Libraries.StaticEcs.IEventConfig<Move>, UniGame.StaticEcs.Network.INetworkCommand
     {
         public FFS.Libraries.StaticEcs.EventTypeConfig<Move> Config() => new FFS.Libraries.StaticEcs.EventTypeConfig<Move>(9);
+        public void Write(ref FFS.Libraries.StaticPack.BinaryPackWriter writer) { }
+        public void Read(ref FFS.Libraries.StaticPack.BinaryPackReader reader, byte version) { }
+    }
+    public struct Health : FFS.Libraries.StaticEcs.IComponent, UniGame.StaticEcs.Network.INetworkType
+    {
+        public void Write<TWorld>(ref FFS.Libraries.StaticPack.BinaryPackWriter writer, FFS.Libraries.StaticEcs.World<TWorld>.Entity self) where TWorld : struct, FFS.Libraries.StaticEcs.IWorldType { }
+        public void Read<TWorld>(ref FFS.Libraries.StaticPack.BinaryPackReader reader, FFS.Libraries.StaticEcs.World<TWorld>.Entity self, byte version, bool disabled) where TWorld : struct, FFS.Libraries.StaticEcs.IWorldType { }
+    }
+    public struct Ping : FFS.Libraries.StaticEcs.IEvent, UniGame.StaticEcs.Network.INetworkCommand
+    {
         public void Write(ref FFS.Libraries.StaticPack.BinaryPackWriter writer) { }
         public void Read(ref FFS.Libraries.StaticPack.BinaryPackReader reader, byte version) { }
     }

@@ -71,9 +71,6 @@ namespace UniGame.StaticEcs.Network
         Server = 2
     }
 
-    /// <summary>Marks authority and replica entities selected by networking.</summary>
-    public struct NetworkTag : ITag { }
-
     /// <summary>Stores server-assigned ownership. Client input never writes this value.</summary>
     public struct NetworkOwnerComponent : IComponent
     {

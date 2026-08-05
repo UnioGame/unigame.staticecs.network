@@ -24,6 +24,14 @@ namespace UniGame.StaticEcs.Network
         public int Count => _values.Count;
         /// <summary>Gets retained byte count.</summary>
         public long Bytes => _bytes;
+        /// <summary>Gets the configured maximum retained item count.</summary>
+        public int Capacity => _capacity;
+        /// <summary>Gets the configured maximum retained byte count.</summary>
+        public long MaxBytes => _maxBytes;
+        /// <summary>Gets the oldest retained tick, or zero when empty.</summary>
+        public uint OldestTick => BoundaryTick(false);
+        /// <summary>Gets the newest retained tick, or zero when empty.</summary>
+        public uint NewestTick => BoundaryTick(true);
         /// <summary>Adds or replaces one tick and evicts oldest ticks until both bounds hold.</summary>
         public void Store(uint tick, T value)
         {
@@ -43,5 +51,15 @@ namespace UniGame.StaticEcs.Network
         }
         /// <summary>Finds one retained tick.</summary>
         public bool TryGet(uint tick, out T value) => _values.TryGetValue(tick, out value);
+
+        private uint BoundaryTick(bool newest)
+        {
+            if (_values.Count == 0) return 0;
+            using var keys = _values.Keys.GetEnumerator();
+            keys.MoveNext();
+            var value = keys.Current;
+            if (newest) while (keys.MoveNext()) value = keys.Current;
+            return value;
+        }
     }
 }

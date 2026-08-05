@@ -52,9 +52,17 @@ $emptyGenerated = 'SourceGenerator.Empty.Tests~/obj/generated/StaticEcs.Network.
 if (Test-Path $emptyGenerated) { throw 'Generator emitted a manifest for an assembly without network types or endpoints' }
 Assert-Pass 'SourceGenerator.Tests~/SourceGenerator.Tests.csproj'
 $generated = Get-Content 'SourceGenerator.Tests~/obj/generated/StaticEcs.Network.Generator/UniGame.StaticEcs.Network.Generator.NetworkSourceGenerator/GeneratedServerNetwork.g.cs' -Raw
-foreach ($required in @('ComponentVersion<global::Shared.Position>()', 'EventVersion<global::Shared.Move>()', 'factory.Policy<global::Shared.Move, global::Demo.MovePolicy>()')) {
+foreach ($required in @('factory.Entity<global::Shared.PlayerEntity>', 'factory.Entity<global::Shared.NpcEntity>',
+    'factory.Component<global::Shared.Health>', 'factory.Command<global::Shared.Ping>',
+    'ComponentVersion<global::Shared.Position>()', 'EventVersion<global::Shared.Move>()',
+    'factory.Policy<global::Shared.Move, global::Demo.MovePolicy>()',
+    'factory.Policy<global::Shared.Ping, global::Demo.PingPolicy>()')) {
     if (-not $generated.Contains($required)) { throw "Missing generated AOT/version assertion: $required" }
 }
+foreach ($defaulted in @('Shared.Health', 'Shared.Ping')) {
+    if ($generated -notmatch "factory\.(?:Component|Command)<global::$defaulted>\([^\r\n]+, 0\);") { throw "Missing generated version 0 assertion: $defaulted" }
+}
+if ($generated -match 'registrar\.(?:EntityType|Component|Tag|Link|Links|Multi)<') { throw 'Generated registration included ordinary ECS storage.' }
 $declaredVersionFingerprint = Invoke-BoundedRun
 $changedVersionFingerprint = Invoke-BoundedRun 'NETWORK_VERSION_MISMATCH'
 if ($declaredVersionFingerprint -eq $changedVersionFingerprint) { throw 'Generated endpoint fingerprint ignored the changed Static ECS config version' }

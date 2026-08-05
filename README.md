@@ -8,7 +8,7 @@ Transport-neutral Network v2 runtime and generated AOT-safe schemas for Static E
 - Aggregates world-neutral Shared manifests into endpoint-specific `Generated{Name}Network` classes without runtime reflection or generated assets.
 - Uses the existing Static ECS `Write` and `Read` hooks through generated typed invokers. Hook buffers are pooled while writing and copied to exact bounded payload arrays.
 - Frames protocol version 2 packets with canonical hashes, CRC32, exact lengths, and `NetworkCompression.None`.
-- Captures full snapshots from `NetworkTag` authority entities, validates the complete snapshot before mutation, creates replica tags automatically, and despawns absent replicas.
+- Captures every entity whose concrete `IEntityType` also implements `INetworkType`, applies scope selection, writes canonical GID order, and despawns absent ledger-owned replicas.
 - Keeps `NetworkSession<TWorld>` state per connection while the server coordinator shares immutable captures only by `(ScopeId, ServerTick)`.
 - Validates commands by connection, peer, epoch, generated schema, sequence, tick window, and server policy before ordering them by `(TargetTick, PeerId, Sequence)`.
 - Classifies state, direction, epoch, and sequence failures without consuming rejected packet cursors, and reports accepted and policy-rejected command totals once per server tick.
@@ -19,6 +19,11 @@ Transport-neutral Network v2 runtime and generated AOT-safe schemas for Static E
 Declare wire types only in a Shared assembly. Each wire type is one concrete non-generic struct with one supported Static ECS shape.
 
 ```csharp
+public struct PlayerEntity : IEntityType, INetworkType
+{
+    public byte Id() => 1;
+}
+
 public struct PositionComponent : IComponent, INetworkType
 {
     public float X;
@@ -65,7 +70,6 @@ Register ordinary ECS types through the normal Static ECS registration path. Gen
 World<ServerWorld>.Create(WorldConfig.Default());
 World<ServerWorld>.Types().RegisterAll(typeof(PositionComponent).Assembly);
 GeneratedServerNetwork.RegisterTypes(World<ServerWorld>.Types());
-World<ServerWorld>.Types().Tag<NetworkTag>().Component<NetworkOwnerComponent>();
 World<ServerWorld>.Initialize();
 
 var schema = GeneratedServerNetwork.CreateSchema();
@@ -94,12 +98,13 @@ Snapshot metadata includes tick, scope, schema fingerprint, canonical hash, byte
 
 ## Configuration
 
-- Package version `2026.1.0` implements wire protocol `2` only.
+- Package version `2026.2.0` implements wire protocol `2` only.
 - Compression is fixed to `NetworkCompression.None`.
 - Runtime limits may be reduced by endpoint orchestration but must not exceed `ProtocolLimits`.
-- `NetworkTag` is control state and never appears in a generated manifest. `NetworkOwnerComponent` is written only from trusted server state.
+- Every entity kind marked with `INetworkType` is authority-replicated; scope selection runs after generated kind selection. `NetworkOwnerComponent` is written only from trusted server state.
 - Endpoint names must be unique valid C# identifiers because they form `Generated{Name}Network`.
 - The generator targets `netstandard2.0`, references Microsoft.CodeAnalysis.CSharp 4.3.1 at build time, and ships only `Analyzers/StaticEcs.Network.Generator.dll` with the `RoslynAnalyzer` label.
 - `NetworkNdjsonLog` contains numeric metadata only. It never records packet payloads, command values, schema manifests, or replicated world bytes.
 - Diagnostics use six measured phases. Decode includes framing and snapshot staging, SnapshotApply contains only ECS mutation, and acknowledgements are separate Send attempts. Snapshot failures retain distinct schema, malformed, limit, and world categories. Server dispatch totals are emitted through the server observer once per tick; connection gauges include live handshakes while peer gauges include only established sessions.
+- Observers may additionally implement `INetworkDiagnosticsObserver` to receive immutable session cursors and snapshot/history metadata. These callbacks never expose payload bytes, command values, ECS handles, or Unity types.
 - See the repository [Static ECS knowledge base](../../../docs/knowledge/static-ecs/) for world lifecycle and type registration.

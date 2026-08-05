@@ -227,6 +227,33 @@ namespace UniGame.StaticEcs.Network
             try { var packets = phase == NetworkPhase.Receive || phase == NetworkPhase.Decode || phase == NetworkPhase.Send ? 1 : 0; var connections = activeConnections < 0 ? State == NetworkSessionState.Closed ? 0 : 1 : activeConnections; var peers = activePeers < 0 ? State == NetworkSessionState.Established ? 1 : 0 : activePeers; var value = new NetworkTraceEvent(phase, kind, result, Role, Connection.Value, PeerId, Epoch, serverTick, targetTick, bytes, packets, entities, records, commands, queueSize, historyTicks, connections, peers, Stopwatch.GetTimestamp(), packetKind, historyBytes, tickGap, durationNanoseconds, _schema.Fingerprint, acceptedCommands, rejectedCommands); _observer.Observe(in value); }
             catch { }
         }
+
+        internal void ReportSession(uint serverTick, uint acknowledgedSnapshotTick, uint acknowledgedCommandSequence)
+        {
+            if (_observer is not INetworkDiagnosticsObserver diagnostics) return;
+            try
+            {
+                var value = new NetworkSessionDiagnostics(Role, State, Connection.Value, PeerId, Epoch, Scope, serverTick,
+                    acknowledgedSnapshotTick, acknowledgedCommandSequence, _nextSendSequence, _nextReceiveSequence,
+                    _nextReceivePacketSequence);
+                diagnostics.ObserveSession(in value);
+            }
+            catch { }
+        }
+
+        internal void ReportSnapshot(NetworkSnapshot snapshot, NetworkHistory<NetworkSnapshot> history)
+        {
+            if (_observer is not INetworkDiagnosticsObserver diagnostics || snapshot == null || history == null) return;
+            try
+            {
+                var value = new NetworkSnapshotDiagnostics(Role, Connection.Value, PeerId, Epoch, snapshot.Scope,
+                    snapshot.ServerTick, snapshot.SchemaFingerprint, snapshot.PayloadHash, snapshot.ByteLength,
+                    snapshot.EntityCount, snapshot.RecordCount, history.Count, history.Bytes, history.OldestTick,
+                    history.NewestTick, history.Capacity, history.MaxBytes);
+                diagnostics.ObserveSnapshot(in value);
+            }
+            catch { }
+        }
     }
 
     /// <summary>Coordinates sessions, ordered commands, and scope-shared immutable captures.</summary>
@@ -304,6 +331,7 @@ namespace UniGame.StaticEcs.Network
 
         internal int HistoryCount(ScopeId scope) => _history.TryGetValue(scope, out var history) ? history.Count : 0;
         internal long HistoryByteCount(ScopeId scope) => _history.TryGetValue(scope, out var history) ? history.Bytes : 0;
+        internal NetworkHistory<NetworkSnapshot> History(ScopeId scope) => _history.TryGetValue(scope, out var history) ? history : null;
 
         private readonly struct PendingCommand
         {

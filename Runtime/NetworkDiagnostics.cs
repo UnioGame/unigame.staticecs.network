@@ -82,6 +82,107 @@ namespace UniGame.StaticEcs.Network
         void Observe(in NetworkTraceEvent value);
     }
 
+    /// <summary>Optionally receives privacy-safe session and snapshot metadata in addition to phase events.</summary>
+    public interface INetworkDiagnosticsObserver : INetworkObserver
+    {
+        /// <summary>Observes one immutable session-state sample.</summary>
+        void ObserveSession(in NetworkSessionDiagnostics value);
+
+        /// <summary>Observes one immutable snapshot and history sample.</summary>
+        void ObserveSnapshot(in NetworkSnapshotDiagnostics value);
+    }
+
+    /// <summary>Contains immutable session state and protocol cursors without payload or ECS references.</summary>
+    public readonly struct NetworkSessionDiagnostics
+    {
+        /// <summary>Creates one session diagnostics sample.</summary>
+        public NetworkSessionDiagnostics(NetworkRole role, NetworkSessionState state, uint connectionId, uint peerId,
+            uint epoch, ScopeId scope, uint serverTick, uint acknowledgedSnapshotTick, uint acknowledgedCommandSequence,
+            uint nextSendCommandSequence, uint nextReceiveCommandSequence, uint nextReceivePacketSequence)
+        {
+            Role = role; State = state; ConnectionId = connectionId; PeerId = peerId; Epoch = epoch; Scope = scope;
+            ServerTick = serverTick; AcknowledgedSnapshotTick = acknowledgedSnapshotTick;
+            AcknowledgedCommandSequence = acknowledgedCommandSequence; NextSendCommandSequence = nextSendCommandSequence;
+            NextReceiveCommandSequence = nextReceiveCommandSequence; NextReceivePacketSequence = nextReceivePacketSequence;
+        }
+
+        /// <summary>Gets endpoint role.</summary>
+        public NetworkRole Role { get; }
+        /// <summary>Gets admission state.</summary>
+        public NetworkSessionState State { get; }
+        /// <summary>Gets transport-owned connection id.</summary>
+        public uint ConnectionId { get; }
+        /// <summary>Gets server-assigned peer id.</summary>
+        public uint PeerId { get; }
+        /// <summary>Gets admitted epoch.</summary>
+        public uint Epoch { get; }
+        /// <summary>Gets replication scope.</summary>
+        public ScopeId Scope { get; }
+        /// <summary>Gets the current authoritative tick known to the endpoint.</summary>
+        public uint ServerTick { get; }
+        /// <summary>Gets the latest acknowledged snapshot tick.</summary>
+        public uint AcknowledgedSnapshotTick { get; }
+        /// <summary>Gets the latest acknowledged command sequence.</summary>
+        public uint AcknowledgedCommandSequence { get; }
+        /// <summary>Gets the next command sequence assigned by this endpoint.</summary>
+        public uint NextSendCommandSequence { get; }
+        /// <summary>Gets the next command sequence accepted by this endpoint.</summary>
+        public uint NextReceiveCommandSequence { get; }
+        /// <summary>Gets the next packet sequence accepted by this endpoint.</summary>
+        public uint NextReceivePacketSequence { get; }
+    }
+
+    /// <summary>Contains immutable snapshot identity, counts, and retained-history bounds.</summary>
+    public readonly struct NetworkSnapshotDiagnostics
+    {
+        /// <summary>Creates one snapshot diagnostics sample.</summary>
+        public NetworkSnapshotDiagnostics(NetworkRole role, uint connectionId, uint peerId, uint epoch, ScopeId scope,
+            uint serverTick, SchemaFingerprint fingerprint, ulong payloadHash, int bytes, int entities, int records,
+            int historyTicks, long historyBytes, uint oldestHistoryTick, uint newestHistoryTick, int historyCapacity,
+            long historyMaxBytes)
+        {
+            Role = role; ConnectionId = connectionId; PeerId = peerId; Epoch = epoch; Scope = scope; ServerTick = serverTick;
+            SchemaFingerprint = fingerprint; PayloadHash = payloadHash; Bytes = bytes; Entities = entities; Records = records;
+            HistoryTicks = historyTicks; HistoryBytes = historyBytes; OldestHistoryTick = oldestHistoryTick;
+            NewestHistoryTick = newestHistoryTick; HistoryCapacity = historyCapacity; HistoryMaxBytes = historyMaxBytes;
+        }
+
+        /// <summary>Gets endpoint role.</summary>
+        public NetworkRole Role { get; }
+        /// <summary>Gets transport-owned connection id.</summary>
+        public uint ConnectionId { get; }
+        /// <summary>Gets server-assigned peer id.</summary>
+        public uint PeerId { get; }
+        /// <summary>Gets admitted epoch.</summary>
+        public uint Epoch { get; }
+        /// <summary>Gets replication scope.</summary>
+        public ScopeId Scope { get; }
+        /// <summary>Gets authoritative snapshot tick.</summary>
+        public uint ServerTick { get; }
+        /// <summary>Gets the schema fingerprint.</summary>
+        public SchemaFingerprint SchemaFingerprint { get; }
+        /// <summary>Gets the canonical payload hash.</summary>
+        public ulong PayloadHash { get; }
+        /// <summary>Gets exact snapshot byte count.</summary>
+        public int Bytes { get; }
+        /// <summary>Gets snapshot entity count.</summary>
+        public int Entities { get; }
+        /// <summary>Gets snapshot record count.</summary>
+        public int Records { get; }
+        /// <summary>Gets retained history item count.</summary>
+        public int HistoryTicks { get; }
+        /// <summary>Gets retained history byte count.</summary>
+        public long HistoryBytes { get; }
+        /// <summary>Gets the oldest retained history tick, or zero when empty.</summary>
+        public uint OldestHistoryTick { get; }
+        /// <summary>Gets the newest retained history tick, or zero when empty.</summary>
+        public uint NewestHistoryTick { get; }
+        /// <summary>Gets the configured history item limit.</summary>
+        public int HistoryCapacity { get; }
+        /// <summary>Gets the configured history byte limit.</summary>
+        public long HistoryMaxBytes { get; }
+    }
+
     /// <summary>Contains immutable privacy-safe endpoint telemetry.</summary>
     public readonly struct NetworkTraceEvent
     {

@@ -7,7 +7,12 @@ internal static class Program
         var client = GeneratedClientNetwork.CreateSchema();
         var server = GeneratedServerNetwork.CreateSchema();
         if (client.Fingerprint != server.Fingerprint) throw new InvalidOperationException("Generated Client and Server schemas differ.");
-        if (client.Versions.Length != 2 || client.Versions[0] != 7 && client.Versions[0] != 8 || client.Versions[1] != 9) throw new InvalidOperationException("Generated config versions were not executed.");
+        var defaultVersions = 0;
+        for (var i = 0; i < client.Versions.Length; i++) if (client.Versions[i] == 0) defaultVersions++;
+        if (client.Versions.Length != 4 || defaultVersions != 2 ||
+            Array.IndexOf(client.Versions, (byte)9) < 0 || Array.IndexOf(client.Versions, (byte)7) < 0 &&
+            Array.IndexOf(client.Versions, (byte)8) < 0)
+            throw new InvalidOperationException("Generated configured and default versions were not executed.");
         Console.WriteLine("SCHEMA:" + client.Fingerprint);
         return 0;
     }

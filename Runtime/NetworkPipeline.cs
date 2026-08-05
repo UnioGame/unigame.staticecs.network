@@ -22,6 +22,7 @@ namespace UniGame.StaticEcs.Network
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
             _replicator = new NetworkReplicator<TWorld>(schema, scope);
             _session = new NetworkSession<TWorld>(transport.Connection, NetworkRole.Client, schema, observer);
+            _session.ReportSession(0, 0, 0);
         }
 
         /// <summary>Gets the per-connection session.</summary>
@@ -64,6 +65,7 @@ namespace UniGame.StaticEcs.Network
                     if (staged == null) RequestResync(header.ServerTick);
                     else ApplySnapshot(staged, entities, records);
                 }
+                _session.ReportSession(header.ServerTick, AcknowledgedSnapshotTick, AcknowledgedCommandSequence);
             }
         }
 
@@ -78,6 +80,7 @@ namespace UniGame.StaticEcs.Network
             payload[8] = envelope.Version;
             envelope.ExactPayload.CopyTo(payload, 9);
             if (!Send(PacketKind.CommandBatch, _session.Epoch, 0, PacketHeader.NoneTick, targetTick, payload)) return NetworkCommandResult.Malformed;
+            _session.ReportSession(AcknowledgedSnapshotTick, AcknowledgedSnapshotTick, AcknowledgedCommandSequence);
             return result;
         }
 
@@ -111,6 +114,7 @@ namespace UniGame.StaticEcs.Network
             if (result != SnapshotApplyResult.Success) { RequestResync(staged.ServerTick); return; }
             AcknowledgedSnapshotTick = staged.ServerTick;
             ResyncRequested = false;
+            _session.ReportSnapshot(staged.Snapshot, History);
             Send(PacketKind.Ack, _session.Epoch, PacketHeader.NoneTick, AcknowledgedSnapshotTick, PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
         }
 
@@ -182,8 +186,9 @@ namespace UniGame.StaticEcs.Network
         {
             if (transport == null) throw new ArgumentNullException(nameof(transport));
             for (var i = 0; i < _peers.Count; i++) if (_peers[i].Transport.Connection == transport.Connection) throw new InvalidOperationException("Connection already exists.");
-            var session = new NetworkSession<TWorld>(transport.Connection, NetworkRole.Server, _schema, observer);
+            var session = new NetworkSession<TWorld>(transport.Connection, NetworkRole.Server, _schema, observer ?? _observer);
             _peers.Add(new Peer(transport, session, peerId, epoch, scope));
+            session.ReportSession(ServerTick, 0, 0);
             return session;
         }
 
@@ -193,7 +198,9 @@ namespace UniGame.StaticEcs.Network
             for (var i = 0; i < _peers.Count; i++)
             {
                 if (_peers[i].Transport.Connection != connection) continue;
-                _peers[i].Session.Close(); _peers.RemoveAt(i); _coordinator.Remove(connection); return true;
+                _peers[i].Session.Close();
+                _peers[i].Session.ReportSession(ServerTick, _peers[i].AcknowledgedSnapshotTick, _peers[i].AcknowledgedCommandSequence);
+                _peers.RemoveAt(i); _coordinator.Remove(connection); return true;
             }
             return false;
         }
@@ -237,7 +244,9 @@ namespace UniGame.StaticEcs.Network
                     _coordinator.StoreCapture(peer.Scope, capture);
                     peer.Session.Trace(NetworkPhase.SnapshotCapture, NetworkTraceKind.Point, NetworkResultCategory.Success, NetworkPacketKind.FullSnapshot, serverTick, 0, capture.ByteLength, _coordinator.HistoryCount(peer.Scope), _coordinator.HistoryByteCount(peer.Scope), unchecked((int)(serverTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), capture.EntityCount, capture.RecordCount, activeConnections: ActiveConnectionCount, activePeers: ActivePeerCount);
                 }
+                peer.Session.ReportSnapshot(capture, _coordinator.History(peer.Scope));
                 SendSnapshot(peer, capture);
+                peer.Session.ReportSession(serverTick, peer.AcknowledgedSnapshotTick, peer.AcknowledgedCommandSequence);
             }
             ServerTick = serverTick;
         }
@@ -259,6 +268,7 @@ namespace UniGame.StaticEcs.Network
                 else if (header.Kind == PacketKind.ResyncRequest) peer.ResyncRequested = true;
                 else if (header.Kind == PacketKind.Disconnect) peer.Session.Close();
                 peer.Session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, NetworkResultCategory.Success, DiagnosticKind(header.Kind), ServerTick, header.TargetTick, packet.Length, 0, 0, unchecked((int)(ServerTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), activeConnections: ActiveConnectionCount, activePeers: ActivePeerCount);
+                peer.Session.ReportSession(ServerTick, peer.AcknowledgedSnapshotTick, peer.AcknowledgedCommandSequence);
             }
         }
 

@@ -6,4 +6,5 @@ namespace Demo
     public struct ClientWorld : FFS.Libraries.StaticEcs.IWorldType { }
     public struct ServerWorld : FFS.Libraries.StaticEcs.IWorldType { }
     public struct MovePolicy : UniGame.StaticEcs.Network.INetworkCommandPolicy<ServerWorld, Shared.Move> { }
+    public struct PingPolicy : UniGame.StaticEcs.Network.INetworkCommandPolicy<ServerWorld, Shared.Ping> { }
 }

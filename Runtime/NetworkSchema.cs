@@ -178,7 +178,6 @@ namespace UniGame.StaticEcs.Network
         private void Add(NetworkSchemaKind kind, NetworkTypeId id, byte version, uint maxBytes, uint maxCount, Type type, object invoker)
         {
             if (_frozen) throw new InvalidOperationException("The compiler schema factory is frozen.");
-            if (type == typeof(NetworkTag)) throw new InvalidOperationException("NetworkTag is control state, not a schema record.");
             if (!_ids.Add(id.Value)) throw new InvalidOperationException($"Duplicate network type id `{id}`.");
             _entries.Add(new NetworkSchemaEntry(kind, id, version, maxBytes, maxCount, type, invoker));
         }
@@ -186,6 +185,7 @@ namespace UniGame.StaticEcs.Network
 
     internal interface IEntityNetworkInvoker<TWorld> where TWorld : struct, IWorldType
     {
+        void Collect(List<World<TWorld>.Entity> entities, HashSet<EntityGID> seen);
         bool Matches(World<TWorld>.Entity entity);
         World<TWorld>.Entity Create(EntityGID gid);
     }
@@ -203,6 +203,13 @@ namespace UniGame.StaticEcs.Network
     internal sealed class EntityNetworkInvoker<TWorld, TEntity> : IEntityNetworkInvoker<TWorld>
         where TWorld : struct, IWorldType where TEntity : struct, IEntityType
     {
+        public void Collect(List<World<TWorld>.Entity> entities, HashSet<EntityGID> seen)
+        {
+            var entityType = default(TEntity).Id();
+            foreach (var entity in World<TWorld>.Query().Entities(EntityStatusType.Any))
+                if (entity.EntityType == entityType && seen.Add(entity.GID)) entities.Add(entity);
+        }
+
         public bool Matches(World<TWorld>.Entity entity) => entity.EntityType == default(TEntity).Id();
         public World<TWorld>.Entity Create(EntityGID gid) => World<TWorld>.NewEntityByGID<TEntity>(gid);
     }
