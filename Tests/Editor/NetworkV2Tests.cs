@@ -365,7 +365,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(dispatch.Commands, Is.EqualTo(1)); Assert.That(dispatch.AcceptedCommands, Is.EqualTo(0)); Assert.That(dispatch.RejectedCommands, Is.EqualTo(1));
                     Assert.That(dispatch.ActiveConnections, Is.EqualTo(3)); Assert.That(dispatch.ActivePeers, Is.EqualTo(2));
 
-                    var disconnect = Packet(PacketKind.Disconnect, 5, 3); disconnect.SchemaFingerprint = serverSchema.Fingerprint;
+                    var disconnect = Packet(PacketKind.Disconnect, 5, 4); disconnect.SchemaFingerprint = serverSchema.Fingerprint;
                     Assert.That(NetworkPacket.TryEncode(disconnect, ReadOnlySpan<byte>.Empty, out var packet), Is.True);
                     Assert.That(clientTransport.TrySend(packet), Is.True); server.Receive();
                     Assert.That(session.State, Is.EqualTo(NetworkSessionState.Closed));
