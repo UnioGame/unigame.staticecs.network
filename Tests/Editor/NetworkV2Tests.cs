@@ -103,6 +103,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 var clientB = new NetworkClient<ClientBWorld>(mock.ClientB, clientBSchema, new ScopeId(7));
                 var authority = World<AuthorityWorld>.NewEntity<TestEntity>();
                 authority.Set(new TestComponent { Value = 1 });
+                authority.Set(new NetworkOwnerComponent { PeerId = 2 });
                 var gid = authority.GID;
 
                 Assert.That(clientA.BeginHandshake(), Is.True);
@@ -115,21 +116,31 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(gid.TryUnpack<ClientBWorld>(out var replicaB), Is.True);
                 Assert.That(replicaA.Read<TestComponent>().Value, Is.EqualTo(1));
                 Assert.That(replicaB.Read<TestComponent>().Value, Is.EqualTo(1));
+                Assert.That(replicaA.Read<NetworkOwnerComponent>().PeerId, Is.EqualTo(2));
+                Assert.That(replicaB.Read<NetworkOwnerComponent>().PeerId, Is.EqualTo(2));
 
                 authority.Set(new TestComponent { Value = 2 });
+                replicaA.Set(new NetworkOwnerComponent { PeerId = 999 });
                 Assert.That(clientA.SendCommand(new TestCommand { Value = 20 }, 2), Is.EqualTo(NetworkCommandResult.Queued));
                 Assert.That(clientB.SendCommand(new TestCommand { Value = 10 }, 2), Is.EqualTo(NetworkCommandResult.Queued));
                 server.Receive(); server.Tick(_ => { });
                 clientA.Process(); clientB.Process();
                 Assert.That(replicaA.Read<TestComponent>().Value, Is.EqualTo(2));
                 Assert.That(replicaB.Read<TestComponent>().Value, Is.EqualTo(2));
+                Assert.That(authority.Read<NetworkOwnerComponent>().PeerId, Is.EqualTo(2), "client-local metadata must not affect authority state");
+                Assert.That(replicaA.Read<NetworkOwnerComponent>().PeerId, Is.EqualTo(2), "the next snapshot restores server-assigned display metadata");
                 authority.Disable<TestComponent>();
                 Assert.That(authority.HasDisabled<TestComponent>(), Is.True);
                 server.Receive(); server.Tick(_ => { }); clientA.Process(); clientB.Process();
                 Assert.That(replicaA.HasDisabled<TestComponent>(), Is.True);
                 Assert.That(replicaB.HasDisabled<TestComponent>(), Is.True);
                 var index = 0;
-                foreach (var item in receiver) { Assert.That(item.Value.Command.Value, Is.EqualTo(index++ == 0 ? 10 : 20)); }
+                foreach (var item in receiver)
+                {
+                    Assert.That(item.Value.Command.Value, Is.EqualTo(index == 0 ? 10 : 20));
+                    Assert.That(item.Value.Context.PeerId, Is.EqualTo(index == 0 ? 1 : 2), "server authority comes from admitted session context");
+                    index++;
+                }
                 Assert.That(index, Is.EqualTo(2));
                 Assert.That(clientA.AcknowledgedSnapshotTick, Is.EqualTo(3));
                 Assert.That(clientA.AcknowledgedCommandSequence, Is.EqualTo(1));
@@ -489,8 +500,11 @@ namespace UniGame.StaticEcs.Network.Tests
             var schema = Schema<TestWorld>(false);
             Assert.That(schema.TryGet(new NetworkTypeId(2), out var component), Is.True);
             Assert.That(schema.TryGet(new NetworkTypeId(10), out var command), Is.True);
+            Assert.That(schema.TryGet(new NetworkTypeId(5), out var owner), Is.True);
             Assert.That(component.Version, Is.Zero);
             Assert.That(command.Version, Is.Zero);
+            Assert.That(owner.Version, Is.Zero);
+            Assert.That(owner.RuntimeType, Is.EqualTo(typeof(NetworkOwnerComponent)));
         }
 
         [Test]
@@ -576,7 +590,7 @@ namespace UniGame.StaticEcs.Network.Tests
         {
             World<TWorld>.Create(WorldConfig.Default());
             var types = World<TWorld>.Types();
-            types.EntityType<TestEntity>(); types.EntityType<SecondEntity>(); types.Tag<TestTag>(); types.Component<TestComponent>(); types.Event<TestCommand>();
+            types.EntityType<TestEntity>(); types.EntityType<SecondEntity>(); types.Tag<TestTag>(); types.Component<TestComponent>(); types.Component<NetworkOwnerComponent>(); types.Event<TestCommand>();
             if (server) { types.Event<NetworkCommandAccepted<TestCommand>>(); types.Event<NetworkCommandRejected<TestCommand>>(); }
             World<TWorld>.Initialize();
         }
@@ -587,6 +601,7 @@ namespace UniGame.StaticEcs.Network.Tests
             factory.Entity<TestEntity>(new NetworkTypeId(1));
             factory.Entity<SecondEntity>(new NetworkTypeId(4));
             factory.DisableableComponent<TestComponent>(new NetworkTypeId(2));
+            factory.Component<NetworkOwnerComponent>(new NetworkTypeId(5));
             factory.Tag<TestTag>(new NetworkTypeId(3));
             if (server) factory.Command<TestCommand, AllowAnyPolicy<TWorld>>(new NetworkTypeId(10));
             else factory.Command<TestCommand>(new NetworkTypeId(10));

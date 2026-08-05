@@ -175,7 +175,7 @@ flowchart LR
 - Package version `2026.2.0` implements wire protocol `2` only.
 - Compression is fixed to `NetworkCompression.None`.
 - Runtime limits may be reduced by endpoint orchestration but must not exceed `ProtocolLimits`.
-- Every entity kind marked with `INetworkType` is authority-replicated; scope selection runs after generated kind selection. `NetworkOwnerComponent` is written only from trusted server state.
+- Every entity kind marked with `INetworkType` is authority-replicated; scope selection runs after generated kind selection. `NetworkOwnerComponent` is replicated display metadata written by the authority. It never grants authority: server policy trusts only `NetworkCommandContext.PeerId` from the admitted session.
 - Endpoint names must be unique valid C# identifiers because they form `Generated{Name}Network`.
 - The generator targets `netstandard2.0`, references Microsoft.CodeAnalysis.CSharp 4.3.1 at build time, and ships only `Analyzers/StaticEcs.Network.Generator.dll` with the `RoslynAnalyzer` label.
 - `NetworkNdjsonLog` contains numeric metadata only. It never records packet payloads, command values, schema manifests, or replicated world bytes.

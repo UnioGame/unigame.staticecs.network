@@ -22,6 +22,12 @@ namespace UniGame.StaticEcs.Network
 {
     public interface INetworkType { }
     public interface INetworkCommand { }
+    public struct NetworkOwnerComponent : FFS.Libraries.StaticEcs.IComponent, INetworkType
+    {
+        public uint PeerId;
+        public void Write<TWorld>(ref FFS.Libraries.StaticPack.BinaryPackWriter writer, FFS.Libraries.StaticEcs.World<TWorld>.Entity self) where TWorld : struct, FFS.Libraries.StaticEcs.IWorldType { }
+        public void Read<TWorld>(ref FFS.Libraries.StaticPack.BinaryPackReader reader, FFS.Libraries.StaticEcs.World<TWorld>.Entity self, byte version, bool disabled) where TWorld : struct, FFS.Libraries.StaticEcs.IWorldType { }
+    }
     public enum NetworkRole : byte { Client = 1, Server = 2 }
     public enum NetworkSchemaKind : byte { Entity, Component, Tag, Link, Links, Multi, Command }
     [System.AttributeUsage(System.AttributeTargets.Assembly, AllowMultiple = true)] public sealed class NetworkEndpointAttribute : System.Attribute { public NetworkEndpointAttribute(string name, System.Type world, NetworkRole role) { } }

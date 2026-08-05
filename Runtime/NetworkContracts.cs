@@ -72,7 +72,7 @@ namespace UniGame.StaticEcs.Network
     }
 
     /// <summary>Stores server-assigned ownership. Client input never writes this value.</summary>
-    public struct NetworkOwnerComponent : IComponent
+    public struct NetworkOwnerComponent : IComponent, INetworkType
     {
         /// <summary>Gets or sets the trusted peer identifier.</summary>
         public uint PeerId;
@@ -84,7 +84,6 @@ namespace UniGame.StaticEcs.Network
         public void Read<TWorld>(ref BinaryPackReader reader, World<TWorld>.Entity self, byte version, bool disabled) where TWorld : struct, IWorldType
         {
             PeerId = reader.ReadUint();
-            self.Set(this);
         }
     }
 
