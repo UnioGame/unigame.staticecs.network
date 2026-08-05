@@ -140,10 +140,11 @@ sequenceDiagram
 
     Input->>Client: INetworkCommand
     Client->>Transport: encoded CommandBatch
-    Transport->>Server: receive and decode
-    Server->>Server: validate, order, authorize
+    Transport->>Server: receive, decode, validate
+    Server->>Server: advance ServerTick
+    Server->>Server: order due commands, authorize
     Server->>World: NetworkCommandAccepted
-    World->>World: advance authority tick
+    Server->>World: run authority gameplay
     Server->>Server: capture full snapshot
     Server->>Transport: encoded FullSnapshot
     Transport->>Client: receive, decode, stage
