@@ -252,8 +252,11 @@ namespace UniGame.StaticEcs.Network.Tests
                     var clientObserver = new DiagnosticsCollector();
                     var server = new NetworkServer<AuthorityWorld>(Schema<AuthorityWorld>(true), (scope, entity) => true, observer: serverObserver);
                     server.AddConnection(serverTransport, 1, 9, new ScopeId(3), serverObserver);
-                    var client = new NetworkClient<ClientAWorld>(clientTransport, Schema<ClientAWorld>(false), new ScopeId(3), clientObserver);
+                    var clientSchema = Schema<ClientAWorld>(false);
+                    var client = new NetworkClient<ClientAWorld>(clientTransport, clientSchema, new ScopeId(3), clientObserver);
+                    Assert.That(clientObserver.Sessions[0].NextSendPacketSequence, Is.EqualTo(1));
                     Assert.That(client.BeginHandshake(), Is.True);
+                    Assert.That(clientObserver.Sessions[clientObserver.Sessions.Count - 1].NextSendPacketSequence, Is.EqualTo(2));
                     server.Receive();
                     EntityGID gid = default;
                     server.Tick(tick =>
@@ -288,6 +291,32 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(clientObserver.Snapshots.Count, Is.EqualTo(1));
                     Assert.That(serverObserver.Snapshots[0].PayloadHash, Is.EqualTo(clientObserver.Snapshots[0].PayloadHash));
                     Assert.That(clientObserver.Sessions[clientObserver.Sessions.Count - 1].AcknowledgedSnapshotTick, Is.EqualTo(1));
+                    Assert.That(serverObserver.Sessions[serverObserver.Sessions.Count - 1].NextSendPacketSequence, Is.EqualTo(3));
+
+                    var nonSnapshot = new PacketHeader
+                    {
+                        Kind = PacketKind.ResyncRequest,
+                        SessionEpoch = 9,
+                        PacketSequence = 3,
+                        ServerTick = 7,
+                        TargetTick = PacketHeader.NoneTick,
+                        SchemaFingerprint = clientSchema.Fingerprint
+                    };
+                    Assert.That(NetworkPacket.TryEncode(nonSnapshot, ReadOnlySpan<byte>.Empty, out var nonSnapshotPacket), Is.True);
+                    Assert.That(serverTransport.TrySend(nonSnapshotPacket), Is.True);
+                    client.Process();
+                    Assert.That(client.ServerTick, Is.EqualTo(7));
+                    Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(1));
+                    nonSnapshot.PacketSequence = 4;
+                    nonSnapshot.ServerTick = 3;
+                    Assert.That(NetworkPacket.TryEncode(nonSnapshot, ReadOnlySpan<byte>.Empty, out var olderTickPacket), Is.True);
+                    Assert.That(serverTransport.TrySend(olderTickPacket), Is.True);
+                    client.Process();
+                    Assert.That(client.ServerTick, Is.EqualTo(7), "validated non-snapshot ticks must not regress the authoritative cursor");
+                    Assert.That(client.SendCommand(new TestCommand { Value = 5 }, 8), Is.EqualTo(NetworkCommandResult.Queued));
+                    var commandDiagnostics = clientObserver.Sessions[clientObserver.Sessions.Count - 1];
+                    Assert.That(commandDiagnostics.ServerTick, Is.EqualTo(7));
+                    Assert.That(commandDiagnostics.NextSendPacketSequence, Is.EqualTo(4));
                 }
             }
             finally { World<AuthorityWorld>.Destroy(); World<ClientAWorld>.Destroy(); }

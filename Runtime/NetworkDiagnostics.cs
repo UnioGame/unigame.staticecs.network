@@ -98,12 +98,14 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Creates one session diagnostics sample.</summary>
         public NetworkSessionDiagnostics(NetworkRole role, NetworkSessionState state, uint connectionId, uint peerId,
             uint epoch, ScopeId scope, uint serverTick, uint acknowledgedSnapshotTick, uint acknowledgedCommandSequence,
-            uint nextSendCommandSequence, uint nextReceiveCommandSequence, uint nextReceivePacketSequence)
+            uint nextSendCommandSequence, uint nextReceiveCommandSequence, uint nextReceivePacketSequence,
+            uint nextSendPacketSequence)
         {
             Role = role; State = state; ConnectionId = connectionId; PeerId = peerId; Epoch = epoch; Scope = scope;
             ServerTick = serverTick; AcknowledgedSnapshotTick = acknowledgedSnapshotTick;
             AcknowledgedCommandSequence = acknowledgedCommandSequence; NextSendCommandSequence = nextSendCommandSequence;
             NextReceiveCommandSequence = nextReceiveCommandSequence; NextReceivePacketSequence = nextReceivePacketSequence;
+            NextSendPacketSequence = nextSendPacketSequence;
         }
 
         /// <summary>Gets endpoint role.</summary>
@@ -130,6 +132,8 @@ namespace UniGame.StaticEcs.Network
         public uint NextReceiveCommandSequence { get; }
         /// <summary>Gets the next packet sequence accepted by this endpoint.</summary>
         public uint NextReceivePacketSequence { get; }
+        /// <summary>Gets the next packet sequence assigned by this endpoint.</summary>
+        public uint NextSendPacketSequence { get; }
     }
 
     /// <summary>Contains immutable snapshot identity, counts, and retained-history bounds.</summary>

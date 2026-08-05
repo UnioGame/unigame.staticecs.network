@@ -228,14 +228,15 @@ namespace UniGame.StaticEcs.Network
             catch { }
         }
 
-        internal void ReportSession(uint serverTick, uint acknowledgedSnapshotTick, uint acknowledgedCommandSequence)
+        internal void ReportSession(uint serverTick, uint acknowledgedSnapshotTick, uint acknowledgedCommandSequence,
+            uint nextSendPacketSequence)
         {
             if (_observer is not INetworkDiagnosticsObserver diagnostics) return;
             try
             {
                 var value = new NetworkSessionDiagnostics(Role, State, Connection.Value, PeerId, Epoch, Scope, serverTick,
                     acknowledgedSnapshotTick, acknowledgedCommandSequence, _nextSendSequence, _nextReceiveSequence,
-                    _nextReceivePacketSequence);
+                    _nextReceivePacketSequence, nextSendPacketSequence);
                 diagnostics.ObserveSession(in value);
             }
             catch { }
