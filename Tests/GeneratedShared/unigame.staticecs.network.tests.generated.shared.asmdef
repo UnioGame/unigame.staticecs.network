@@ -2,6 +2,7 @@
   "name": "unigame.staticecs.network.tests.generated.shared",
   "rootNamespace": "UniGame.StaticEcs.Network.GeneratedTests.Shared",
   "references": [
+    "unigame.staticecs.network.protocol",
     "unigame.staticecs.network",
     "FFS.StaticEcs"
   ],
