@@ -20,11 +20,17 @@ Transport-neutral Network v2 runtime and generated AOT-safe schemas for Static E
 
 The package separates immutable generated schema from mutable endpoint state:
 
-```text
-Shared wire types -> generated manifest -> endpoint NetworkSchema<TWorld>
-NetworkSchema     -> NetworkSession + NetworkReplicator
-INetworkTransport -> NetworkClient / multi-connection NetworkServer
-runtime phases    -> INetworkObserver -> NDJSON or optional Unity Profiler adapter
+```mermaid
+flowchart LR
+    T["Shared wire types"] --> G["Roslyn generator"]
+    G --> M["Generated manifest and typed invokers"]
+    M --> S["NetworkSchema&lt;TWorld&gt;"]
+    S --> C["NetworkClient&lt;TWorld&gt;"]
+    S --> V["NetworkServer&lt;TWorld&gt;"]
+    C --> O["Observer and bounded history"]
+    V --> O
+    X["INetworkTransport"] --> C
+    X --> V
 ```
 
 Production roles may both use the same world type in different processes. A sandbox may
@@ -124,12 +130,44 @@ client.Process();
 client.SendCommand(new MoveCommand { X = 1 }, targetTick);
 ```
 
+```mermaid
+sequenceDiagram
+    participant Input as Client gameplay
+    participant Client as NetworkClient
+    participant Transport as INetworkTransport
+    participant Server as NetworkServer
+    participant World as Authority gameplay
+
+    Input->>Client: INetworkCommand
+    Client->>Transport: encoded CommandBatch
+    Transport->>Server: receive and decode
+    Server->>Server: validate, order, authorize
+    Server->>World: NetworkCommandAccepted
+    World->>World: advance authority tick
+    Server->>Server: capture full snapshot
+    Server->>Transport: encoded FullSnapshot
+    Transport->>Client: receive, decode, stage
+    Client->>Client: apply replica changes
+```
+
 Snapshot metadata includes tick, scope, schema fingerprint, canonical hash, bytes, entity count, and record count. Authority capture always requires an explicit scope selector; the client-only replicator constructor supports staging and apply but rejects capture. Client and server histories evict oldest ticks until both tick and byte budgets hold. Snapshot staging preflights canonical order, ledger ownership, entity kinds, bounds, and local occupancy before any ECS mutation; only ledger-owned replicas may be updated or despawned.
 
 Generated typed invokers select every authority entity whose concrete `IEntityType` also
 implements `INetworkType`, then apply the active scope selector. Moving an entity out of
 scope or destroying it makes it absent from the next full snapshot and despawns the
 corresponding ledger-owned replica. Client-local entities remain outside that ledger.
+
+```mermaid
+flowchart LR
+    A["Authority entity kind implements INetworkType"] --> B["Scope selector"]
+    B --> C["Generated Write invokers"]
+    C --> D["Canonical full snapshot"]
+    D --> E["Decode and validate without ECS mutation"]
+    E --> F["Create or update ledger replicas"]
+    E --> G["Remove absent network records"]
+    E --> H["Despawn absent ledger replicas"]
+    I["Client-local entities"] -. "outside replica ledger" .-> H
+```
 
 ## Configuration
 
