@@ -590,7 +590,8 @@ namespace UniGame.StaticEcs.Network.Tests
         {
             World<TWorld>.Create(WorldConfig.Default());
             var types = World<TWorld>.Types();
-            types.EntityType<TestEntity>(); types.EntityType<SecondEntity>(); types.Tag<TestTag>(); types.Component<TestComponent>(); types.Component<NetworkOwnerComponent>(); types.Event<TestCommand>();
+            types.RegisterAll(typeof(NetworkOwnerComponent).Assembly);
+            types.EntityType<TestEntity>(); types.EntityType<SecondEntity>(); types.Tag<TestTag>(); types.Component<TestComponent>(); types.Event<TestCommand>();
             if (server) { types.Event<NetworkCommandAccepted<TestCommand>>(); types.Event<NetworkCommandRejected<TestCommand>>(); }
             World<TWorld>.Initialize();
         }

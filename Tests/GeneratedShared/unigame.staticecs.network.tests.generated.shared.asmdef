@@ -1,0 +1,17 @@
+{
+  "name": "unigame.staticecs.network.tests.generated.shared",
+  "rootNamespace": "UniGame.StaticEcs.Network.GeneratedTests.Shared",
+  "references": [
+    "unigame.staticecs.network",
+    "FFS.StaticEcs"
+  ],
+  "includePlatforms": ["Editor"],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": true
+}

@@ -99,6 +99,7 @@ Register ordinary ECS types through the normal Static ECS registration path. Gen
 
 ```csharp
 World<ServerWorld>.Create(WorldConfig.Default());
+World<ServerWorld>.Types().RegisterAll(typeof(NetworkOwnerComponent).Assembly);
 World<ServerWorld>.Types().RegisterAll(typeof(PositionComponent).Assembly);
 GeneratedServerNetwork.RegisterTypes(World<ServerWorld>.Types());
 World<ServerWorld>.Initialize();
