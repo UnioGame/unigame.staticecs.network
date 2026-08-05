@@ -142,6 +142,9 @@ corresponding ledger-owned replica. Client-local entities remain outside that le
 - `NetworkNdjsonLog` contains numeric metadata only. It never records packet payloads, command values, schema manifests, or replicated world bytes.
 - Diagnostics use six measured phases. Decode includes framing and snapshot staging, SnapshotApply contains only ECS mutation, and acknowledgements are separate Send attempts. Snapshot failures retain distinct schema, malformed, limit, and world categories. Server dispatch totals are emitted through the server observer once per tick; connection gauges include live handshakes while peer gauges include only established sessions.
 - Observers may additionally implement `INetworkDiagnosticsObserver` to receive immutable session cursors and snapshot/history metadata. These callbacks never expose payload bytes, command values, ECS handles, or Unity types.
+- See the repository [Static ECS knowledge base](../../../docs/knowledge/static-ecs/) for world lifecycle and type registration.
+
+## Limitations
+
 - `CommandBatch` currently carries one command record per packet. The packet kind and limits reserve batching for later transport optimization.
 - Resync signaling is implemented. Targeted historical replay is not; with current full snapshots, the next accepted snapshot restores replica state.
-- See the repository [Static ECS knowledge base](../../../docs/knowledge/static-ecs/) for world lifecycle and type registration.
