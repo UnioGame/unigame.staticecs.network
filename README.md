@@ -185,6 +185,11 @@ queued packets and rejects sends until reconnect; reconnect increments a generat
 orchestration to create a fresh session. Decisions contain timing, direction, ordinal, size,
 and action but never payload bytes.
 
+A protocol `Disconnect` uses the same idempotent cleanup path as local teardown. The client
+destroys replica-owned entities and clears applied history; the server removes peer,
+coordinator, and pending-packet state so the connection identity can be admitted again.
+Active peer identities are unique and zero remains reserved.
+
 Loss, duplication, and reordering operate below the current strict ordered session. Reliable
 retransmission/reassembly is outside this phase, so adverse settings can intentionally cause
 sequence rejection and resync. Use the `Immediate` preset for normal full-cycle gameplay.

@@ -66,6 +66,56 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void RemoteDisconnectClearsClientReplicasAndHistory()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var authoritySchema = Schema<AuthorityWorld>(true);
+                var clientSchema = Schema<ClientAWorld>(false);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(41), out var clientTransport,
+                    out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    var server = new NetworkServer<AuthorityWorld>(authoritySchema,
+                        (scope, entity) => true);
+                    server.AddConnection(serverTransport, 4, 9, new ScopeId(1));
+                    var client = new NetworkClient<ClientAWorld>(clientTransport, clientSchema,
+                        new ScopeId(1));
+                    var authority = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    authority.Set(new TestComponent { Value = 5 });
+
+                    client.BeginHandshake();
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+                    Assert.That(client.History.Count, Is.EqualTo(1));
+                    Assert.That(World<ClientAWorld>.Query(default(EntityIs<TestEntity>))
+                        .EntitiesCount(), Is.EqualTo(1));
+
+                    var disconnect = Packet(PacketKind.Disconnect, 9, 3);
+                    disconnect.SchemaFingerprint = clientSchema.Fingerprint;
+                    Assert.That(NetworkPacket.TryEncode(disconnect, ReadOnlySpan<byte>.Empty,
+                        out var packet), Is.True);
+                    Assert.That(serverTransport.TrySend(packet), Is.True);
+                    client.Process();
+
+                    Assert.That(client.Session.State, Is.EqualTo(NetworkSessionState.Closed));
+                    Assert.That(client.History.Count, Is.Zero);
+                    Assert.That(World<ClientAWorld>.Query(default(EntityIs<TestEntity>))
+                        .EntitiesCount(), Is.Zero);
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
         public void HistoryEvictsOldestAndScopeCaptureIsSharedByReference()
         {
             var history = new NetworkHistory<string>(2);
@@ -100,6 +150,8 @@ namespace UniGame.StaticEcs.Network.Tests
                 var server = new NetworkServer<AuthorityWorld>(authoritySchema, (scope, entity) => true,
                     4, 1024 * 1024, peerObserver: peerObserver);
                 server.AddConnection(mock.ServerA, 2, 11, new ScopeId(7));
+                Assert.Throws<InvalidOperationException>(() =>
+                    server.AddConnection(mock.ServerB, 2, 12, new ScopeId(7)));
                 server.AddConnection(mock.ServerB, 1, 12, new ScopeId(7));
                 var clientA = new NetworkClient<ClientAWorld>(mock.ClientA, clientASchema, new ScopeId(7));
                 var clientB = new NetworkClient<ClientBWorld>(mock.ClientB, clientBSchema, new ScopeId(7));
@@ -402,6 +454,15 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(session.State, Is.EqualTo(NetworkSessionState.Closed));
                     var decoded = observer.Single(NetworkPhase.Decode, NetworkPacketKind.Disconnect);
                     Assert.That(decoded.ActiveConnections, Is.EqualTo(2)); Assert.That(decoded.ActivePeers, Is.EqualTo(1));
+                    MemoryNetworkTransport.CreatePair(new ConnectionId(1), out var reconnectClient,
+                        out var reconnectServer);
+                    using (reconnectClient)
+                    using (reconnectServer)
+                    {
+                        Assert.DoesNotThrow(() => server.AddConnection(reconnectServer, 4, 8,
+                            default));
+                        Assert.That(server.RemoveConnection(new ConnectionId(1)), Is.True);
+                    }
                 }
             }
             finally { World<RejectWorld>.Destroy(); }

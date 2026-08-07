@@ -47,6 +47,7 @@ namespace UniGame.StaticEcs.Network
             AcknowledgedCommandSequence = 0;
             ServerTick = 0;
             ResyncRequested = false;
+            _session.ReportSession(0, 0, 0, _packetSequence);
         }
 
         /// <summary>Sends the protocol-two Hello packet.</summary>
@@ -71,9 +72,14 @@ namespace UniGame.StaticEcs.Network
                 if (header.Kind == PacketKind.Ready) DecodeReady(header, payload);
                 else if (header.Kind == PacketKind.FullSnapshot) decodeResult = DiagnosticResult(TryStageSnapshot(header, payload, out staged, out entities, out records, out decodedBytes));
                 else if (header.Kind == PacketKind.ResyncRequest) ResyncRequested = true;
-                else if (header.Kind == PacketKind.Disconnect) _session.Close();
+                var disconnected = header.Kind == PacketKind.Disconnect;
                 AcknowledgedCommandSequence = Math.Max(AcknowledgedCommandSequence, header.AcknowledgedCommandSequence);
                 _session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, decodeResult, DiagnosticKind(header.Kind), header.ServerTick, header.TargetTick, decodedBytes, History.Count, History.Bytes, unchecked((int)(header.ServerTick - AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), entities, records);
+                if (disconnected)
+                {
+                    Disconnect();
+                    return;
+                }
                 if (header.Kind == PacketKind.FullSnapshot)
                 {
                     if (staged == null) RequestResync(header.ServerTick);
@@ -201,7 +207,14 @@ namespace UniGame.StaticEcs.Network
         public NetworkSession<TWorld> AddConnection(INetworkTransport transport, uint peerId, uint epoch, ScopeId scope, INetworkObserver observer = null)
         {
             if (transport == null) throw new ArgumentNullException(nameof(transport));
-            for (var i = 0; i < _peers.Count; i++) if (_peers[i].Transport.Connection == transport.Connection) throw new InvalidOperationException("Connection already exists.");
+            if (peerId == 0) throw new ArgumentOutOfRangeException(nameof(peerId), "Peer identity zero is reserved.");
+            for (var i = 0; i < _peers.Count; i++)
+            {
+                if (_peers[i].Transport.Connection == transport.Connection)
+                    throw new InvalidOperationException("Connection already exists.");
+                if (_peers[i].PeerId == peerId)
+                    throw new InvalidOperationException("Peer identity already exists.");
+            }
             var session = new NetworkSession<TWorld>(transport.Connection, NetworkRole.Server, _schema, observer ?? _observer);
             var peer = new Peer(transport, session, peerId, epoch, scope);
             _peers.Add(peer);
@@ -215,8 +228,9 @@ namespace UniGame.StaticEcs.Network
             for (var i = 0; i < _peers.Count; i++)
             {
                 if (_peers[i].Transport.Connection != connection) continue;
-                ClosePeer(_peers[i]);
-                _peers.RemoveAt(i); _coordinator.Remove(connection); return true;
+                CleanupPeer(_peers[i]);
+                _peers.RemoveAt(i);
+                return true;
             }
             return false;
         }
@@ -234,7 +248,9 @@ namespace UniGame.StaticEcs.Network
                     peer.PendingPackets.Enqueue(packet);
                     peer.Session.Trace(NetworkPhase.Receive, NetworkTraceKind.Point, NetworkResultCategory.Success, NetworkPacketKind.None, ServerTick, 0, packet?.Length ?? 0, 0, 0, unchecked((int)(ServerTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(receiveStarted), activeConnections: ActiveConnectionCount, activePeers: ActivePeerCount);
                 }
-                DecodePending(peer);
+                if (!DecodePending(peer)) continue;
+                _peers.RemoveAt(i);
+                i--;
             }
         }
 
@@ -270,7 +286,7 @@ namespace UniGame.StaticEcs.Network
         public bool TryGetCapture(ScopeId scope, uint serverTick, out NetworkSnapshot snapshot)
             => _coordinator.TryGetCapture(scope, serverTick, out snapshot);
 
-        private void DecodePending(Peer peer)
+        private bool DecodePending(Peer peer)
         {
             while (peer.PendingPackets.Count > 0)
             {
@@ -283,12 +299,14 @@ namespace UniGame.StaticEcs.Network
                 else if (header.Kind == PacketKind.ResyncRequest) peer.ResyncRequested = true;
                 else if (header.Kind == PacketKind.Disconnect)
                 {
-                    ClosePeer(peer);
-                    _coordinator.Remove(peer.Transport.Connection);
+                    CleanupPeer(peer);
                 }
                 peer.Session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, NetworkResultCategory.Success, DiagnosticKind(header.Kind), ServerTick, header.TargetTick, packet.Length, 0, 0, unchecked((int)(ServerTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), activeConnections: ActiveConnectionCount, activePeers: ActivePeerCount);
                 peer.Session.ReportSession(ServerTick, peer.AcknowledgedSnapshotTick, peer.AcknowledgedCommandSequence, peer.PacketSequence);
+                if (header.Kind == PacketKind.Disconnect)
+                    return true;
             }
+            return false;
         }
 
         private void Admit(Peer peer, SchemaFingerprint remoteFingerprint)
@@ -373,6 +391,13 @@ namespace UniGame.StaticEcs.Network
             }
             peer.Session.ReportSession(ServerTick, peer.AcknowledgedSnapshotTick,
                 peer.AcknowledgedCommandSequence, peer.PacketSequence);
+        }
+
+        private void CleanupPeer(Peer peer)
+        {
+            ClosePeer(peer);
+            peer.PendingPackets.Clear();
+            _coordinator.Remove(peer.Transport.Connection);
         }
 
         private void NotifyAdmitted(Peer peer)
