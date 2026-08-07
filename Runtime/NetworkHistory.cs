@@ -52,6 +52,13 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Finds one retained tick.</summary>
         public bool TryGet(uint tick, out T value) => _values.TryGetValue(tick, out value);
 
+        /// <summary>Removes all retained items and resets the byte count.</summary>
+        public void Clear()
+        {
+            _values.Clear();
+            _bytes = 0;
+        }
+
         private uint BoundaryTick(bool newest)
         {
             if (_values.Count == 0) return 0;

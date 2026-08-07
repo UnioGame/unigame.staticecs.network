@@ -187,7 +187,7 @@ namespace UniGame.StaticEcs.Network
     {
         void Collect(List<World<TWorld>.Entity> entities, HashSet<EntityGID> seen);
         bool Matches(World<TWorld>.Entity entity);
-        World<TWorld>.Entity Create(EntityGID gid);
+        World<TWorld>.Entity Create();
     }
 
     internal interface IRecordNetworkInvoker<TWorld> where TWorld : struct, IWorldType
@@ -211,7 +211,7 @@ namespace UniGame.StaticEcs.Network
         }
 
         public bool Matches(World<TWorld>.Entity entity) => entity.EntityType == default(TEntity).Id();
-        public World<TWorld>.Entity Create(EntityGID gid) => World<TWorld>.NewEntityByGID<TEntity>(gid);
+        public World<TWorld>.Entity Create() => World<TWorld>.NewEntity<TEntity>();
     }
 
     internal class ComponentNetworkInvoker<TWorld, T> : IRecordNetworkInvoker<TWorld>

@@ -96,7 +96,9 @@ namespace UniGame.StaticEcs.Network.Tests
                 var clientASchema = Schema<ClientAWorld>(false);
                 var clientBSchema = Schema<ClientBWorld>(false);
                 using var mock = new TwoClientNetworkMock();
-                var server = new NetworkServer<AuthorityWorld>(authoritySchema, (scope, entity) => true, 4, 1024 * 1024);
+                var peerObserver = new TestPeerObserver();
+                var server = new NetworkServer<AuthorityWorld>(authoritySchema, (scope, entity) => true,
+                    4, 1024 * 1024, peerObserver: peerObserver);
                 server.AddConnection(mock.ServerA, 2, 11, new ScopeId(7));
                 server.AddConnection(mock.ServerB, 1, 12, new ScopeId(7));
                 var clientA = new NetworkClient<ClientAWorld>(mock.ClientA, clientASchema, new ScopeId(7));
@@ -112,6 +114,9 @@ namespace UniGame.StaticEcs.Network.Tests
                 clientA.Process(); clientB.Process();
                 Assert.That(clientA.Session.State, Is.EqualTo(NetworkSessionState.Established));
                 Assert.That(clientB.Session.State, Is.EqualTo(NetworkSessionState.Established));
+                Assert.That(peerObserver.AdmittedPeers.Count, Is.EqualTo(2));
+                Assert.That(peerObserver.AdmittedPeers[0].PeerId, Is.EqualTo(2));
+                Assert.That(peerObserver.AdmittedPeers[1].PeerId, Is.EqualTo(1));
                 Assert.That(gid.TryUnpack<ClientAWorld>(out var replicaA), Is.True);
                 Assert.That(gid.TryUnpack<ClientBWorld>(out var replicaB), Is.True);
                 Assert.That(replicaA.Read<TestComponent>().Value, Is.EqualTo(1));
@@ -156,6 +161,10 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(gid.TryUnpack<ClientBWorld>(out _), Is.False);
 
                 Assert.That(server.RemoveConnection(new ConnectionId(1)), Is.True);
+                Assert.That(peerObserver.DisconnectedPeers.Count, Is.EqualTo(1));
+                Assert.That(peerObserver.DisconnectedPeers[0].PeerId, Is.EqualTo(2));
+                Assert.That(server.RemoveConnection(new ConnectionId(1)), Is.False);
+                Assert.That(peerObserver.DisconnectedPeers.Count, Is.EqualTo(1));
                 CreateReplicationWorld<ReconnectWorld>(false);
                 MemoryNetworkTransport.CreatePair(new ConnectionId(1), out var reconnectTransport, out var reconnectServer);
                 using (reconnectTransport) using (reconnectServer)
@@ -173,6 +182,16 @@ namespace UniGame.StaticEcs.Network.Tests
                 World<AuthorityWorld>.Destroy(); World<ClientAWorld>.Destroy(); World<ClientBWorld>.Destroy();
                 if (World<ReconnectWorld>.Status == WorldStatus.Initialized) World<ReconnectWorld>.Destroy();
             }
+        }
+
+        private sealed class TestPeerObserver : INetworkPeerObserver
+        {
+            internal readonly List<NetworkPeerData> AdmittedPeers = new List<NetworkPeerData>();
+            internal readonly List<NetworkPeerData> DisconnectedPeers = new List<NetworkPeerData>();
+
+            public void Admitted(in NetworkPeerData peer) => AdmittedPeers.Add(peer);
+
+            public void Disconnected(in NetworkPeerData peer) => DisconnectedPeers.Add(peer);
         }
 
         [Test]
@@ -200,7 +219,7 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
-        public void SnapshotConflictAndMalformedPacketNeverMutateClientLocalEntity()
+        public void SnapshotSourceIdCollisionAndMalformedPacketNeverMutateClientLocalEntity()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
             CreateReplicationWorld<ConflictWorld>(false);
@@ -215,10 +234,22 @@ namespace UniGame.StaticEcs.Network.Tests
                 var capture = new NetworkReplicator<AuthorityWorld>(authoritySchema, (scope, entity) => true, new ScopeId(3));
                 Assert.That(capture.Capture(1, out var snapshot), Is.EqualTo(SnapshotCaptureResult.Success));
                 var apply = new NetworkReplicator<ConflictWorld>(clientSchema, new ScopeId(3));
-                Assert.That(apply.Stage(snapshot, out _), Is.EqualTo(SnapshotApplyResult.EntityConflict));
+                Assert.That(apply.Stage(snapshot, out var staged), Is.EqualTo(SnapshotApplyResult.Success));
+                Assert.That(apply.Apply(staged), Is.EqualTo(SnapshotApplyResult.Success));
                 Assert.That(local.Read<TestComponent>().Value, Is.EqualTo(99));
 
-                var malformed = snapshot.Bytes.ToArray(); malformed[malformed.Length - 1] ^= 1;
+                var replicaCount = 0;
+                foreach (var entity in World<ConflictWorld>.Query().Entities())
+                {
+                    if (entity.EntityType != default(TestEntity).Id() || entity.GID == local.GID)
+                        continue;
+                    Assert.That(entity.Read<TestComponent>().Value, Is.EqualTo(5));
+                    replicaCount++;
+                }
+                Assert.That(replicaCount, Is.EqualTo(1));
+
+                var malformed = new byte[snapshot.ByteLength - 1];
+                snapshot.Bytes.Span.Slice(0, malformed.Length).CopyTo(malformed);
                 var bad = new NetworkSnapshot(1, snapshot.SchemaFingerprint, snapshot.Scope, malformed, snapshot.EntityCount, snapshot.RecordCount);
                 Assert.That(apply.Stage(bad, out _), Is.Not.EqualTo(SnapshotApplyResult.Success));
                 Assert.That(local.Read<TestComponent>().Value, Is.EqualTo(99));
@@ -420,7 +451,11 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(NetworkClient<ClientAWorld>.DiagnosticResult(client.Stage(wrongScope, out _)), Is.EqualTo(NetworkResultCategory.Schema));
                 var malformed = new NetworkSnapshot(1, schema.Fingerprint, new ScopeId(1), new byte[] { 0, 0, 0, 0, 1 }, 0, 0);
                 Assert.That(NetworkClient<ClientAWorld>.DiagnosticResult(client.Stage(malformed, out _)), Is.EqualTo(NetworkResultCategory.Malformed));
-                World<ClientAWorld>.NewEntity<TestEntity>();
+                Assert.That(client.Stage(capture, out var staged), Is.EqualTo(SnapshotApplyResult.Success));
+                Assert.That(client.Apply(staged), Is.EqualTo(SnapshotApplyResult.Success));
+                foreach (var entity in World<ClientAWorld>.Query().Entities())
+                    if (entity.EntityType == default(TestEntity).Id())
+                        entity.Destroy();
                 Assert.That(NetworkClient<ClientAWorld>.DiagnosticResult(client.Stage(capture, out _)), Is.EqualTo(NetworkResultCategory.World));
                 Assert.That(NetworkClient<ClientAWorld>.DiagnosticResult(SnapshotApplyResult.Success), Is.EqualTo(NetworkResultCategory.Success));
             }

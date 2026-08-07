@@ -38,6 +38,17 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Gets whether malformed or rejected input requested resynchronization.</summary>
         public bool ResyncRequested { get; private set; }
 
+        /// <summary>Closes the session and removes all replica-owned entities from the client world.</summary>
+        public void Disconnect()
+        {
+            _session.Close();
+            _replicator.ClearReplicas();
+            AcknowledgedSnapshotTick = 0;
+            AcknowledgedCommandSequence = 0;
+            ServerTick = 0;
+            ResyncRequested = false;
+        }
+
         /// <summary>Sends the protocol-two Hello packet.</summary>
         public bool BeginHandshake() => Send(PacketKind.Hello, 0, PacketHeader.NoneTick, PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
 
@@ -170,18 +181,20 @@ namespace UniGame.StaticEcs.Network
         private readonly NetworkReplicator<TWorld> _replicator;
         private readonly List<Peer> _peers = new List<Peer>();
         private readonly INetworkObserver _observer;
+        private readonly INetworkPeerObserver _peerObserver;
 
         /// <summary>Gets the latest authoritative tick completed by this server.</summary>
         public uint ServerTick { get; private set; }
 
         /// <summary>Creates a multi-connection authoritative server pipeline.</summary>
-        public NetworkServer(NetworkSchema<TWorld> schema, NetworkScopeSelector<TWorld> scopeSelector, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024, INetworkObserver observer = null)
+        public NetworkServer(NetworkSchema<TWorld> schema, NetworkScopeSelector<TWorld> scopeSelector, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024, INetworkObserver observer = null, INetworkPeerObserver peerObserver = null)
         {
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
             if (scopeSelector == null) throw new ArgumentNullException(nameof(scopeSelector));
             _coordinator = new NetworkServerCoordinator<TWorld>(historyTicks, historyBytes);
             _replicator = new NetworkReplicator<TWorld>(schema, scopeSelector);
             _observer = observer;
+            _peerObserver = peerObserver;
         }
 
         /// <summary>Adds one transport-owned connection with server-assigned identity and scope.</summary>
@@ -202,8 +215,7 @@ namespace UniGame.StaticEcs.Network
             for (var i = 0; i < _peers.Count; i++)
             {
                 if (_peers[i].Transport.Connection != connection) continue;
-                _peers[i].Session.Close();
-                _peers[i].Session.ReportSession(ServerTick, _peers[i].AcknowledgedSnapshotTick, _peers[i].AcknowledgedCommandSequence, _peers[i].PacketSequence);
+                ClosePeer(_peers[i]);
                 _peers.RemoveAt(i); _coordinator.Remove(connection); return true;
             }
             return false;
@@ -269,7 +281,11 @@ namespace UniGame.StaticEcs.Network
                 else if (header.Kind == PacketKind.CommandBatch) DecodeCommand(peer, header, payload, checked(ServerTick + 1));
                 else if (header.Kind == PacketKind.Ack) peer.AcknowledgedSnapshotTick = header.AcknowledgedSnapshotTick;
                 else if (header.Kind == PacketKind.ResyncRequest) peer.ResyncRequested = true;
-                else if (header.Kind == PacketKind.Disconnect) peer.Session.Close();
+                else if (header.Kind == PacketKind.Disconnect)
+                {
+                    ClosePeer(peer);
+                    _coordinator.Remove(peer.Transport.Connection);
+                }
                 peer.Session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, NetworkResultCategory.Success, DiagnosticKind(header.Kind), ServerTick, header.TargetTick, packet.Length, 0, 0, unchecked((int)(ServerTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), activeConnections: ActiveConnectionCount, activePeers: ActivePeerCount);
                 peer.Session.ReportSession(ServerTick, peer.AcknowledgedSnapshotTick, peer.AcknowledgedCommandSequence, peer.PacketSequence);
             }
@@ -279,6 +295,11 @@ namespace UniGame.StaticEcs.Network
         {
             if (peer.Session.Admit(remoteFingerprint, peer.PeerId, peer.Epoch, peer.Scope) != NetworkAdmissionResult.Accepted) { Send(peer, PacketKind.Disconnect, 0, PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty); return; }
             _coordinator.Add(peer.Session);
+            if (!peer.AdmissionNotified)
+            {
+                peer.AdmissionNotified = true;
+                NotifyAdmitted(peer);
+            }
             var payload = new byte[12];
             Hashing.Write32(payload, 0, peer.PeerId);
             Hashing.Write64(payload, 4, peer.Scope.Value);
@@ -342,6 +363,32 @@ namespace UniGame.StaticEcs.Network
             catch { }
         }
 
+        private void ClosePeer(Peer peer)
+        {
+            peer.Session.Close();
+            if (peer.AdmissionNotified && !peer.DisconnectNotified)
+            {
+                peer.DisconnectNotified = true;
+                NotifyDisconnected(peer);
+            }
+            peer.Session.ReportSession(ServerTick, peer.AcknowledgedSnapshotTick,
+                peer.AcknowledgedCommandSequence, peer.PacketSequence);
+        }
+
+        private void NotifyAdmitted(Peer peer)
+        {
+            if (_peerObserver == null) return;
+            var data = peer.Data();
+            _peerObserver.Admitted(in data);
+        }
+
+        private void NotifyDisconnected(Peer peer)
+        {
+            if (_peerObserver == null) return;
+            var data = peer.Data();
+            _peerObserver.Disconnected(in data);
+        }
+
         private static NetworkPacketKind DiagnosticKind(PacketKind kind) => (NetworkPacketKind)(byte)kind;
         private static long ElapsedNanoseconds(long started) => (Stopwatch.GetTimestamp() - started) * 1000000000L / Stopwatch.Frequency;
 
@@ -358,7 +405,17 @@ namespace UniGame.StaticEcs.Network
             internal uint AcknowledgedSnapshotTick;
             internal uint AcknowledgedCommandSequence;
             internal bool ResyncRequested;
+            internal bool AdmissionNotified;
+            internal bool DisconnectNotified;
             internal readonly Queue<byte[]> PendingPackets = new Queue<byte[]>();
+
+            internal NetworkPeerData Data() => new NetworkPeerData
+            {
+                Connection = Transport.Connection,
+                PeerId = PeerId,
+                Epoch = Epoch,
+                Scope = Scope
+            };
         }
     }
 }

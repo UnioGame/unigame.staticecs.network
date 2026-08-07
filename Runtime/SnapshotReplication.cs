@@ -102,11 +102,24 @@ namespace UniGame.StaticEcs.Network
         internal bool Disabled;
     }
 
+    internal readonly struct NetworkReplicaEntry
+    {
+        internal readonly EntityGID LocalGid;
+        internal readonly NetworkTypeId KindId;
+
+        internal NetworkReplicaEntry(EntityGID localGid, NetworkTypeId kindId)
+        {
+            LocalGid = localGid;
+            KindId = kindId;
+        }
+    }
+
     /// <summary>Captures generated authority entity kinds and applies two-phase full snapshots.</summary>
     public sealed class NetworkReplicator<TWorld> where TWorld : struct, IWorldType
     {
         private readonly NetworkSchema<TWorld> _schema;
-        private readonly Dictionary<EntityGID, NetworkTypeId> _replicas = new Dictionary<EntityGID, NetworkTypeId>();
+        private readonly Dictionary<EntityGID, NetworkReplicaEntry> _replicas =
+            new Dictionary<EntityGID, NetworkReplicaEntry>();
         private readonly object _owner = new object();
         private readonly NetworkScopeSelector<TWorld> _scopeSelector;
 
@@ -239,8 +252,13 @@ namespace UniGame.StaticEcs.Network
                 for (var i = 0; i < entities.Length; i++)
                 {
                     var source = entities[i];
-                    if (!source.Gid.TryUnpack<TWorld>(out var existing)) continue;
-                    if (!_replicas.TryGetValue(source.Gid, out var kindId) || kindId != source.Kind.TypeId || !((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Matches(existing)) return SnapshotApplyResult.EntityConflict;
+                    if (!_replicas.TryGetValue(source.Gid, out var replica)) continue;
+                    if (
+                        replica.KindId != source.Kind.TypeId
+                        || !replica.LocalGid.TryUnpack<TWorld>(out var existing)
+                        || !((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Matches(existing)
+                    )
+                        return SnapshotApplyResult.EntityConflict;
                 }
                 staged = new StagedNetworkSnapshot(_owner, snapshot, entities);
                 return SnapshotApplyResult.Success;
@@ -260,16 +278,38 @@ namespace UniGame.StaticEcs.Network
             for (var i = 0; i < staged.Entities.Length; i++)
             {
                 var source = staged.Entities[i];
-                if (source.Gid.TryUnpack<TWorld>(out var existing) && (!_replicas.TryGetValue(source.Gid, out var kindId) || kindId != source.Kind.TypeId || !((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Matches(existing))) return SnapshotApplyResult.EntityConflict;
+                if (!_replicas.TryGetValue(source.Gid, out var replica)) continue;
+                if (
+                    replica.KindId != source.Kind.TypeId
+                    || !replica.LocalGid.TryUnpack<TWorld>(out var existing)
+                    || !((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Matches(existing)
+                )
+                    return SnapshotApplyResult.EntityConflict;
             }
             var removedIds = new List<EntityGID>();
             foreach (var pair in _replicas) if (!incoming.Contains(pair.Key)) removedIds.Add(pair.Key);
-            for (var i = 0; i < removedIds.Count; i++) { var gid = removedIds[i]; if (gid.TryUnpack<TWorld>(out var removed)) removed.Destroy(); _replicas.Remove(gid); }
+            for (var i = 0; i < removedIds.Count; i++)
+            {
+                var sourceGid = removedIds[i];
+                var localGid = _replicas[sourceGid].LocalGid;
+                if (localGid.TryUnpack<TWorld>(out var removed)) removed.Destroy();
+                _replicas.Remove(sourceGid);
+            }
             for (var i = 0; i < staged.Entities.Length; i++)
             {
                 var source = staged.Entities[i];
-                if (!source.Gid.TryUnpack<TWorld>(out var entity)) entity = ((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Create(source.Gid);
-                else if (!((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Matches(entity)) return SnapshotApplyResult.EntityConflict;
+                World<TWorld>.Entity entity;
+                if (_replicas.TryGetValue(source.Gid, out var replica))
+                {
+                    if (!replica.LocalGid.TryUnpack<TWorld>(out entity))
+                        return SnapshotApplyResult.EntityConflict;
+                }
+                else
+                {
+                    entity = ((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Create();
+                }
+                if (!((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Matches(entity))
+                    return SnapshotApplyResult.EntityConflict;
                 var entries = _schema.RetainedEntries;
                 for (var j = 0; j < entries.Length; j++)
                 {
@@ -284,10 +324,30 @@ namespace UniGame.StaticEcs.Network
                     ((IRecordNetworkInvoker<TWorld>)record.Entry.Invoker).Apply(entity, record.Payload, record.Entry.Version, record.Disabled);
                 }
                 if (source.Disabled) entity.Disable(); else entity.Enable();
-                _replicas[source.Gid] = source.Kind.TypeId;
+                _replicas[source.Gid] = new NetworkReplicaEntry(entity.GID, source.Kind.TypeId);
             }
             History.Store(staged.ServerTick, staged.Snapshot);
             return SnapshotApplyResult.Success;
+        }
+
+        /// <summary>Destroys all client replicas and clears applied snapshot history.</summary>
+        public void ClearReplicas()
+        {
+            if (World<TWorld>.Status != WorldStatus.Initialized)
+            {
+                _replicas.Clear();
+                History.Clear();
+                return;
+            }
+
+            var replicas = new List<NetworkReplicaEntry>(_replicas.Values);
+            for (var i = 0; i < replicas.Count; i++)
+            {
+                if (replicas[i].LocalGid.TryUnpack<TWorld>(out var entity))
+                    entity.Destroy();
+            }
+            _replicas.Clear();
+            History.Clear();
         }
 
         private static int Compare(EntityGID left, EntityGID right)

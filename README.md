@@ -13,6 +13,9 @@ Transport-neutral Network v2 runtime and generated AOT-safe schemas for Static E
 - Validates commands by connection, peer, epoch, generated schema, sequence, tick window, and server policy before ordering them by `(TargetTick, PeerId, Sequence)`.
 - Classifies state, direction, epoch, and sequence failures without consuming rejected packet cursors, and reports accepted and policy-rejected command totals once per server tick.
 - Provides bounded history, isolated two-client in-memory transport, privacy-safe observer events, and a bounded pending NDJSON queue with explicit gap records.
+- Provides an explicit-clock deterministic `NetworkSimulator` with latency, jitter, loss,
+  duplication, reordering, bandwidth, bounded queues, disconnect/reconnect, and decision
+  record/replay.
 
 ## Usage
 
@@ -31,12 +34,13 @@ flowchart LR
     V --> O
     X["INetworkTransport"] --> C
     X --> V
+    SIM["NetworkSimulator: optional mock transport"] --> X
 ```
 
 Production Client and Dedicated Server both close the generic runtime on `World<Main>`
-in separate processes. Only Network Demo Client mode adds a hidden
-`World<DemoServerWorld>` so both roles can coexist in one process; isolated tests use
-dedicated world types. See the cross-package
+in separate processes. The game-layer Host and mock Client workflows add a hidden
+`World<EmbeddedServerWorld>` and use `NetworkSimulator` so both roles execute the same
+binary loop in one process; isolated tests use dedicated world types. See the cross-package
 [architecture and data-flow guide](../../../docs/guides/static-ecs-network.md) for the
 complete assembly map, packet flow, snapshot shape, clocks, and current limitations.
 
@@ -157,7 +161,33 @@ sequenceDiagram
     Client->>Client: apply replica changes
 ```
 
-Snapshot metadata includes tick, scope, schema fingerprint, canonical hash, bytes, entity count, and record count. Authority capture always requires an explicit scope selector; the client-only replicator constructor supports staging and apply but rejects capture. Client and server histories evict oldest ticks until both tick and byte budgets hold. Snapshot staging preflights canonical order, ledger ownership, entity kinds, bounds, and local occupancy before any ECS mutation; only ledger-owned replicas may be updated or despawned.
+Snapshot metadata includes tick, scope, schema fingerprint, canonical hash, bytes, entity count, and record count. Authority capture always requires an explicit scope selector; the client-only replicator constructor supports staging and apply but rejects capture. Client and server histories evict oldest ticks until both tick and byte budgets hold. Snapshot staging preflights canonical order, ledger ownership, entity kinds, bounds, and local occupancy before any ECS mutation. The replica ledger maps each authority GID from the wire to an independently allocated local client GID, so a server chunk identifier is never claimed inside the client world; only those mapped local replicas may be updated or despawned.
+
+### Simulate the transport
+
+`NetworkSimulator` is an optional `INetworkTransport` pair for development and tests. Its
+clock advances only when orchestration calls `Advance(milliseconds)`; polling a transport
+never changes time or random state.
+
+```csharp
+var config = NetworkSimulationPresets.Create(NetworkSimulationPreset.Local);
+config.Seed = 42;
+using var simulator = new NetworkSimulator(new ConnectionId(1), in config);
+
+var client = new NetworkClient<Main>(simulator.Client, clientSchema, scope, observer);
+server.AddConnection(simulator.Server, peerId, epoch, scope, observer);
+simulator.Advance(50);
+```
+
+Queues are bounded independently in both directions and drop newest on overflow. Bandwidth
+tokens accumulate so packets larger than one time slice do not starve. Disconnect clears
+queued packets and rejects sends until reconnect; reconnect increments a generation used by
+orchestration to create a fresh session. Decisions contain timing, direction, ordinal, size,
+and action but never payload bytes.
+
+Loss, duplication, and reordering operate below the current strict ordered session. Reliable
+retransmission/reassembly is outside this phase, so adverse settings can intentionally cause
+sequence rejection and resync. Use the `Immediate` preset for normal full-cycle gameplay.
 
 Generated typed invokers select every authority entity whose concrete `IEntityType` also
 implements `INetworkType`, then apply the active scope selector. Moving an entity out of
@@ -181,6 +211,8 @@ flowchart LR
 - Package version `2026.2.0` implements wire protocol `2` only.
 - Compression is fixed to `NetworkCompression.None`.
 - Runtime limits may be reduced by endpoint orchestration but must not exceed `ProtocolLimits`.
+- Simulator configuration affects future sends. Applying a seed restarts the deterministic
+  PRNG and should therefore happen at an explicit debug boundary.
 - Every entity kind marked with `INetworkType` is authority-replicated; scope selection runs after generated kind selection. `NetworkOwnerComponent` is replicated display metadata written by the authority. It never grants authority: server policy trusts only `NetworkCommandContext.PeerId` from the admitted session.
 - Endpoint names must be unique valid C# identifiers because they form `Generated{Name}Network`.
 - The generator targets `netstandard2.0`, references Microsoft.CodeAnalysis.CSharp 4.3.1 at build time, and ships only `Analyzers/StaticEcs.Network.Generator.dll` with the `RoslynAnalyzer` label.
@@ -193,3 +225,5 @@ flowchart LR
 
 - `CommandBatch` currently carries one command record per packet. The packet kind and limits reserve batching for later transport optimization.
 - Resync signaling is implemented. Targeted historical replay is not; with current full snapshots, the next accepted snapshot restores replica state.
+- The simulator does not implement reliable delivery, fragmentation, acknowledgement-driven
+  resend, or congestion control.
