@@ -37,10 +37,11 @@ flowchart LR
     SIM["NetworkSimulator: optional mock transport"] --> X
 ```
 
-Production Client and Dedicated Server both close the generic runtime on `World<Main>`
-in separate processes. The game-layer Host and mock Client workflows add a hidden
-`World<EmbeddedServerWorld>` and use `NetworkSimulator` so both roles execute the same
-binary loop in one process; isolated tests use dedicated world types. See the cross-package
+The package is world-neutral. The game layer closes the authority endpoint on `World<Main>`
+and the local replica endpoint on `World<ClientWorld>`. Host and mock Client use
+`NetworkSimulator` so both endpoints execute the same binary loop in one process;
+Dedicated Server creates only the Main authority endpoint, and isolated tests use dedicated
+world types. See the cross-package
 [architecture and data-flow guide](../../../docs/guides/static-ecs-network.md) for the
 complete assembly map, packet flow, snapshot shape, clocks, and current limitations.
 
@@ -81,21 +82,21 @@ checks that the hook consumed the exact payload.
 
 ### Declare endpoints and command policy
 
-Declare every endpoint once at assembly level. Production Client and Server declarations
-live in their respective role assemblies and both use `Main`.
+Declare every endpoint once at assembly level. The world choice belongs to composition, not
+to this package.
 
 ```csharp
-// Client assembly
-[assembly: NetworkEndpoint("Client", typeof(Main), NetworkRole.Client)]
+// Client composition assembly
+[assembly: NetworkEndpoint("Client", typeof(ClientWorld), NetworkRole.Client)]
 
-// Server assembly
-[assembly: NetworkEndpoint("Server", typeof(Main), NetworkRole.Server)]
+// Shared authority composition assembly
+[assembly: NetworkEndpoint("Authority", typeof(Main), NetworkRole.Server)]
 ```
 
 Bind authorization in the server assembly. Policies are endpoint behavior and do not change the Shared fingerprint.
 
 ```csharp
-public struct MovePolicy : INetworkCommandPolicy<Main, MoveCommand>
+public struct AuthorityMovePolicy : INetworkCommandPolicy<Main, MoveCommand>
 {
     public bool Authorize(in NetworkCommandContext context, in MoveCommand command) =>
         context.PeerId != 0;
@@ -125,6 +126,34 @@ server.AddConnection(serverTransport, assignedPeerId, epoch, scopeId, observer);
 
 `ConnectionId` is transport-owned. `PeerId`, epoch, and scope are trusted server inputs;
 the client learns them only from the admitted Ready packet.
+
+An optional `INetworkPeerAdmissionPolicy` can atomically prepare game-owned state before
+the session becomes established. The server calls it after fingerprint validation and
+before `Session.Admit`, coordinator registration, and `Ready`:
+
+```csharp
+public sealed class PlayerAdmissionPolicy : INetworkPeerAdmissionPolicy
+{
+    public bool TryAdmit(
+        in NetworkPeerData peer,
+        out NetworkAdmissionRejection reason)
+    {
+        // Reserve capacity and create server-owned gameplay state.
+        reason = NetworkAdmissionRejection.None;
+        return true;
+    }
+
+    public void Rollback(in NetworkPeerData peer)
+    {
+        // Idempotently release anything prepared before Ready.
+    }
+}
+```
+
+Pre-Ready failure invokes `Rollback` and never emits `Admitted`. A successful `Ready` send
+commits admission and then invokes `INetworkPeerObserver.Admitted`; established disconnect
+invokes `Disconnected` exactly once. Gameplay ownership remains server-controlled and is
+not part of the admission request payload.
 
 ### Run the command and snapshot pipeline
 

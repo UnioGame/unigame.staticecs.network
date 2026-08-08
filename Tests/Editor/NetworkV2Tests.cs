@@ -682,6 +682,126 @@ namespace UniGame.StaticEcs.Network.Tests
             StringAssert.Contains("\"kind\":\"gap\"", text);
         }
 
+        [Test]
+        public void AdmissionPolicy_CommitsBeforeLifecycleNotification()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                MemoryNetworkTransport.CreatePair(new ConnectionId(71),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    var order = new List<string>();
+                    var policy = new RecordingAdmissionPolicy(order, true);
+                    var observer = new OrderedPeerObserver(order);
+                    var server = new NetworkServer<AuthorityWorld>(
+                        Schema<AuthorityWorld>(true), static (_, _) => true,
+                        peerObserver: observer, admissionPolicy: policy);
+                    server.AddConnection(serverTransport, 3, 8, new ScopeId(1));
+                    var client = new NetworkClient<ClientAWorld>(
+                        clientTransport, Schema<ClientAWorld>(false), new ScopeId(1));
+
+                    client.BeginHandshake();
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+
+                    Assert.That(order, Is.EqualTo(new[] { "policy", "admitted" }));
+                    Assert.That(policy.RollbackCount, Is.Zero);
+                    Assert.That(client.Session.State, Is.EqualTo(NetworkSessionState.Established));
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void AdmissionPolicy_RejectionRollsBackWithoutLifecycleNotification()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                MemoryNetworkTransport.CreatePair(new ConnectionId(72),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    var order = new List<string>();
+                    var policy = new RecordingAdmissionPolicy(order, false);
+                    var observer = new OrderedPeerObserver(order);
+                    var server = new NetworkServer<AuthorityWorld>(
+                        Schema<AuthorityWorld>(true), static (_, _) => true,
+                        peerObserver: observer, admissionPolicy: policy);
+                    server.AddConnection(serverTransport, 4, 9, new ScopeId(1));
+                    var client = new NetworkClient<ClientAWorld>(
+                        clientTransport, Schema<ClientAWorld>(false), new ScopeId(1));
+
+                    client.BeginHandshake();
+                    server.Receive();
+                    client.Process();
+
+                    Assert.That(order, Is.EqualTo(new[] { "policy", "rollback" }));
+                    Assert.That(policy.RollbackCount, Is.EqualTo(1));
+                    Assert.That(client.Session.State, Is.EqualTo(NetworkSessionState.Closed));
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void AdmissionObserverFailure_DisconnectsCommittedPeerAndRunsCleanup()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                MemoryNetworkTransport.CreatePair(new ConnectionId(73),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    var order = new List<string>();
+                    var policy = new RecordingAdmissionPolicy(order, true);
+                    var observer = new ThrowingPeerObserver(order);
+                    var server = new NetworkServer<AuthorityWorld>(
+                        Schema<AuthorityWorld>(true), static (_, _) => true,
+                        peerObserver: observer, admissionPolicy: policy);
+                    server.AddConnection(serverTransport, 5, 10, new ScopeId(1));
+                    var client = new NetworkClient<ClientAWorld>(
+                        clientTransport, Schema<ClientAWorld>(false), new ScopeId(1));
+
+                    client.BeginHandshake();
+                    server.Receive();
+                    client.Process();
+
+                    Assert.That(order, Is.EqualTo(new[]
+                    {
+                        "policy",
+                        "admitted",
+                        "disconnected"
+                    }));
+                    Assert.That(client.Session.State, Is.EqualTo(NetworkSessionState.Closed));
+                    Assert.That(server.RemoveConnection(new ConnectionId(73)), Is.False);
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
         private static void CreateReplicationWorld<TWorld>(bool server) where TWorld : struct, IWorldType
         {
             World<TWorld>.Create(WorldConfig.Default());
@@ -796,6 +916,69 @@ namespace UniGame.StaticEcs.Network.Tests
             internal readonly List<NetworkSnapshotDiagnostics> Snapshots = new List<NetworkSnapshotDiagnostics>();
             public void ObserveSession(in NetworkSessionDiagnostics value) => Sessions.Add(value);
             public void ObserveSnapshot(in NetworkSnapshotDiagnostics value) => Snapshots.Add(value);
+        }
+
+        private sealed class RecordingAdmissionPolicy : INetworkPeerAdmissionPolicy
+        {
+            private readonly List<string> _order;
+            private readonly bool _accept;
+
+            internal RecordingAdmissionPolicy(List<string> order, bool accept)
+            {
+                _order = order;
+                _accept = accept;
+            }
+
+            internal int RollbackCount { get; private set; }
+
+            public bool TryAdmit(
+                in NetworkPeerData peer,
+                out NetworkAdmissionRejection reason)
+            {
+                _order.Add("policy");
+                reason = _accept
+                    ? NetworkAdmissionRejection.None
+                    : NetworkAdmissionRejection.Capacity;
+                return _accept;
+            }
+
+            public void Rollback(in NetworkPeerData peer)
+            {
+                RollbackCount++;
+                _order.Add("rollback");
+            }
+        }
+
+        private sealed class OrderedPeerObserver : INetworkPeerObserver
+        {
+            private readonly List<string> _order;
+
+            internal OrderedPeerObserver(List<string> order)
+            {
+                _order = order;
+            }
+
+            public void Admitted(in NetworkPeerData peer) => _order.Add("admitted");
+
+            public void Disconnected(in NetworkPeerData peer) => _order.Add("disconnected");
+        }
+
+        private sealed class ThrowingPeerObserver : INetworkPeerObserver
+        {
+            private readonly List<string> _order;
+
+            internal ThrowingPeerObserver(List<string> order)
+            {
+                _order = order;
+            }
+
+            public void Admitted(in NetworkPeerData peer)
+            {
+                _order.Add("admitted");
+                throw new InvalidOperationException("admission observer failure");
+            }
+
+            public void Disconnected(in NetworkPeerData peer) => _order.Add("disconnected");
         }
     }
 }

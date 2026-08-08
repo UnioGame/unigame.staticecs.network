@@ -188,12 +188,13 @@ namespace UniGame.StaticEcs.Network
         private readonly List<Peer> _peers = new List<Peer>();
         private readonly INetworkObserver _observer;
         private readonly INetworkPeerObserver _peerObserver;
+        private readonly INetworkPeerAdmissionPolicy _admissionPolicy;
 
         /// <summary>Gets the latest authoritative tick completed by this server.</summary>
         public uint ServerTick { get; private set; }
 
         /// <summary>Creates a multi-connection authoritative server pipeline.</summary>
-        public NetworkServer(NetworkSchema<TWorld> schema, NetworkScopeSelector<TWorld> scopeSelector, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024, INetworkObserver observer = null, INetworkPeerObserver peerObserver = null)
+        public NetworkServer(NetworkSchema<TWorld> schema, NetworkScopeSelector<TWorld> scopeSelector, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024, INetworkObserver observer = null, INetworkPeerObserver peerObserver = null, INetworkPeerAdmissionPolicy admissionPolicy = null)
         {
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
             if (scopeSelector == null) throw new ArgumentNullException(nameof(scopeSelector));
@@ -201,6 +202,7 @@ namespace UniGame.StaticEcs.Network
             _replicator = new NetworkReplicator<TWorld>(schema, scopeSelector);
             _observer = observer;
             _peerObserver = peerObserver;
+            _admissionPolicy = admissionPolicy;
         }
 
         /// <summary>Adds one transport-owned connection with server-assigned identity and scope.</summary>
@@ -293,7 +295,8 @@ namespace UniGame.StaticEcs.Network
                 var packet = peer.PendingPackets.Dequeue();
                 var started = Stopwatch.GetTimestamp();
                 if (!NetworkPacket.TryDecode(packet, out var header, out var payload) || header.Kind != PacketKind.Hello && header.SchemaFingerprint != _schema.Fingerprint || peer.Session.ValidatePacket(in header) != PacketValidationResult.Success) { peer.Session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, NetworkResultCategory.Protocol, NetworkPacketKind.None, ServerTick, 0, packet?.Length ?? 0, 0, 0, unchecked((int)(ServerTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), activeConnections: ActiveConnectionCount, activePeers: ActivePeerCount); continue; }
-                if (header.Kind == PacketKind.Hello) Admit(peer, header.SchemaFingerprint);
+                if (header.Kind == PacketKind.Hello && !Admit(peer, header.SchemaFingerprint))
+                    return true;
                 else if (header.Kind == PacketKind.CommandBatch) DecodeCommand(peer, header, payload, checked(ServerTick + 1));
                 else if (header.Kind == PacketKind.Ack) peer.AcknowledgedSnapshotTick = header.AcknowledgedSnapshotTick;
                 else if (header.Kind == PacketKind.ResyncRequest) peer.ResyncRequested = true;
@@ -309,19 +312,80 @@ namespace UniGame.StaticEcs.Network
             return false;
         }
 
-        private void Admit(Peer peer, SchemaFingerprint remoteFingerprint)
+        private bool Admit(Peer peer, SchemaFingerprint remoteFingerprint)
         {
-            if (peer.Session.Admit(remoteFingerprint, peer.PeerId, peer.Epoch, peer.Scope) != NetworkAdmissionResult.Accepted) { Send(peer, PacketKind.Disconnect, 0, PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty); return; }
-            _coordinator.Add(peer.Session);
-            if (!peer.AdmissionNotified)
+            if (remoteFingerprint != _schema.Fingerprint)
             {
-                peer.AdmissionNotified = true;
-                NotifyAdmitted(peer);
+                Send(peer, PacketKind.Disconnect, 0, PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
+                peer.Session.Close();
+                return false;
             }
-            var payload = new byte[12];
-            Hashing.Write32(payload, 0, peer.PeerId);
-            Hashing.Write64(payload, 4, peer.Scope.Value);
-            Send(peer, PacketKind.Ready, 0, PacketHeader.NoneTick, payload);
+
+            var data = peer.Data();
+            var policyInvoked = false;
+            try
+            {
+                if (_admissionPolicy != null)
+                {
+                    policyInvoked = true;
+                    if (!_admissionPolicy.TryAdmit(in data, out var rejection))
+                    {
+                        if (rejection == NetworkAdmissionRejection.None)
+                            rejection = NetworkAdmissionRejection.Rejected;
+                        TraceAdmissionFailure(peer, rejection);
+                        TryRollbackAdmission(in data);
+                        Send(peer, PacketKind.Disconnect, 0, PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
+                        peer.Session.Close();
+                        return false;
+                    }
+                }
+
+                if (peer.Session.Admit(remoteFingerprint, peer.PeerId, peer.Epoch, peer.Scope) !=
+                    NetworkAdmissionResult.Accepted)
+                    throw new InvalidOperationException("Session rejected a validated peer admission.");
+
+                _coordinator.Add(peer.Session);
+                var payload = new byte[12];
+                Hashing.Write32(payload, 0, peer.PeerId);
+                Hashing.Write64(payload, 4, peer.Scope.Value);
+                if (!Send(peer, PacketKind.Ready, 0, PacketHeader.NoneTick, payload))
+                    throw new InvalidOperationException("Ready packet could not be sent.");
+            }
+            catch
+            {
+                TraceAdmissionFailure(peer, NetworkAdmissionRejection.PolicyError);
+                _coordinator.Remove(peer.Transport.Connection);
+                peer.Session.Close();
+                if (policyInvoked)
+                    TryRollbackAdmission(in data);
+                Send(peer, PacketKind.Disconnect, 0, PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
+                return false;
+            }
+
+            peer.AdmissionNotified = true;
+            try
+            {
+                NotifyAdmitted(peer);
+                return true;
+            }
+            catch
+            {
+                Send(peer, PacketKind.Disconnect, 0, PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
+                CleanupPeer(peer);
+                return false;
+            }
+        }
+
+        private void TryRollbackAdmission(in NetworkPeerData peer)
+        {
+            try
+            {
+                _admissionPolicy?.Rollback(in peer);
+            }
+            catch
+            {
+                // Admission is already rejected; rollback remains best effort and idempotent.
+            }
         }
 
         private void DecodeCommand(Peer peer, PacketHeader header, ReadOnlyMemory<byte> payload, uint serverTick)
@@ -395,9 +459,15 @@ namespace UniGame.StaticEcs.Network
 
         private void CleanupPeer(Peer peer)
         {
-            ClosePeer(peer);
-            peer.PendingPackets.Clear();
-            _coordinator.Remove(peer.Transport.Connection);
+            try
+            {
+                ClosePeer(peer);
+            }
+            finally
+            {
+                peer.PendingPackets.Clear();
+                _coordinator.Remove(peer.Transport.Connection);
+            }
         }
 
         private void NotifyAdmitted(Peer peer)
@@ -411,7 +481,24 @@ namespace UniGame.StaticEcs.Network
         {
             if (_peerObserver == null) return;
             var data = peer.Data();
-            _peerObserver.Disconnected(in data);
+            try
+            {
+                _peerObserver.Disconnected(in data);
+            }
+            catch
+            {
+                // Transport/session cleanup must not be interrupted by game lifecycle hooks.
+            }
+        }
+
+        private void TraceAdmissionFailure(Peer peer, NetworkAdmissionRejection rejection)
+        {
+            peer.Session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point,
+                NetworkResultCategory.Policy, NetworkPacketKind.Hello,
+                ServerTick, 0, 0, _coordinator.HistoryCount(peer.Scope),
+                _coordinator.HistoryByteCount(peer.Scope), 0, 0,
+                activeConnections: ActiveConnectionCount, activePeers: ActivePeerCount,
+                rejectedCommands: rejection == NetworkAdmissionRejection.None ? 0 : 1);
         }
 
         private static NetworkPacketKind DiagnosticKind(PacketKind kind) => (NetworkPacketKind)(byte)kind;
