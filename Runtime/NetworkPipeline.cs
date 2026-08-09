@@ -62,7 +62,9 @@ namespace UniGame.StaticEcs.Network
                 if (!_transport.TryReceive(out var packet)) break;
                 _session.Trace(NetworkPhase.Receive, NetworkTraceKind.Point, NetworkResultCategory.Success, NetworkPacketKind.None, AcknowledgedSnapshotTick, 0, packet?.Length ?? 0, History.Count, History.Bytes, 0, ElapsedNanoseconds(receiveStarted));
                 var started = Stopwatch.GetTimestamp();
-                if (!NetworkPacket.TryDecode(packet, out var header, out var payload) || header.SchemaFingerprint != _schema.Fingerprint || _session.ValidatePacket(in header) != PacketValidationResult.Success) { _session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, NetworkResultCategory.Protocol, NetworkPacketKind.None, AcknowledgedSnapshotTick, 0, packet?.Length ?? 0, History.Count, History.Bytes, 0, ElapsedNanoseconds(started)); RequestResync(AcknowledgedSnapshotTick); continue; }
+                if (!NetworkPacket.TryDecode(packet, out var header, out var payload) ||
+                    header.Kind != PacketKind.Disconnect && header.SchemaFingerprint != _schema.Fingerprint ||
+                    _session.ValidatePacket(in header) != PacketValidationResult.Success) { _session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, NetworkResultCategory.Protocol, NetworkPacketKind.None, AcknowledgedSnapshotTick, 0, packet?.Length ?? 0, History.Count, History.Bytes, 0, ElapsedNanoseconds(started)); RequestResync(AcknowledgedSnapshotTick); continue; }
                 if (header.ServerTick != PacketHeader.NoneTick) ServerTick = Math.Max(ServerTick, header.ServerTick);
                 StagedNetworkSnapshot staged = null;
                 var entities = 0;

@@ -247,7 +247,7 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
-        public void SchemaMismatchHandshakeRejectsAndRequestsResync()
+        public void SchemaMismatchHandshakeClosesBothEndpoints()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
             try
@@ -263,8 +263,9 @@ namespace UniGame.StaticEcs.Network.Tests
                     var serverSession = server.AddConnection(serverTransport, 9, 4, new ScopeId(1));
                     var client = new NetworkClient<MismatchWorld>(clientTransport, mismatchSchema, new ScopeId(1));
                     client.BeginHandshake(); server.Receive(); server.Tick(_ => { }); client.Process();
-                    Assert.That(serverSession.State, Is.EqualTo(NetworkSessionState.Rejected));
-                    Assert.That(client.ResyncRequested, Is.True);
+                    Assert.That(serverSession.State, Is.EqualTo(NetworkSessionState.Closed));
+                    Assert.That(client.Session.State, Is.EqualTo(NetworkSessionState.Closed));
+                    Assert.That(client.ResyncRequested, Is.False);
                 }
             }
             finally { World<AuthorityWorld>.Destroy(); }

@@ -200,8 +200,13 @@ namespace UniGame.StaticEcs.Network
         {
             if (State == NetworkSessionState.Handshaking)
             {
-                if (Role == NetworkRole.Server && header.Kind != PacketKind.Hello || Role == NetworkRole.Client && header.Kind != PacketKind.Ready) return PacketValidationResult.WrongRole;
-                if (header.SessionEpoch == 0 != (Role == NetworkRole.Server)) return PacketValidationResult.WrongEpoch;
+                var disconnect = Role == NetworkRole.Client && header.Kind == PacketKind.Disconnect;
+                if (!disconnect &&
+                    (Role == NetworkRole.Server && header.Kind != PacketKind.Hello ||
+                     Role == NetworkRole.Client && header.Kind != PacketKind.Ready))
+                    return PacketValidationResult.WrongRole;
+                if (!disconnect && header.SessionEpoch == 0 != (Role == NetworkRole.Server))
+                    return PacketValidationResult.WrongEpoch;
             }
             else
             {
