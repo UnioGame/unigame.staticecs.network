@@ -47,6 +47,21 @@ namespace UniGame.StaticEcs.Network
     /// <summary>Configures future packet decisions made by <see cref="NetworkSimulator"/>.</summary>
     public struct NetworkSimulationConfig
     {
+        /// <summary>Authoritative gameplay ticks per second.</summary>
+        public int TicksPerSecond;
+
+        /// <summary>Number of client prediction ticks retained for reconciliation.</summary>
+        public int PredictionHistoryTicks;
+
+        /// <summary>Number of authoritative ticks presentation renders behind.</summary>
+        public int InterpolationDelayTicks;
+
+        /// <summary>Number of recent input frames repeated in one unreliable batch.</summary>
+        public int InputRedundancy;
+
+        /// <summary>Maximum prediction replay work per rendered frame.</summary>
+        public float MaxResimulationMilliseconds;
+
         /// <summary>Deterministic random seed.</summary>
         public uint Seed;
 
@@ -219,6 +234,11 @@ namespace UniGame.StaticEcs.Network
         {
             var config = new NetworkSimulationConfig
             {
+                TicksPerSecond = 20,
+                PredictionHistoryTicks = 64,
+                InterpolationDelayTicks = 2,
+                InputRedundancy = 3,
+                MaxResimulationMilliseconds = 2f,
                 Seed = 1,
                 MaxQueuedPackets = 1024,
                 MaxQueuedBytes = 16 * 1024 * 1024,

@@ -45,6 +45,20 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void SimulationConfigProducesStableDistinctFingerprints()
+        {
+            var config = NetworkSimulationPresets.Create(
+                NetworkSimulationPreset.Immediate);
+            var first = new NetworkSimulationClockResource(in config);
+            var second = new NetworkSimulationClockResource(20, 64, 2, 3, 2f);
+            var changed = new NetworkSimulationClockResource(30, 64, 2, 3, 2f);
+
+            Assert.That(first.Config.TicksPerSecond, Is.EqualTo(20));
+            Assert.That(first.Fingerprint, Is.EqualTo(second.Fingerprint));
+            Assert.That(changed.Fingerprint, Is.Not.EqualTo(first.Fingerprint));
+        }
+
+        [Test]
         public void SchemaFingerprintIsOrderIndependentAndRejectsCollisions()
         {
             var first = NetworkCompilerSupport.Create<TestWorld>();

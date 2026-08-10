@@ -13,40 +13,34 @@ namespace UniGame.StaticEcs.Network
             int interpolationDelayTicks = 2,
             int inputRedundancy = 3,
             float maxResimulationMilliseconds = 2f)
+            : this(new NetworkSimulationConfig
+            {
+                TicksPerSecond = ticksPerSecond,
+                PredictionHistoryTicks = predictionHistoryTicks,
+                InterpolationDelayTicks = interpolationDelayTicks,
+                InputRedundancy = inputRedundancy,
+                MaxResimulationMilliseconds = maxResimulationMilliseconds
+            })
         {
-            if (ticksPerSecond <= 0)
-            {
-                throw new ArgumentOutOfRangeException(nameof(ticksPerSecond));
-            }
+        }
 
-            if (predictionHistoryTicks <= 0)
-            {
-                throw new ArgumentOutOfRangeException(nameof(predictionHistoryTicks));
-            }
-
-            if (interpolationDelayTicks < 0)
-            {
-                throw new ArgumentOutOfRangeException(nameof(interpolationDelayTicks));
-            }
-
-            if (inputRedundancy <= 0)
-            {
-                throw new ArgumentOutOfRangeException(nameof(inputRedundancy));
-            }
-
-            if (maxResimulationMilliseconds <= 0f)
-            {
-                throw new ArgumentOutOfRangeException(nameof(maxResimulationMilliseconds));
-            }
-
-            TicksPerSecond = ticksPerSecond;
-            TickSeconds = 1f / ticksPerSecond;
-            PredictionHistoryTicks = predictionHistoryTicks;
-            InterpolationDelayTicks = interpolationDelayTicks;
-            InputRedundancy = inputRedundancy;
-            MaxResimulationMilliseconds = maxResimulationMilliseconds;
+        /// <summary>Creates the clock resource from one shared simulation configuration.</summary>
+        public NetworkSimulationClockResource(in NetworkSimulationConfig config)
+        {
+            if (config.TicksPerSecond <= 0)
+                throw new ArgumentException("Simulation config is not initialized.", nameof(config));
+            Config = config;
+            TicksPerSecond = config.TicksPerSecond;
+            TickSeconds = 1f / config.TicksPerSecond;
+            PredictionHistoryTicks = config.PredictionHistoryTicks;
+            InterpolationDelayTicks = config.InterpolationDelayTicks;
+            InputRedundancy = config.InputRedundancy;
+            MaxResimulationMilliseconds = config.MaxResimulationMilliseconds;
             Fingerprint = CalculateFingerprint();
         }
+
+        /// <summary>Gets the complete shared simulation configuration.</summary>
+        public NetworkSimulationConfig Config { get; }
 
         /// <summary>Gets the fixed simulation frequency.</summary>
         public int TicksPerSecond { get; }
