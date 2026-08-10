@@ -10,7 +10,7 @@ namespace UniGame.StaticEcs.Network.Tests
     public sealed class NetworkV2Tests
     {
         [Test]
-        public void TypeIdsAndPacketHeaderAreCanonicalV2()
+        public void TypeIdsAndPacketHeaderAreCanonicalV3()
         {
             var id = NetworkCompilerSupport.TypeId("SourceGenerator.Tests", "Demo.Position");
             Assert.That(id.Value, Is.EqualTo(4089044646u));
@@ -18,18 +18,24 @@ namespace UniGame.StaticEcs.Network.Tests
             var header = new PacketHeader
             {
                 Kind = PacketKind.FullSnapshot,
+                Flags = PacketFlags.ReliableOrdered,
                 Compression = NetworkCompression.None,
                 ServerTick = 42,
                 TargetTick = PacketHeader.NoneTick,
                 PayloadLength = 3,
                 SchemaFingerprint = new SchemaFingerprint(1, 2),
+                SimulationFingerprint = 3,
+                ContentFingerprint = 4,
                 PayloadHash = 7
             };
             var bytes = new byte[PacketHeader.Size];
             Assert.That(header.TryWrite(bytes), Is.True);
             Assert.That(PacketHeader.TryRead(bytes, out var decoded), Is.True);
-            Assert.That(PacketHeader.Version, Is.EqualTo(2));
+            Assert.That(PacketHeader.Version, Is.EqualTo(3));
             Assert.That(decoded.SchemaFingerprint, Is.EqualTo(header.SchemaFingerprint));
+            Assert.That(decoded.SimulationFingerprint,
+                Is.EqualTo(header.SimulationFingerprint));
+            Assert.That(decoded.ContentFingerprint, Is.EqualTo(header.ContentFingerprint));
             bytes[10] = 1;
             Assert.That(PacketHeader.TryRead(bytes, out _), Is.False);
             header.Kind = PacketKind.Hello;
@@ -63,6 +69,113 @@ namespace UniGame.StaticEcs.Network.Tests
             Assert.That(mock.ServerB.TryReceive(out var second), Is.True);
             CollectionAssert.AreEqual(new byte[] { 1 }, first);
             CollectionAssert.AreEqual(new byte[] { 2 }, second);
+        }
+
+        [Test]
+        public void RedundantInputsAreDeduplicatedAndAcknowledgedOnAdverseLink()
+        {
+            World<InputWorld>.Create(WorldConfig.Default());
+            var types = World<InputWorld>.Types();
+            types.Event<TestInput>();
+            types.Event<NetworkCommandAccepted<TestInput>>();
+            types.Event<NetworkCommandRejected<TestInput>>();
+            World<InputWorld>.Initialize();
+            var receiver = World<InputWorld>
+                .RegisterEventReceiver<NetworkCommandAccepted<TestInput>>();
+            try
+            {
+                var clientFactory = NetworkCompilerSupport.Create<InputWorld>();
+                clientFactory.Command<TestInput>(new NetworkTypeId(91));
+                var serverFactory = NetworkCompilerSupport.Create<InputWorld>();
+                serverFactory.Command<TestInput, AllowInputPolicy>(
+                    new NetworkTypeId(91));
+                var immediate = NetworkSimulationPresets.Create(
+                    NetworkSimulationPreset.Immediate);
+                using var simulator = new NetworkSimulator(new ConnectionId(90),
+                    in immediate);
+                var server = new NetworkServer<InputWorld>(serverFactory.Freeze(),
+                    static (_, _) => false);
+                server.AddConnection(simulator.Server, 7, 11, new ScopeId(1));
+                var client = new NetworkClient<InputWorld>(simulator.Client,
+                    clientFactory.Freeze(), new ScopeId(1), inputRedundancy: 3);
+
+                Assert.That(client.BeginHandshake(), Is.True);
+                simulator.Advance(0);
+                server.Receive();
+                server.Tick(_ => { });
+                simulator.Advance(0);
+                client.Process();
+                Assert.That(client.Session.State,
+                    Is.EqualTo(NetworkSessionState.Established));
+
+                var adverse = NetworkSimulationPresets.Create(
+                    NetworkSimulationPreset.Unstable);
+                adverse.Seed = 771;
+                adverse.LossProbability = 0.1f;
+                adverse.DuplicateProbability = 0.1f;
+                adverse.ReorderProbability = 0.1f;
+                simulator.ApplyConfig(in adverse);
+
+                var sequences = new HashSet<uint>();
+                uint latestTick = 0;
+                uint latestSequence = 0;
+                for (var index = 0; index < 106; index++)
+                {
+                    var input = new TestInput { Value = index < 100 ? index + 1 : 0 };
+                    Assert.That(client.SendInput(in input, server.ServerTick + 4),
+                        Is.EqualTo(NetworkCommandResult.Queued));
+                    simulator.Advance(50);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    CollectAcceptedInputs(receiver, sequences, ref latestTick,
+                        ref latestSequence);
+                    World<InputWorld>.Tick();
+                    simulator.Advance(50);
+                    client.Process();
+                }
+                for (var index = 0; index < 8; index++)
+                {
+                    simulator.Advance(50);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    CollectAcceptedInputs(receiver, sequences, ref latestTick,
+                        ref latestSequence);
+                    World<InputWorld>.Tick();
+                    simulator.Advance(50);
+                    client.Process();
+                }
+
+                Assert.That(sequences.Count, Is.GreaterThanOrEqualTo(95));
+                Assert.That(client.LastProcessedInputTick, Is.EqualTo(latestTick));
+                Assert.That(client.LastProcessedInputSequence,
+                    Is.EqualTo(latestSequence));
+                var stats = simulator.CaptureStats();
+                Assert.That(stats.ClientToServer.LostPackets, Is.GreaterThan(0));
+                Assert.That(stats.ClientToServer.DuplicatePackets, Is.GreaterThan(0));
+                Assert.That(stats.ClientToServer.ReorderedPackets, Is.GreaterThan(0));
+            }
+            finally
+            {
+                World<InputWorld>.DeleteEventReceiver(ref receiver);
+                World<InputWorld>.Destroy();
+            }
+        }
+
+        private static void CollectAcceptedInputs(
+            EventReceiver<InputWorld, NetworkCommandAccepted<TestInput>> receiver,
+            HashSet<uint> sequences,
+            ref uint latestTick,
+            ref uint latestSequence)
+        {
+            foreach (World<InputWorld>.Event<NetworkCommandAccepted<TestInput>> item
+                     in receiver)
+            {
+                Assert.That(sequences.Add(item.Value.Context.Sequence), Is.True,
+                    "Redundant or duplicated input was applied twice.");
+                latestTick = Math.Max(latestTick, item.Value.Context.TargetTick);
+                latestSequence = Math.Max(latestSequence,
+                    item.Value.Context.Sequence);
+            }
         }
 
         [Test]
@@ -391,6 +504,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     var nonSnapshot = new PacketHeader
                     {
                         Kind = PacketKind.ResyncRequest,
+                        Flags = PacketFlags.ReliableOrdered,
                         SessionEpoch = 9,
                         PacketSequence = 3,
                         ServerTick = 7,
@@ -829,6 +943,7 @@ namespace UniGame.StaticEcs.Network.Tests
         private static PacketHeader Packet(PacketKind kind, uint epoch, uint sequence) => new PacketHeader
         {
             Kind = kind,
+            Flags = PacketFlags.ReliableOrdered,
             SessionEpoch = epoch,
             PacketSequence = sequence
         };
@@ -868,6 +983,19 @@ namespace UniGame.StaticEcs.Network.Tests
         public struct MismatchWorld : IWorldType { }
         public struct RejectWorld : IWorldType { }
         public struct TestEntity : IEntityType, INetworkType { public byte Id() => 1; }
+        private struct InputWorld : IWorldType { }
+        internal struct TestInput : IEvent, INetworkInput
+        {
+            public int Value;
+            public void Write(ref BinaryPackWriter writer) => writer.WriteInt(Value);
+            public void Read(ref BinaryPackReader reader, byte version) =>
+                Value = reader.ReadInt();
+        }
+        private struct AllowInputPolicy : INetworkCommandPolicy<InputWorld, TestInput>
+        {
+            public bool Authorize(in NetworkCommandContext context,
+                in TestInput command) => true;
+        }
         public struct SecondEntity : IEntityType, INetworkType { public byte Id() => 2; }
         public struct TestTag : ITag, INetworkType { }
         public struct TestComponent : IComponent, IDisableable, INetworkType

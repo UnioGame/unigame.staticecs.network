@@ -204,11 +204,15 @@ namespace UniGame.StaticEcs.Network
             if (_replaying)
                 return Replay(state, packet, ordinal);
 
-            var lost = NextUnit() < _config.LossProbability;
-            var duplicated = NextUnit() < _config.DuplicateProbability;
-            var reordered = NextUnit() < _config.ReorderProbability;
+            bool reliableOrdered = PacketHeader.TryRead(packet, out var header) &&
+                                   header.Flags == PacketFlags.ReliableOrdered;
+            var lost = !reliableOrdered && NextUnit() < _config.LossProbability;
+            var duplicated = !reliableOrdered &&
+                             NextUnit() < _config.DuplicateProbability;
+            var reordered = !reliableOrdered &&
+                            NextUnit() < _config.ReorderProbability;
             var jitterUnit = NextUnit();
-            var due = DueTime(jitterUnit);
+            var due = DueTime(reliableOrdered ? 0.5f : jitterUnit);
             if (lost)
             {
                 state.LostPackets++;

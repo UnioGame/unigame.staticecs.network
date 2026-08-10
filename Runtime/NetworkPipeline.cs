@@ -13,13 +13,36 @@ namespace UniGame.StaticEcs.Network
         private readonly NetworkSchema<TWorld> _schema;
         private readonly NetworkReplicator<TWorld> _replicator;
         private readonly NetworkSession<TWorld> _session;
+        private readonly List<NetworkCommandEnvelope> _recentInputs = new List<NetworkCommandEnvelope>();
+        private readonly int _inputRedundancy;
+        private readonly int _ticksPerSecond;
+        private readonly int _predictionLeadTicks;
+        private readonly ulong _simulationFingerprint;
+        private readonly ulong _contentFingerprint;
         private uint _packetSequence = 1;
+        private uint _inputPacketSequence = 1;
+        private long _lastServerTickTimestamp;
+        private long _lastPingTimestamp;
+        private double _roundTripSeconds;
 
         /// <summary>Creates an isolated client pipeline.</summary>
-        public NetworkClient(INetworkTransport transport, NetworkSchema<TWorld> schema, ScopeId scope = default, INetworkObserver observer = null)
+        public NetworkClient(INetworkTransport transport, NetworkSchema<TWorld> schema,
+            ScopeId scope = default, INetworkObserver observer = null,
+            int ticksPerSecond = 20, int predictionLeadTicks = 1,
+            int inputRedundancy = 3, ulong simulationFingerprint = 0,
+            ulong contentFingerprint = 0)
         {
             _transport = transport ?? throw new ArgumentNullException(nameof(transport));
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
+            if (ticksPerSecond <= 0) throw new ArgumentOutOfRangeException(nameof(ticksPerSecond));
+            if (predictionLeadTicks < 0) throw new ArgumentOutOfRangeException(nameof(predictionLeadTicks));
+            if (inputRedundancy <= 0 || inputRedundancy > ProtocolLimits.MaxCommandsPerBatch)
+                throw new ArgumentOutOfRangeException(nameof(inputRedundancy));
+            _ticksPerSecond = ticksPerSecond;
+            _predictionLeadTicks = predictionLeadTicks;
+            _inputRedundancy = inputRedundancy;
+            _simulationFingerprint = simulationFingerprint;
+            _contentFingerprint = contentFingerprint;
             _replicator = new NetworkReplicator<TWorld>(schema, scope);
             _session = new NetworkSession<TWorld>(transport.Connection, NetworkRole.Client, schema, observer);
             _session.ReportSession(0, 0, 0, _packetSequence);
@@ -33,10 +56,31 @@ namespace UniGame.StaticEcs.Network
         public uint AcknowledgedSnapshotTick { get; private set; }
         /// <summary>Gets the latest server-acknowledged command sequence.</summary>
         public uint AcknowledgedCommandSequence { get; private set; }
+        /// <summary>Gets the latest input tick confirmed as processed into an applied snapshot.</summary>
+        public uint LastProcessedInputTick { get; private set; }
+        /// <summary>Gets the latest input sequence confirmed as processed into an applied snapshot.</summary>
+        public uint LastProcessedInputSequence { get; private set; }
         /// <summary>Gets the latest authoritative server tick from a validated packet.</summary>
         public uint ServerTick { get; private set; }
+        /// <summary>Gets the estimated current authoritative tick including prediction lead.</summary>
+        public uint EstimatedServerTick
+        {
+            get
+            {
+                if (ServerTick == 0) return 1;
+                double elapsed = _lastServerTickTimestamp == 0
+                    ? 0d
+                    : (Stopwatch.GetTimestamp() - _lastServerTickTimestamp) /
+                      (double)Stopwatch.Frequency;
+                double ahead = (elapsed + _roundTripSeconds * 0.5d) * _ticksPerSecond +
+                               _predictionLeadTicks;
+                return checked(ServerTick + (uint)Math.Max(1d, Math.Ceiling(ahead)));
+            }
+        }
         /// <summary>Gets whether malformed or rejected input requested resynchronization.</summary>
         public bool ResyncRequested { get; private set; }
+        /// <summary>Gets whether snapshot hooks left the replica world requiring full recreation.</summary>
+        public bool ReplicaResetRequired { get; private set; }
 
         /// <summary>Closes the session and removes all replica-owned entities from the client world.</summary>
         public void Disconnect()
@@ -45,12 +89,19 @@ namespace UniGame.StaticEcs.Network
             _replicator.ClearReplicas();
             AcknowledgedSnapshotTick = 0;
             AcknowledgedCommandSequence = 0;
+            LastProcessedInputTick = 0;
+            LastProcessedInputSequence = 0;
             ServerTick = 0;
+            _lastServerTickTimestamp = 0;
+            _lastPingTimestamp = 0;
+            _roundTripSeconds = 0d;
+            _recentInputs.Clear();
             ResyncRequested = false;
+            ReplicaResetRequired = false;
             _session.ReportSession(0, 0, 0, _packetSequence);
         }
 
-        /// <summary>Sends the protocol-two Hello packet.</summary>
+        /// <summary>Sends the protocol-three Hello packet.</summary>
         public bool BeginHandshake() => Send(PacketKind.Hello, 0, PacketHeader.NoneTick, PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
 
         /// <summary>Processes received packets using authoritative ticks carried by the wire.</summary>
@@ -63,9 +114,16 @@ namespace UniGame.StaticEcs.Network
                 _session.Trace(NetworkPhase.Receive, NetworkTraceKind.Point, NetworkResultCategory.Success, NetworkPacketKind.None, AcknowledgedSnapshotTick, 0, packet?.Length ?? 0, History.Count, History.Bytes, 0, ElapsedNanoseconds(receiveStarted));
                 var started = Stopwatch.GetTimestamp();
                 if (!NetworkPacket.TryDecode(packet, out var header, out var payload) ||
-                    header.Kind != PacketKind.Disconnect && header.SchemaFingerprint != _schema.Fingerprint ||
+                    header.Kind != PacketKind.Disconnect &&
+                    (header.SchemaFingerprint != _schema.Fingerprint ||
+                     header.SimulationFingerprint != _simulationFingerprint ||
+                     header.ContentFingerprint != _contentFingerprint) ||
                     _session.ValidatePacket(in header) != PacketValidationResult.Success) { _session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, NetworkResultCategory.Protocol, NetworkPacketKind.None, AcknowledgedSnapshotTick, 0, packet?.Length ?? 0, History.Count, History.Bytes, 0, ElapsedNanoseconds(started)); RequestResync(AcknowledgedSnapshotTick); continue; }
-                if (header.ServerTick != PacketHeader.NoneTick) ServerTick = Math.Max(ServerTick, header.ServerTick);
+                if (header.ServerTick != PacketHeader.NoneTick && header.ServerTick >= ServerTick)
+                {
+                    ServerTick = header.ServerTick;
+                    _lastServerTickTimestamp = Stopwatch.GetTimestamp();
+                }
                 StagedNetworkSnapshot staged = null;
                 var entities = 0;
                 var records = 0;
@@ -73,6 +131,7 @@ namespace UniGame.StaticEcs.Network
                 var decodeResult = NetworkResultCategory.Success;
                 if (header.Kind == PacketKind.Ready) DecodeReady(header, payload);
                 else if (header.Kind == PacketKind.FullSnapshot) decodeResult = DiagnosticResult(TryStageSnapshot(header, payload, out staged, out entities, out records, out decodedBytes));
+                else if (header.Kind == PacketKind.Pong) DecodePong(payload);
                 else if (header.Kind == PacketKind.ResyncRequest) ResyncRequested = true;
                 var disconnected = header.Kind == PacketKind.Disconnect;
                 AcknowledgedCommandSequence = Math.Max(AcknowledgedCommandSequence, header.AcknowledgedCommandSequence);
@@ -85,7 +144,7 @@ namespace UniGame.StaticEcs.Network
                 if (header.Kind == PacketKind.FullSnapshot)
                 {
                     if (staged == null) RequestResync(header.ServerTick);
-                    else ApplySnapshot(staged, entities, records);
+                    else ApplySnapshot(staged, header, entities, records);
                 }
                 _session.ReportSession(ServerTick, AcknowledgedSnapshotTick, AcknowledgedCommandSequence, _packetSequence);
             }
@@ -103,6 +162,88 @@ namespace UniGame.StaticEcs.Network
             envelope.ExactPayload.CopyTo(payload, 9);
             if (!Send(PacketKind.CommandBatch, _session.Epoch, ServerTick, PacketHeader.NoneTick, targetTick, payload)) return NetworkCommandResult.Malformed;
             return result;
+        }
+
+        /// <summary>Serializes one continuous input and repeats the newest bounded input window.</summary>
+        public NetworkCommandResult SendInput<TInput>(in TInput input, uint targetTick)
+            where TInput : struct, IEvent, INetworkInput
+        {
+            return SendInput(in input, targetTick, out _);
+        }
+
+        /// <summary>Serializes input and returns the assigned monotonic input sequence.</summary>
+        public NetworkCommandResult SendInput<TInput>(in TInput input, uint targetTick,
+            out uint sequence)
+            where TInput : struct, IEvent, INetworkInput
+        {
+            sequence = 0;
+            var result = _session.CreateInput(in input, targetTick, out var envelope);
+            if (result != NetworkCommandResult.Queued) return result;
+            sequence = envelope.Sequence;
+            _recentInputs.Add(envelope);
+            while (_recentInputs.Count > _inputRedundancy)
+                _recentInputs.RemoveAt(0);
+            return SendInputBatch() ? result : NetworkCommandResult.Malformed;
+        }
+
+        /// <summary>Requests a clean full snapshot after local history or replica state became unusable.</summary>
+        public void RequestFullResync()
+        {
+            RequestResync(ServerTick);
+        }
+
+        /// <summary>Sends a periodic clock synchronization sample for server-tick estimation.</summary>
+        public bool SynchronizeClock()
+        {
+            if (_session.State != NetworkSessionState.Established) return false;
+            long now = Stopwatch.GetTimestamp();
+            if (_lastPingTimestamp != 0 &&
+                now - _lastPingTimestamp < Stopwatch.Frequency)
+                return false;
+            _lastPingTimestamp = now;
+            var payload = new byte[8];
+            Hashing.Write64(payload, 0, unchecked((ulong)now));
+            return Send(PacketKind.Ping, _session.Epoch, ServerTick,
+                PacketHeader.NoneTick, PacketHeader.NoneTick, payload);
+        }
+
+        private bool SendInputBatch()
+        {
+            int length = 1;
+            for (var i = 0; i < _recentInputs.Count; i++)
+                length = checked(length + 17 + _recentInputs[i].ExactPayload.Length);
+            if (length > ProtocolLimits.MaxWirePayloadBytes) return false;
+            var payload = new byte[length];
+            payload[0] = checked((byte)_recentInputs.Count);
+            int offset = 1;
+            for (var i = 0; i < _recentInputs.Count; i++)
+            {
+                var frame = _recentInputs[i];
+                Hashing.Write32(payload, offset, frame.Sequence);
+                Hashing.Write32(payload, offset + 4, frame.TargetTick);
+                Hashing.Write32(payload, offset + 8, frame.TypeId.Value);
+                payload[offset + 12] = frame.Version;
+                Hashing.Write32(payload, offset + 13, checked((uint)frame.ExactPayload.Length));
+                frame.ExactPayload.CopyTo(payload, offset + 17);
+                offset += 17 + frame.ExactPayload.Length;
+            }
+            var header = Header(PacketKind.InputBatch, _inputPacketSequence++,
+                ServerTick, PacketHeader.NoneTick);
+            header.Flags = PacketFlags.UnreliableSequenced;
+            return NetworkPacket.TryEncode(header, payload, out var packet) &&
+                   _transport.TrySend(packet);
+        }
+
+        private void DecodePong(ReadOnlyMemory<byte> payload)
+        {
+            if (payload.Length != 8) return;
+            long sent = unchecked((long)Hashing.Read64(payload.Span, 0));
+            long elapsed = Stopwatch.GetTimestamp() - sent;
+            if (elapsed < 0) return;
+            double sample = elapsed / (double)Stopwatch.Frequency;
+            _roundTripSeconds = _roundTripSeconds <= 0d
+                ? sample
+                : _roundTripSeconds * 0.8d + sample * 0.2d;
         }
 
         private void DecodeReady(PacketHeader header, ReadOnlyMemory<byte> payload)
@@ -127,13 +268,28 @@ namespace UniGame.StaticEcs.Network
             return _replicator.Stage(snapshot, out staged);
         }
 
-        private void ApplySnapshot(StagedNetworkSnapshot staged, int entities, int records)
+        private void ApplySnapshot(StagedNetworkSnapshot staged, PacketHeader header,
+            int entities, int records)
         {
             var started = Stopwatch.GetTimestamp();
-            var result = _replicator.Apply(staged);
+            SnapshotApplyResult result;
+            try
+            {
+                result = _replicator.Apply(staged);
+            }
+            catch (Exception)
+            {
+                ReplicaResetRequired = true;
+                try { _replicator.ClearReplicas(); }
+                catch { }
+                RequestResync(staged.ServerTick);
+                return;
+            }
             _session.Trace(NetworkPhase.SnapshotApply, NetworkTraceKind.Point, DiagnosticResult(result), NetworkPacketKind.FullSnapshot, staged.ServerTick, 0, staged.Snapshot.ByteLength, History.Count, History.Bytes, unchecked((int)(staged.ServerTick - AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), entities, records);
             if (result != SnapshotApplyResult.Success) { RequestResync(staged.ServerTick); return; }
             AcknowledgedSnapshotTick = staged.ServerTick;
+            LastProcessedInputTick = header.LastProcessedInputTick;
+            LastProcessedInputSequence = header.LastProcessedInputSequence;
             ResyncRequested = false;
             _session.ReportSnapshot(staged.Snapshot, History);
             Send(PacketKind.Ack, _session.Epoch, PacketHeader.NoneTick, AcknowledgedSnapshotTick, PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
@@ -166,7 +322,9 @@ namespace UniGame.StaticEcs.Network
             Kind = kind, Flags = PacketFlags.ReliableOrdered, Compression = NetworkCompression.None,
             SessionEpoch = _session.Epoch, PacketSequence = sequence, ServerTick = serverTick, TargetTick = targetTick,
             AcknowledgedSnapshotTick = AcknowledgedSnapshotTick, AcknowledgedCommandSequence = 0,
-            SchemaFingerprint = _schema.Fingerprint
+            SchemaFingerprint = _schema.Fingerprint,
+            SimulationFingerprint = _simulationFingerprint,
+            ContentFingerprint = _contentFingerprint
         };
         private static NetworkPacketKind DiagnosticKind(PacketKind kind) => (NetworkPacketKind)(byte)kind;
         internal static NetworkResultCategory DiagnosticResult(SnapshotApplyResult result) => result switch
@@ -191,12 +349,14 @@ namespace UniGame.StaticEcs.Network
         private readonly INetworkObserver _observer;
         private readonly INetworkPeerObserver _peerObserver;
         private readonly INetworkPeerAdmissionPolicy _admissionPolicy;
+        private readonly ulong _simulationFingerprint;
+        private readonly ulong _contentFingerprint;
 
         /// <summary>Gets the latest authoritative tick completed by this server.</summary>
         public uint ServerTick { get; private set; }
 
         /// <summary>Creates a multi-connection authoritative server pipeline.</summary>
-        public NetworkServer(NetworkSchema<TWorld> schema, NetworkScopeSelector<TWorld> scopeSelector, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024, INetworkObserver observer = null, INetworkPeerObserver peerObserver = null, INetworkPeerAdmissionPolicy admissionPolicy = null)
+        public NetworkServer(NetworkSchema<TWorld> schema, NetworkScopeSelector<TWorld> scopeSelector, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024, INetworkObserver observer = null, INetworkPeerObserver peerObserver = null, INetworkPeerAdmissionPolicy admissionPolicy = null, ulong simulationFingerprint = 0, ulong contentFingerprint = 0)
         {
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
             if (scopeSelector == null) throw new ArgumentNullException(nameof(scopeSelector));
@@ -205,6 +365,8 @@ namespace UniGame.StaticEcs.Network
             _observer = observer;
             _peerObserver = peerObserver;
             _admissionPolicy = admissionPolicy;
+            _simulationFingerprint = simulationFingerprint;
+            _contentFingerprint = contentFingerprint;
         }
 
         /// <summary>Adds one transport-owned connection with server-assigned identity and scope.</summary>
@@ -266,6 +428,15 @@ namespace UniGame.StaticEcs.Network
             var dispatchStarted = Stopwatch.GetTimestamp();
             var dispatched = _coordinator.Dispatch(serverTick);
             TraceDispatch(serverTick, dispatched, ElapsedNanoseconds(dispatchStarted));
+            for (var i = 0; i < _peers.Count; i++)
+            {
+                var peer = _peers[i];
+                if (_coordinator.TryGetProcessedInput(peer.Transport.Connection, out var cursor))
+                {
+                    peer.LastProcessedInputTick = cursor.Tick;
+                    peer.LastProcessedInputSequence = cursor.Sequence;
+                }
+            }
             gameplay(serverTick);
             var captures = new Dictionary<ScopeId, NetworkSnapshot>();
             for (var i = 0; i < _peers.Count; i++)
@@ -296,10 +467,19 @@ namespace UniGame.StaticEcs.Network
             {
                 var packet = peer.PendingPackets.Dequeue();
                 var started = Stopwatch.GetTimestamp();
-                if (!NetworkPacket.TryDecode(packet, out var header, out var payload) || header.Kind != PacketKind.Hello && header.SchemaFingerprint != _schema.Fingerprint || peer.Session.ValidatePacket(in header) != PacketValidationResult.Success) { peer.Session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, NetworkResultCategory.Protocol, NetworkPacketKind.None, ServerTick, 0, packet?.Length ?? 0, 0, 0, unchecked((int)(ServerTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), activeConnections: ActiveConnectionCount, activePeers: ActivePeerCount); continue; }
-                if (header.Kind == PacketKind.Hello && !Admit(peer, header.SchemaFingerprint))
+                if (!NetworkPacket.TryDecode(packet, out var header, out var payload) ||
+                    (header.Kind != PacketKind.Hello &&
+                     (header.SchemaFingerprint != _schema.Fingerprint ||
+                     header.SimulationFingerprint != _simulationFingerprint ||
+                     header.ContentFingerprint != _contentFingerprint)) ||
+                    peer.Session.ValidatePacket(in header) != PacketValidationResult.Success) { peer.Session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, NetworkResultCategory.Protocol, NetworkPacketKind.None, ServerTick, 0, packet?.Length ?? 0, 0, 0, unchecked((int)(ServerTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), activeConnections: ActiveConnectionCount, activePeers: ActivePeerCount); continue; }
+                if (header.Kind == PacketKind.Hello && !Admit(peer, header.SchemaFingerprint,
+                        header.SimulationFingerprint, header.ContentFingerprint))
                     return true;
                 else if (header.Kind == PacketKind.CommandBatch) DecodeCommand(peer, header, payload, checked(ServerTick + 1));
+                else if (header.Kind == PacketKind.InputBatch) DecodeInputs(peer, payload, checked(ServerTick + 1));
+                else if (header.Kind == PacketKind.Ping) Send(peer, PacketKind.Pong,
+                    ServerTick, PacketHeader.NoneTick, payload.Span);
                 else if (header.Kind == PacketKind.Ack) peer.AcknowledgedSnapshotTick = header.AcknowledgedSnapshotTick;
                 else if (header.Kind == PacketKind.ResyncRequest) peer.ResyncRequested = true;
                 else if (header.Kind == PacketKind.Disconnect)
@@ -314,9 +494,12 @@ namespace UniGame.StaticEcs.Network
             return false;
         }
 
-        private bool Admit(Peer peer, SchemaFingerprint remoteFingerprint)
+        private bool Admit(Peer peer, SchemaFingerprint remoteFingerprint,
+            ulong simulationFingerprint, ulong contentFingerprint)
         {
-            if (remoteFingerprint != _schema.Fingerprint)
+            if (remoteFingerprint != _schema.Fingerprint ||
+                simulationFingerprint != _simulationFingerprint ||
+                contentFingerprint != _contentFingerprint)
             {
                 Send(peer, PacketKind.Disconnect, 0, PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
                 peer.Session.Close();
@@ -403,6 +586,76 @@ namespace UniGame.StaticEcs.Network
             else peer.AcknowledgedCommandSequence = commandSequence;
         }
 
+        private void DecodeInputs(Peer peer, ReadOnlyMemory<byte> payload, uint serverTick)
+        {
+            if (payload.Length < 1)
+            {
+                Send(peer, PacketKind.ResyncRequest, serverTick,
+                    PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
+                return;
+            }
+
+            var bytes = payload.Span;
+            int count = bytes[0];
+            if (count < 1 || count > ProtocolLimits.MaxCommandsPerBatch)
+            {
+                Send(peer, PacketKind.ResyncRequest, serverTick,
+                    PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
+                return;
+            }
+
+            int offset = 1;
+            for (var i = 0; i < count; i++)
+            {
+                if (offset > bytes.Length - 17)
+                {
+                    Send(peer, PacketKind.ResyncRequest, serverTick,
+                        PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
+                    return;
+                }
+
+                uint sequence = Hashing.Read32(bytes, offset);
+                uint targetTick = Hashing.Read32(bytes, offset + 4);
+                uint idValue = Hashing.Read32(bytes, offset + 8);
+                byte version = bytes[offset + 12];
+                uint payloadLength = Hashing.Read32(bytes, offset + 13);
+                offset += 17;
+                if (sequence == 0 || idValue == 0 ||
+                    payloadLength > ProtocolLimits.MaxCommandBytes ||
+                    payloadLength > (uint)(bytes.Length - offset))
+                {
+                    Send(peer, PacketKind.ResyncRequest, serverTick,
+                        PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
+                    return;
+                }
+
+                var exact = payload.Slice(offset, checked((int)payloadLength)).ToArray();
+                offset += checked((int)payloadLength);
+                var envelope = new NetworkCommandEnvelope(
+                    peer.Transport.Connection,
+                    peer.PeerId,
+                    peer.Epoch,
+                    sequence,
+                    targetTick,
+                    new NetworkTypeId(idValue),
+                    version,
+                    exact,
+                    true);
+                var result = _coordinator.Queue(envelope, serverTick);
+                if (result != NetworkCommandResult.Queued &&
+                    result != NetworkCommandResult.Duplicate)
+                {
+                    Send(peer, PacketKind.ResyncRequest, serverTick,
+                        PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
+                    return;
+                }
+            }
+
+            if (offset != bytes.Length)
+                Send(peer, PacketKind.ResyncRequest, serverTick,
+                    PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
+        }
+
         private void SendSnapshot(Peer peer, NetworkSnapshot snapshot)
         {
             var payload = new byte[8 + snapshot.ByteLength];
@@ -421,7 +674,12 @@ namespace UniGame.StaticEcs.Network
                 Kind = kind, Flags = PacketFlags.ReliableOrdered, Compression = NetworkCompression.None,
                 SessionEpoch = peer.Session.Epoch, PacketSequence = peer.PacketSequence++, ServerTick = serverTick,
                 TargetTick = PacketHeader.NoneTick, AcknowledgedSnapshotTick = acknowledgedTick,
-                AcknowledgedCommandSequence = peer.AcknowledgedCommandSequence, SchemaFingerprint = _schema.Fingerprint
+                AcknowledgedCommandSequence = peer.AcknowledgedCommandSequence,
+                LastProcessedInputTick = peer.LastProcessedInputTick,
+                LastProcessedInputSequence = peer.LastProcessedInputSequence,
+                SchemaFingerprint = _schema.Fingerprint
+                , SimulationFingerprint = _simulationFingerprint
+                , ContentFingerprint = _contentFingerprint
             };
             var sent = NetworkPacket.TryEncode(header, payload, out var packet) && peer.Transport.TrySend(packet);
             peer.Session.Trace(NetworkPhase.Send, NetworkTraceKind.Point, sent ? NetworkResultCategory.Success : NetworkResultCategory.Transport, DiagnosticKind(kind), serverTick, PacketHeader.NoneTick, packet?.Length ?? 0, _coordinator.HistoryCount(peer.Scope), _coordinator.HistoryByteCount(peer.Scope), unchecked((int)(serverTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), activeConnections: ActiveConnectionCount, activePeers: ActivePeerCount);
@@ -518,6 +776,8 @@ namespace UniGame.StaticEcs.Network
             internal uint PacketSequence;
             internal uint AcknowledgedSnapshotTick;
             internal uint AcknowledgedCommandSequence;
+            internal uint LastProcessedInputTick;
+            internal uint LastProcessedInputSequence;
             internal bool ResyncRequested;
             internal bool AdmissionNotified;
             internal bool DisconnectNotified;

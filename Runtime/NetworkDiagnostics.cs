@@ -22,7 +22,13 @@ namespace UniGame.StaticEcs.Network
         /// <summary>A resynchronization request packet.</summary>
         ResyncRequest,
         /// <summary>A disconnect packet.</summary>
-        Disconnect
+        Disconnect,
+        /// <summary>A redundant continuous input batch.</summary>
+        InputBatch,
+        /// <summary>A clock synchronization request.</summary>
+        Ping,
+        /// <summary>A clock synchronization response.</summary>
+        Pong
     }
     /// <summary>Identifies a measured networking phase.</summary>
     public enum NetworkPhase : byte

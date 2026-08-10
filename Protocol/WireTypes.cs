@@ -2,7 +2,7 @@ using System;
 
 namespace UniGame.StaticEcs.Network
 {
-    /// <summary>Identifies a packet payload on the version-two wire.</summary>
+    /// <summary>Identifies a packet payload on the version-three wire.</summary>
     public enum PacketKind : byte
     {
         /// <summary>Begins protocol negotiation.</summary>
@@ -18,7 +18,13 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Requests recovery from a rejected state.</summary>
         ResyncRequest = 6,
         /// <summary>Ends a protocol session.</summary>
-        Disconnect = 7
+        Disconnect = 7,
+        /// <summary>Carries redundant tick-indexed continuous input frames.</summary>
+        InputBatch = 8,
+        /// <summary>Measures clock offset and round-trip time.</summary>
+        Ping = 9,
+        /// <summary>Returns a clock synchronization sample.</summary>
+        Pong = 10
     }
 
     /// <summary>Declares packet delivery requirements.</summary>
@@ -26,7 +32,9 @@ namespace UniGame.StaticEcs.Network
     public enum PacketFlags : byte
     {
         /// <summary>Requests exactly-once, in-order delivery.</summary>
-        ReliableOrdered = 1
+        ReliableOrdered = 1,
+        /// <summary>Keeps only packets newer than the last accepted sequence.</summary>
+        UnreliableSequenced = 2
     }
 
     /// <summary>Declares replicated entity state.</summary>
@@ -64,7 +72,7 @@ namespace UniGame.StaticEcs.Network
     [Flags]
     public enum CommandFlags : ushort
     {
-        /// <summary>Version two defines no command options.</summary>
+        /// <summary>Version three defines no command options.</summary>
         None = 0
     }
 
@@ -121,7 +129,7 @@ namespace UniGame.StaticEcs.Network
         Requested = 8
     }
 
-    /// <summary>Defines immutable version-two protocol limits.</summary>
+    /// <summary>Defines immutable version-three protocol limits.</summary>
     public static class ProtocolLimits
     {
         /// <summary>Maximum encoded payload length.</summary>

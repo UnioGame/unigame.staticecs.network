@@ -10,6 +10,9 @@ namespace UniGame.StaticEcs.Network
     /// <summary>Marks a concrete Shared Static ECS command event.</summary>
     public interface INetworkCommand { }
 
+    /// <summary>Marks continuous tick-indexed client input sent with redundant sequenced delivery.</summary>
+    public interface INetworkInput : INetworkCommand { }
+
     /// <summary>Authorizes one decoded command using trusted server context.</summary>
     public interface INetworkCommandPolicy<TWorld, TCommand>
         where TWorld : struct, IWorldType

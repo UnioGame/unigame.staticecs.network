@@ -14,6 +14,7 @@ namespace UniGame.StaticEcs.Network.Generator
     {
         private const string NetworkType = "UniGame.StaticEcs.Network.INetworkType";
         private const string NetworkCommand = "UniGame.StaticEcs.Network.INetworkCommand";
+        private const string NetworkInput = "UniGame.StaticEcs.Network.INetworkInput";
         private const string EndpointAttribute = "UniGame.StaticEcs.Network.NetworkEndpointAttribute";
         private const string ManifestRecordAttribute = "UniGame.StaticEcs.Network.NetworkManifestRecordAttribute";
         private static readonly DiagnosticDescriptor InvalidWireType = Error("NETV2001", "Invalid network wire type", "Network wire type '{0}' must be a concrete non-generic struct");
@@ -62,6 +63,8 @@ namespace UniGame.StaticEcs.Network.Generator
         private static void CollectType(INamedTypeSymbol type, string assemblyName, List<Record> records, SourceProductionContext context)
         {
             foreach (var nested in type.GetTypeMembers()) CollectType(nested, assemblyName, records, context);
+            if (type.TypeKind == TypeKind.Interface && type.ToDisplayString() == NetworkInput)
+                return;
             var isType = Implements(type, NetworkType);
             var isCommand = Implements(type, NetworkCommand);
             if (!isType && !isCommand) return;
