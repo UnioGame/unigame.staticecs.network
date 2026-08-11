@@ -56,8 +56,8 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Number of authoritative ticks presentation renders behind.</summary>
         public int InterpolationDelayTicks;
 
-        /// <summary>Number of recent input frames repeated in one unreliable batch.</summary>
-        public int InputRedundancy;
+        /// <summary>Number of previous command ticks repeated in one unreliable batch.</summary>
+        public int CommandRedundancy;
 
         /// <summary>Maximum prediction replay work per rendered frame.</summary>
         public float MaxResimulationMilliseconds;
@@ -237,7 +237,7 @@ namespace UniGame.StaticEcs.Network
                 TicksPerSecond = 20,
                 PredictionHistoryTicks = 64,
                 InterpolationDelayTicks = 2,
-                InputRedundancy = 3,
+                CommandRedundancy = 3,
                 MaxResimulationMilliseconds = 2f,
                 Seed = 1,
                 MaxQueuedPackets = 1024,

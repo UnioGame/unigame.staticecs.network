@@ -7,10 +7,10 @@ using NUnit.Framework;
 
 namespace UniGame.StaticEcs.Network.Tests
 {
-    public sealed class NetworkV2Tests
+    public sealed class NetworkV4Tests
     {
         [Test]
-        public void TypeIdsAndPacketHeaderAreCanonicalV3()
+        public void TypeIdsAndPacketHeaderAreCanonicalV4AndRejectV3()
         {
             var id = NetworkCompilerSupport.TypeId("SourceGenerator.Tests", "Demo.Position");
             Assert.That(id.Value, Is.EqualTo(4089044646u));
@@ -21,7 +21,6 @@ namespace UniGame.StaticEcs.Network.Tests
                 Flags = PacketFlags.ReliableOrdered,
                 Compression = NetworkCompression.None,
                 ServerTick = 42,
-                TargetTick = PacketHeader.NoneTick,
                 PayloadLength = 3,
                 SchemaFingerprint = new SchemaFingerprint(1, 2),
                 SimulationFingerprint = 3,
@@ -31,11 +30,15 @@ namespace UniGame.StaticEcs.Network.Tests
             var bytes = new byte[PacketHeader.Size];
             Assert.That(header.TryWrite(bytes), Is.True);
             Assert.That(PacketHeader.TryRead(bytes, out var decoded), Is.True);
-            Assert.That(PacketHeader.Version, Is.EqualTo(3));
+            Assert.That(PacketHeader.Version, Is.EqualTo(4));
             Assert.That(decoded.SchemaFingerprint, Is.EqualTo(header.SchemaFingerprint));
             Assert.That(decoded.SimulationFingerprint,
                 Is.EqualTo(header.SimulationFingerprint));
             Assert.That(decoded.ContentFingerprint, Is.EqualTo(header.ContentFingerprint));
+            bytes[4] = 3;
+            bytes[5] = 0;
+            Assert.That(PacketHeader.TryRead(bytes, out _), Is.False);
+            Assert.That(header.TryWrite(bytes), Is.True);
             bytes[10] = 1;
             Assert.That(PacketHeader.TryRead(bytes, out _), Is.False);
             header.Kind = PacketKind.Hello;
@@ -86,16 +89,16 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
-        public void RedundantInputsAreDeduplicatedAndAcknowledgedOnAdverseLink()
+        public void RedundantCommandsAreDeduplicatedAndAcknowledgedOnAdverseLink()
         {
             World<InputWorld>.Create(WorldConfig.Default());
             var types = World<InputWorld>.Types();
             types.Event<TestInput>();
-            types.Event<NetworkCommandAccepted<TestInput>>();
-            types.Event<NetworkCommandRejected<TestInput>>();
+            types.Event<NetworkCommandAcceptedEvent<TestInput>>();
+            types.Event<NetworkCommandRejectedEvent<TestInput>>();
             World<InputWorld>.Initialize();
             var receiver = World<InputWorld>
-                .RegisterEventReceiver<NetworkCommandAccepted<TestInput>>();
+                .RegisterEventReceiver<NetworkCommandAcceptedEvent<TestInput>>();
             try
             {
                 var clientFactory = NetworkCompilerSupport.Create<InputWorld>();
@@ -111,7 +114,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     static (_, _) => false);
                 server.AddConnection(simulator.Server, 7, 11, new ScopeId(1));
                 var client = new NetworkClient<InputWorld>(simulator.Client,
-                    clientFactory.Freeze(), new ScopeId(1), inputRedundancy: 3);
+                    clientFactory.Freeze(), new ScopeId(1), commandRedundancy: 3);
 
                 Assert.That(client.BeginHandshake(), Is.True);
                 simulator.Advance(0);
@@ -136,7 +139,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 for (var index = 0; index < 106; index++)
                 {
                     var input = new TestInput { Value = index < 100 ? index + 1 : 0 };
-                    Assert.That(client.SendInput(in input, server.ServerTick + 4),
+                    Assert.That(client.SendCommand(in input, server.ServerTick + 4),
                         Is.EqualTo(NetworkCommandResult.Queued));
                     simulator.Advance(50);
                     server.Receive();
@@ -160,8 +163,8 @@ namespace UniGame.StaticEcs.Network.Tests
                 }
 
                 Assert.That(sequences.Count, Is.GreaterThanOrEqualTo(95));
-                Assert.That(client.LastProcessedInputTick, Is.EqualTo(latestTick));
-                Assert.That(client.LastProcessedInputSequence,
+                Assert.That(client.ServerProcessedCommandTick, Is.EqualTo(latestTick));
+                Assert.That(client.ServerProcessedCommandSequence,
                     Is.EqualTo(latestSequence));
                 var stats = simulator.CaptureStats();
                 Assert.That(stats.ClientToServer.LostPackets, Is.GreaterThan(0));
@@ -176,12 +179,12 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         private static void CollectAcceptedInputs(
-            EventReceiver<InputWorld, NetworkCommandAccepted<TestInput>> receiver,
+            EventReceiver<InputWorld, NetworkCommandAcceptedEvent<TestInput>> receiver,
             HashSet<uint> sequences,
             ref uint latestTick,
             ref uint latestSequence)
         {
-            foreach (World<InputWorld>.Event<NetworkCommandAccepted<TestInput>> item
+            foreach (World<InputWorld>.Event<NetworkCommandAcceptedEvent<TestInput>> item
                      in receiver)
             {
                 Assert.That(sequences.Add(item.Value.Context.Sequence), Is.True,
@@ -189,6 +192,193 @@ namespace UniGame.StaticEcs.Network.Tests
                 latestTick = Math.Max(latestTick, item.Value.Context.TargetTick);
                 latestSequence = Math.Max(latestSequence,
                     item.Value.Context.Sequence);
+            }
+        }
+
+        [Test]
+        public void CommandQueueRejectsOverflowBeforeSendingPartialBatch()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            var receiver = World<AuthorityWorld>
+                .RegisterEventReceiver<NetworkCommandAcceptedEvent<TestCommand>>();
+            try
+            {
+                MemoryNetworkTransport.CreatePair(new ConnectionId(92),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    var server = new NetworkServer<AuthorityWorld>(
+                        Schema<AuthorityWorld>(true), static (_, _) => false);
+                    server.AddConnection(serverTransport, 7, 12, new ScopeId(1));
+                    var client = new NetworkClient<ClientAWorld>(clientTransport,
+                        Schema<ClientAWorld>(false), new ScopeId(1));
+                    Assert.That(client.BeginHandshake(), Is.True);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+                    server.Receive();
+
+                    for (var i = 0; i < ProtocolLimits.MaxCommandsPerBatch; i++)
+                    {
+                        var command = new TestCommand { Value = i };
+                        Assert.That(client.QueueCommand(in command, 2, out _),
+                            Is.EqualTo(NetworkCommandResult.Queued));
+                    }
+                    var overflow = new TestCommand { Value = -1 };
+                    Assert.That(client.QueueCommand(in overflow, 2, out _),
+                        Is.EqualTo(NetworkCommandResult.LimitExceeded));
+                    Assert.That(serverTransport.TryReceive(out _), Is.False,
+                        "Queueing must not send a partial command batch.");
+
+                    Assert.That(client.FlushCommands(2),
+                        Is.EqualTo(NetworkCommandResult.Queued));
+                    server.Receive();
+                    server.Tick(_ => { });
+                    var count = 0;
+                    foreach (World<AuthorityWorld>
+                                 .Event<NetworkCommandAcceptedEvent<TestCommand>> _ in receiver)
+                        count++;
+                    Assert.That(count, Is.EqualTo(ProtocolLimits.MaxCommandsPerBatch));
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.DeleteEventReceiver(ref receiver);
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void CommandBatchRepeatsCurrentAndThreePreviousTicks()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                MemoryNetworkTransport.CreatePair(new ConnectionId(94),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    var server = new NetworkServer<AuthorityWorld>(
+                        Schema<AuthorityWorld>(true), static (_, _) => false);
+                    server.AddConnection(serverTransport, 7, 14, new ScopeId(1));
+                    var clientSchema = Schema<ClientAWorld>(false);
+                    var client = new NetworkClient<ClientAWorld>(clientTransport,
+                        clientSchema, new ScopeId(1), commandRedundancy: 3);
+                    Assert.That(client.BeginHandshake(), Is.True);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+                    server.Receive();
+
+                    byte[] latestPacket = null;
+                    for (uint tick = 2; tick <= 6; tick++)
+                    {
+                        var command = new TestCommand { Value = (int)tick };
+                        Assert.That(client.QueueCommand(in command, tick, out _),
+                            Is.EqualTo(NetworkCommandResult.Queued));
+                        Assert.That(client.FlushCommands(tick),
+                            Is.EqualTo(NetworkCommandResult.Queued));
+                        Assert.That(serverTransport.TryReceive(out latestPacket), Is.True);
+                    }
+
+                    Assert.That(NetworkPacket.TryDecode(latestPacket,
+                        clientSchema.Fingerprint, out _, out var payload), Is.True);
+                    Assert.That(payload.Span[0], Is.EqualTo(4));
+                    var ticks = new List<uint>();
+                    int offset = 1;
+                    for (var i = 0; i < payload.Span[0]; i++)
+                    {
+                        ticks.Add(Read32(payload.Span, offset + 4));
+                        int commandBytes = checked((int)Read32(
+                            payload.Span, offset + 13));
+                        offset += 17 + commandBytes;
+                    }
+                    CollectionAssert.AreEqual(new uint[] { 3, 4, 5, 6 }, ticks);
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void MalformedAndOversizedCommandBatchesNeverQueueValidPrefix()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            var receiver = World<AuthorityWorld>
+                .RegisterEventReceiver<NetworkCommandAcceptedEvent<TestCommand>>();
+            try
+            {
+                MemoryNetworkTransport.CreatePair(new ConnectionId(93),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    var serverSchema = Schema<AuthorityWorld>(true);
+                    var clientSchema = Schema<ClientAWorld>(false);
+                    var server = new NetworkServer<AuthorityWorld>(serverSchema,
+                        static (_, _) => false);
+                    server.AddConnection(serverTransport, 7, 13, new ScopeId(1));
+                    var client = new NetworkClient<ClientAWorld>(clientTransport,
+                        clientSchema, new ScopeId(1));
+                    Assert.That(client.BeginHandshake(), Is.True);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+                    server.Receive();
+
+                    var command = new TestCommand { Value = 7 };
+                    Assert.That(client.QueueCommand(in command, 2, out _),
+                        Is.EqualTo(NetworkCommandResult.Queued));
+                    Assert.That(client.FlushCommands(2),
+                        Is.EqualTo(NetworkCommandResult.Queued));
+                    Assert.That(serverTransport.TryReceive(out var validPacket), Is.True);
+                    Assert.That(NetworkPacket.TryDecode(validPacket, clientSchema.Fingerprint,
+                        out var header, out var validPayload), Is.True);
+
+                    var malformedPayload = new byte[validPayload.Length + 5];
+                    validPayload.Span.CopyTo(malformedPayload);
+                    malformedPayload[0] = 2;
+                    Assert.That(NetworkPacket.TryEncode(header, malformedPayload,
+                        out var malformedPacket), Is.True);
+                    Assert.That(clientTransport.TrySend(malformedPacket), Is.True);
+                    server.Receive();
+
+                    var oversizedPayload = new byte[18];
+                    oversizedPayload[0] = 1;
+                    Write32(oversizedPayload, 1, 2);
+                    Write32(oversizedPayload, 5, 2);
+                    Write32(oversizedPayload, 9, 10);
+                    oversizedPayload[13] = 0;
+                    Write32(oversizedPayload, 14,
+                        ProtocolLimits.MaxCommandBytes + 1u);
+                    header.PacketSequence = 2;
+                    Assert.That(NetworkPacket.TryEncode(header, oversizedPayload,
+                        out var oversizedPacket), Is.True);
+                    Assert.That(clientTransport.TrySend(oversizedPacket), Is.True);
+                    server.Receive();
+                    server.Tick(_ => { });
+
+                    var count = 0;
+                    foreach (World<AuthorityWorld>
+                                 .Event<NetworkCommandAcceptedEvent<TestCommand>> _ in receiver)
+                        count++;
+                    Assert.That(count, Is.Zero);
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.DeleteEventReceiver(ref receiver);
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
             }
         }
 
@@ -266,7 +456,7 @@ namespace UniGame.StaticEcs.Network.Tests
             CreateReplicationWorld<AuthorityWorld>(true);
             CreateReplicationWorld<ClientAWorld>(false);
             CreateReplicationWorld<ClientBWorld>(false);
-            var receiver = World<AuthorityWorld>.RegisterEventReceiver<NetworkCommandAccepted<TestCommand>>();
+            var receiver = World<AuthorityWorld>.RegisterEventReceiver<NetworkCommandAcceptedEvent<TestCommand>>();
             try
             {
                 var authoritySchema = Schema<AuthorityWorld>(true);
@@ -327,7 +517,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 }
                 Assert.That(index, Is.EqualTo(2));
                 Assert.That(clientA.AcknowledgedSnapshotTick, Is.EqualTo(3));
-                Assert.That(clientA.AcknowledgedCommandSequence, Is.EqualTo(1));
+                Assert.That(clientA.ServerProcessedCommandSequence, Is.EqualTo(1));
 
                 Assert.That(mock.ServerA.TrySend(new byte[] { 1, 2, 3 }), Is.True);
                 clientA.Process();
@@ -441,7 +631,7 @@ namespace UniGame.StaticEcs.Network.Tests
         public void ServerDispatchReturnsPolicyRejectedWithoutRejectedEventReceiver()
         {
             World<RejectWorld>.Create(WorldConfig.Default());
-            World<RejectWorld>.Types().Event<TestCommand>().Event<NetworkCommandAccepted<TestCommand>>().Event<NetworkCommandRejected<TestCommand>>();
+            World<RejectWorld>.Types().Event<TestCommand>().Event<NetworkCommandAcceptedEvent<TestCommand>>().Event<NetworkCommandRejectedEvent<TestCommand>>();
             World<RejectWorld>.Initialize();
             try
             {
@@ -522,7 +712,6 @@ namespace UniGame.StaticEcs.Network.Tests
                         SessionEpoch = 9,
                         PacketSequence = 3,
                         ServerTick = 7,
-                        TargetTick = PacketHeader.NoneTick,
                         SchemaFingerprint = clientSchema.Fingerprint
                     };
                     Assert.That(NetworkPacket.TryEncode(nonSnapshot, ReadOnlySpan<byte>.Empty, out var nonSnapshotPacket), Is.True);
@@ -539,7 +728,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(client.SendCommand(new TestCommand { Value = 5 }, 8), Is.EqualTo(NetworkCommandResult.Queued));
                     var commandDiagnostics = clientObserver.Sessions[clientObserver.Sessions.Count - 1];
                     Assert.That(commandDiagnostics.ServerTick, Is.EqualTo(7));
-                    Assert.That(commandDiagnostics.NextSendPacketSequence, Is.EqualTo(4));
+                    Assert.That(commandDiagnostics.NextSendPacketSequence, Is.EqualTo(3));
                 }
             }
             finally { World<AuthorityWorld>.Destroy(); World<ClientAWorld>.Destroy(); }
@@ -549,7 +738,7 @@ namespace UniGame.StaticEcs.Network.Tests
         public void ServerDispatchTelemetryPreservesPolicyOutcomeAndActiveSessionGauges()
         {
             World<RejectWorld>.Create(WorldConfig.Default());
-            World<RejectWorld>.Types().Event<TestCommand>().Event<NetworkCommandAccepted<TestCommand>>().Event<NetworkCommandRejected<TestCommand>>();
+            World<RejectWorld>.Types().Event<TestCommand>().Event<NetworkCommandAcceptedEvent<TestCommand>>().Event<NetworkCommandRejectedEvent<TestCommand>>();
             World<RejectWorld>.Initialize();
             try
             {
@@ -577,7 +766,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(dispatch.Commands, Is.EqualTo(1)); Assert.That(dispatch.AcceptedCommands, Is.EqualTo(0)); Assert.That(dispatch.RejectedCommands, Is.EqualTo(1));
                     Assert.That(dispatch.ActiveConnections, Is.EqualTo(3)); Assert.That(dispatch.ActivePeers, Is.EqualTo(2));
 
-                    var disconnect = Packet(PacketKind.Disconnect, 5, 4); disconnect.SchemaFingerprint = serverSchema.Fingerprint;
+                    var disconnect = Packet(PacketKind.Disconnect, 5, 3); disconnect.SchemaFingerprint = serverSchema.Fingerprint;
                     Assert.That(NetworkPacket.TryEncode(disconnect, ReadOnlySpan<byte>.Empty, out var packet), Is.True);
                     Assert.That(clientTransport.TrySend(packet), Is.True); server.Receive();
                     Assert.That(session.State, Is.EqualTo(NetworkSessionState.Closed));
@@ -745,9 +934,9 @@ namespace UniGame.StaticEcs.Network.Tests
         public void SessionsValidateAndDispatchCommandsInTargetPeerSequenceOrder()
         {
             World<TestWorld>.Create(WorldConfig.Default());
-            World<TestWorld>.Types().Event<TestCommand>().Event<NetworkCommandAccepted<TestCommand>>().Event<NetworkCommandRejected<TestCommand>>();
+            World<TestWorld>.Types().Event<TestCommand>().Event<NetworkCommandAcceptedEvent<TestCommand>>().Event<NetworkCommandRejectedEvent<TestCommand>>();
             World<TestWorld>.Initialize();
-            var receiver = World<TestWorld>.RegisterEventReceiver<NetworkCommandAccepted<TestCommand>>();
+            var receiver = World<TestWorld>.RegisterEventReceiver<NetworkCommandAcceptedEvent<TestCommand>>();
             try
             {
                 var clientFactory = NetworkCompilerSupport.Create<TestWorld>();
@@ -937,7 +1126,7 @@ namespace UniGame.StaticEcs.Network.Tests
             var types = World<TWorld>.Types();
             types.RegisterAll(typeof(NetworkOwnerComponent).Assembly);
             types.EntityType<TestEntity>(); types.EntityType<SecondEntity>(); types.Tag<TestTag>(); types.Component<TestComponent>(); types.Event<TestCommand>();
-            if (server) { types.Event<NetworkCommandAccepted<TestCommand>>(); types.Event<NetworkCommandRejected<TestCommand>>(); }
+            if (server) { types.Event<NetworkCommandAcceptedEvent<TestCommand>>(); types.Event<NetworkCommandRejectedEvent<TestCommand>>(); }
             World<TWorld>.Initialize();
         }
 
@@ -957,10 +1146,24 @@ namespace UniGame.StaticEcs.Network.Tests
         private static PacketHeader Packet(PacketKind kind, uint epoch, uint sequence) => new PacketHeader
         {
             Kind = kind,
-            Flags = PacketFlags.ReliableOrdered,
+            Flags = kind == PacketKind.CommandBatch
+                ? PacketFlags.UnreliableSequenced
+                : PacketFlags.ReliableOrdered,
             SessionEpoch = epoch,
             PacketSequence = sequence
         };
+
+        private static uint Read32(ReadOnlySpan<byte> source, int offset) =>
+            (uint)(source[offset] | source[offset + 1] << 8 |
+                   source[offset + 2] << 16 | source[offset + 3] << 24);
+
+        private static void Write32(Span<byte> destination, int offset, uint value)
+        {
+            destination[offset] = (byte)value;
+            destination[offset + 1] = (byte)(value >> 8);
+            destination[offset + 2] = (byte)(value >> 16);
+            destination[offset + 3] = (byte)(value >> 24);
+        }
 
         private static void AssertMetadataOnly(Type type)
         {
@@ -977,9 +1180,18 @@ namespace UniGame.StaticEcs.Network.Tests
             var session = new NetworkSession<TestWorld>(new ConnectionId(connection), role, schema);
             Assert.That(session.Admit(schema.Fingerprint, 1, 7, default), Is.EqualTo(NetworkAdmissionResult.Accepted));
             var wrongEpoch = Packet(kind, 6, 1); Assert.That(session.ValidatePacket(in wrongEpoch), Is.EqualTo(allowed ? PacketValidationResult.WrongEpoch : PacketValidationResult.WrongRole));
-            var outOfOrder = Packet(kind, 7, 2); Assert.That(session.ValidatePacket(in outOfOrder), Is.EqualTo(allowed ? PacketValidationResult.Sequence : PacketValidationResult.WrongRole));
-            var candidate = Packet(kind, 7, 1); Assert.That(session.ValidatePacket(in candidate), Is.EqualTo(allowed ? PacketValidationResult.Success : PacketValidationResult.WrongRole));
-            if (allowed) Assert.That(session.ValidatePacket(in candidate), Is.EqualTo(PacketValidationResult.Sequence));
+            var outOfOrder = Packet(kind, 7, 2);
+            var outOfOrderResult = allowed && kind == PacketKind.CommandBatch
+                ? PacketValidationResult.Success
+                : allowed ? PacketValidationResult.Sequence : PacketValidationResult.WrongRole;
+            Assert.That(session.ValidatePacket(in outOfOrder), Is.EqualTo(outOfOrderResult));
+            var candidate = Packet(kind, 7, 1);
+            var candidateResult = allowed && kind == PacketKind.CommandBatch
+                ? PacketValidationResult.Sequence
+                : allowed ? PacketValidationResult.Success : PacketValidationResult.WrongRole;
+            Assert.That(session.ValidatePacket(in candidate), Is.EqualTo(candidateResult));
+            if (allowed && kind != PacketKind.CommandBatch)
+                Assert.That(session.ValidatePacket(in candidate), Is.EqualTo(PacketValidationResult.Sequence));
             else
             {
                 var fallback = Packet(role == NetworkRole.Server ? PacketKind.Ack : PacketKind.FullSnapshot, 7, 1);
@@ -998,7 +1210,7 @@ namespace UniGame.StaticEcs.Network.Tests
         public struct RejectWorld : IWorldType { }
         public struct TestEntity : IEntityType, INetworkType { public byte Id() => 1; }
         private struct InputWorld : IWorldType { }
-        internal struct TestInput : IEvent, INetworkInput
+        internal struct TestInput : IEvent, INetworkCommand
         {
             public int Value;
             public void Write(ref BinaryPackWriter writer) => writer.WriteInt(Value);

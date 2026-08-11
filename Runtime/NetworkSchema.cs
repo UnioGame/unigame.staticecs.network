@@ -304,8 +304,8 @@ namespace UniGame.StaticEcs.Network
         {
             var command = Read(payload, version);
             var accepted = default(TPolicy).Authorize(in context, in command);
-            if (accepted) World<TWorld>.SendEvent(new NetworkCommandAccepted<T> { Command = command, Context = context });
-            else World<TWorld>.SendEvent(new NetworkCommandRejected<T> { Command = command, Context = context });
+            if (accepted) World<TWorld>.SendEvent(new NetworkCommandAcceptedEvent<T> { Command = command, Context = context });
+            else World<TWorld>.SendEvent(new NetworkCommandRejectedEvent<T> { Command = command, Context = context });
             return accepted ? NetworkCommandResult.Dispatched : NetworkCommandResult.PolicyRejected;
         }
     }

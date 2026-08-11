@@ -10,9 +10,6 @@ namespace UniGame.StaticEcs.Network
     /// <summary>Marks a concrete Shared Static ECS command event.</summary>
     public interface INetworkCommand { }
 
-    /// <summary>Marks continuous tick-indexed client input sent with redundant sequenced delivery.</summary>
-    public interface INetworkInput : INetworkCommand { }
-
     /// <summary>Authorizes one decoded command using trusted server context.</summary>
     public interface INetworkCommandPolicy<TWorld, TCommand>
         where TWorld : struct, IWorldType
@@ -74,7 +71,7 @@ namespace UniGame.StaticEcs.Network
         Server = 2
     }
 
-    /// <summary>Stores server-assigned ownership. Client input never writes this value.</summary>
+    /// <summary>Stores server-assigned ownership. Client commands never write this value.</summary>
     public struct NetworkOwnerComponent : IComponent, INetworkType
     {
         /// <summary>Gets or sets the trusted peer identifier.</summary>
@@ -107,7 +104,7 @@ namespace UniGame.StaticEcs.Network
     }
 
     /// <summary>Reports an accepted typed command to server systems.</summary>
-    public struct NetworkCommandAccepted<TCommand> : IEvent where TCommand : struct, IEvent, INetworkCommand
+    public struct NetworkCommandAcceptedEvent<TCommand> : IEvent where TCommand : struct, IEvent, INetworkCommand
     {
         /// <summary>Gets or sets the decoded command.</summary>
         public TCommand Command;
@@ -116,7 +113,7 @@ namespace UniGame.StaticEcs.Network
     }
 
     /// <summary>Reports a policy-rejected typed command to server systems.</summary>
-    public struct NetworkCommandRejected<TCommand> : IEvent where TCommand : struct, IEvent, INetworkCommand
+    public struct NetworkCommandRejectedEvent<TCommand> : IEvent where TCommand : struct, IEvent, INetworkCommand
     {
         /// <summary>Gets or sets the decoded command.</summary>
         public TCommand Command;

@@ -11,14 +11,14 @@ namespace UniGame.StaticEcs.Network
             int ticksPerSecond,
             int predictionHistoryTicks = 64,
             int interpolationDelayTicks = 2,
-            int inputRedundancy = 3,
+            int commandRedundancy = 3,
             float maxResimulationMilliseconds = 2f)
             : this(new NetworkSimulationConfig
             {
                 TicksPerSecond = ticksPerSecond,
                 PredictionHistoryTicks = predictionHistoryTicks,
                 InterpolationDelayTicks = interpolationDelayTicks,
-                InputRedundancy = inputRedundancy,
+                CommandRedundancy = commandRedundancy,
                 MaxResimulationMilliseconds = maxResimulationMilliseconds
             })
         {
@@ -34,7 +34,7 @@ namespace UniGame.StaticEcs.Network
             TickSeconds = 1f / config.TicksPerSecond;
             PredictionHistoryTicks = config.PredictionHistoryTicks;
             InterpolationDelayTicks = config.InterpolationDelayTicks;
-            InputRedundancy = config.InputRedundancy;
+            CommandRedundancy = config.CommandRedundancy;
             MaxResimulationMilliseconds = config.MaxResimulationMilliseconds;
             Fingerprint = CalculateFingerprint();
         }
@@ -54,8 +54,8 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Gets the number of authoritative ticks presentation renders behind.</summary>
         public int InterpolationDelayTicks { get; }
 
-        /// <summary>Gets the number of recent input frames repeated in each send.</summary>
-        public int InputRedundancy { get; }
+        /// <summary>Gets the number of previous command ticks repeated in each send.</summary>
+        public int CommandRedundancy { get; }
 
         /// <summary>Gets the maximum resimulation work allowed per rendered frame.</summary>
         public float MaxResimulationMilliseconds { get; }
@@ -71,7 +71,7 @@ namespace UniGame.StaticEcs.Network
             Add(ref value, TicksPerSecond, prime);
             Add(ref value, PredictionHistoryTicks, prime);
             Add(ref value, InterpolationDelayTicks, prime);
-            Add(ref value, InputRedundancy, prime);
+            Add(ref value, CommandRedundancy, prime);
             Add(ref value, BitConverter.SingleToInt32Bits(MaxResimulationMilliseconds), prime);
             return value;
         }

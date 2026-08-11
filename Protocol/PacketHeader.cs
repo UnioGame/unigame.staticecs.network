@@ -2,20 +2,20 @@ using System;
 
 namespace UniGame.StaticEcs.Network
 {
-    /// <summary>Declares the only wire compression supported by Network v3.</summary>
+    /// <summary>Declares the only wire compression supported by Network v4.</summary>
     public enum NetworkCompression : byte
     {
         /// <summary>Leaves the canonical payload unchanged.</summary>
         None = 0
     }
 
-    /// <summary>Contains the fixed Network v3 packet framing fields.</summary>
+    /// <summary>Contains the fixed Network v4 packet framing fields.</summary>
     public struct PacketHeader
     {
-        /// <summary>Network v3 protocol number.</summary>
-        public const ushort Version = 3;
+        /// <summary>Network v4 protocol number.</summary>
+        public const ushort Version = 4;
         /// <summary>Fixed encoded header length.</summary>
-        public const int Size = 92;
+        public const int Size = 84;
         /// <summary>Sentinel used when no tick exists.</summary>
         public const uint NoneTick = uint.MaxValue;
 
@@ -31,16 +31,12 @@ namespace UniGame.StaticEcs.Network
         public uint PacketSequence { get; set; }
         /// <summary>Gets or sets authoritative server time.</summary>
         public uint ServerTick { get; set; }
-        /// <summary>Gets or sets the command target tick.</summary>
-        public uint TargetTick { get; set; }
         /// <summary>Gets or sets the acknowledged snapshot tick.</summary>
         public uint AcknowledgedSnapshotTick { get; set; }
-        /// <summary>Gets or sets the acknowledged command sequence.</summary>
-        public uint AcknowledgedCommandSequence { get; set; }
-        /// <summary>Gets or sets the last input tick processed into this server state.</summary>
-        public uint LastProcessedInputTick { get; set; }
-        /// <summary>Gets or sets the last input sequence processed into this server state.</summary>
-        public uint LastProcessedInputSequence { get; set; }
+        /// <summary>Gets or sets the last command tick processed into this server state.</summary>
+        public uint ServerProcessedCommandTick { get; set; }
+        /// <summary>Gets or sets the last command sequence processed into this server state.</summary>
+        public uint ServerProcessedCommandSequence { get; set; }
         /// <summary>Gets or sets exact payload length.</summary>
         public uint PayloadLength { get; set; }
         /// <summary>Gets or sets the generated schema fingerprint.</summary>
@@ -67,17 +63,15 @@ namespace UniGame.StaticEcs.Network
             Hashing.Write32(bytes, 12, SessionEpoch);
             Hashing.Write32(bytes, 16, PacketSequence);
             Hashing.Write32(bytes, 20, ServerTick);
-            Hashing.Write32(bytes, 24, TargetTick);
-            Hashing.Write32(bytes, 28, AcknowledgedSnapshotTick);
-            Hashing.Write32(bytes, 32, AcknowledgedCommandSequence);
-            Hashing.Write32(bytes, 36, LastProcessedInputTick);
-            Hashing.Write32(bytes, 40, LastProcessedInputSequence);
-            Hashing.Write32(bytes, 44, PayloadLength);
-            SchemaFingerprint.WriteBytes(bytes.Slice(48, 16));
-            Hashing.Write64(bytes, 64, SimulationFingerprint);
-            Hashing.Write64(bytes, 72, ContentFingerprint);
-            Hashing.Write64(bytes, 80, PayloadHash);
-            Hashing.Write32(bytes, 88, Hashing.Crc32(bytes));
+            Hashing.Write32(bytes, 24, AcknowledgedSnapshotTick);
+            Hashing.Write32(bytes, 28, ServerProcessedCommandTick);
+            Hashing.Write32(bytes, 32, ServerProcessedCommandSequence);
+            Hashing.Write32(bytes, 36, PayloadLength);
+            SchemaFingerprint.WriteBytes(bytes.Slice(40, 16));
+            Hashing.Write64(bytes, 56, SimulationFingerprint);
+            Hashing.Write64(bytes, 64, ContentFingerprint);
+            Hashing.Write64(bytes, 72, PayloadHash);
+            Hashing.Write32(bytes, 80, Hashing.Crc32(bytes));
             return true;
         }
 
@@ -89,20 +83,21 @@ namespace UniGame.StaticEcs.Network
                 Read16(source, 4) != Version || Read16(source, 6) != Size || source[11] != 0) return false;
             Span<byte> copy = stackalloc byte[Size];
             source.Slice(0, Size).CopyTo(copy);
-            var expected = Hashing.Read32(copy, 88);
-            copy.Slice(88, 4).Clear();
+            var expected = Hashing.Read32(copy, 80);
+            copy.Slice(80, 4).Clear();
             if (Hashing.Crc32(copy) != expected) return false;
             header = new PacketHeader
             {
                 Kind = (PacketKind)source[8], Flags = (PacketFlags)source[9], Compression = (NetworkCompression)source[10],
                 SessionEpoch = Hashing.Read32(source, 12), PacketSequence = Hashing.Read32(source, 16),
-                ServerTick = Hashing.Read32(source, 20), TargetTick = Hashing.Read32(source, 24),
-                AcknowledgedSnapshotTick = Hashing.Read32(source, 28), AcknowledgedCommandSequence = Hashing.Read32(source, 32),
-                LastProcessedInputTick = Hashing.Read32(source, 36), LastProcessedInputSequence = Hashing.Read32(source, 40),
-                PayloadLength = Hashing.Read32(source, 44), SchemaFingerprint = SchemaFingerprint.ReadBytes(source.Slice(48, 16)),
-                SimulationFingerprint = Hashing.Read64(source, 64),
-                ContentFingerprint = Hashing.Read64(source, 72),
-                PayloadHash = Hashing.Read64(source, 80)
+                ServerTick = Hashing.Read32(source, 20), AcknowledgedSnapshotTick = Hashing.Read32(source, 24),
+                ServerProcessedCommandTick = Hashing.Read32(source, 28),
+                ServerProcessedCommandSequence = Hashing.Read32(source, 32),
+                PayloadLength = Hashing.Read32(source, 36),
+                SchemaFingerprint = SchemaFingerprint.ReadBytes(source.Slice(40, 16)),
+                SimulationFingerprint = Hashing.Read64(source, 56),
+                ContentFingerprint = Hashing.Read64(source, 64),
+                PayloadHash = Hashing.Read64(source, 72)
             };
             return IsValid(header);
         }
@@ -110,13 +105,19 @@ namespace UniGame.StaticEcs.Network
         private static ushort Read16(ReadOnlySpan<byte> source, int offset) => (ushort)(source[offset] | source[offset + 1] << 8);
 
         private static bool IsValid(PacketHeader value) =>
-            value.Kind >= PacketKind.Hello && value.Kind <= PacketKind.Pong &&
+            IsKnownKind(value.Kind) &&
             (value.Flags == PacketFlags.ReliableOrdered ||
              value.Flags == PacketFlags.UnreliableSequenced) &&
             value.Compression == NetworkCompression.None && value.PayloadLength <= ProtocolLimits.MaxWirePayloadBytes;
+
+        private static bool IsKnownKind(PacketKind kind) => kind == PacketKind.Hello ||
+            kind == PacketKind.Ready || kind == PacketKind.CommandBatch ||
+            kind == PacketKind.FullSnapshot || kind == PacketKind.Ack ||
+            kind == PacketKind.ResyncRequest || kind == PacketKind.Disconnect ||
+            kind == PacketKind.Ping || kind == PacketKind.Pong;
     }
 
-    /// <summary>Encodes and validates exact Network v3 packets.</summary>
+    /// <summary>Encodes and validates exact Network v4 packets.</summary>
     public static class NetworkPacket
     {
         /// <summary>Frames one canonical payload with exact length and xxHash64.</summary>

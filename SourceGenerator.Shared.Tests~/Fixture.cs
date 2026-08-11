@@ -46,8 +46,8 @@ namespace UniGame.StaticEcs.Network
         public NetworkSchema<T> Freeze() { _entries.Sort((left, right) => left.Id.CompareTo(right.Id)); var versions = _entries.ConvertAll(value => value.Version).ToArray(); return new NetworkSchema<T>(string.Join(";", _entries), versions); }
     }
     public static class NetworkCompilerSupport { public static NetworkCompilerSchemaFactory<T> Create<T>() where T : struct, FFS.Libraries.StaticEcs.IWorldType => new NetworkCompilerSchemaFactory<T>(); public static byte ComponentVersion<T>() where T : struct, FFS.Libraries.StaticEcs.IComponent, FFS.Libraries.StaticEcs.IComponentConfig<T> => default(T).Config().Version ?? 0; public static byte EventVersion<T>() where T : struct, FFS.Libraries.StaticEcs.IEvent, FFS.Libraries.StaticEcs.IEventConfig<T> => default(T).Config().Version ?? 0; }
-    public struct NetworkCommandAccepted<T> : FFS.Libraries.StaticEcs.IEvent where T : struct, FFS.Libraries.StaticEcs.IEvent, INetworkCommand { }
-    public struct NetworkCommandRejected<T> : FFS.Libraries.StaticEcs.IEvent where T : struct, FFS.Libraries.StaticEcs.IEvent, INetworkCommand { }
+    public struct NetworkCommandAcceptedEvent<T> : FFS.Libraries.StaticEcs.IEvent where T : struct, FFS.Libraries.StaticEcs.IEvent, INetworkCommand { }
+    public struct NetworkCommandRejectedEvent<T> : FFS.Libraries.StaticEcs.IEvent where T : struct, FFS.Libraries.StaticEcs.IEvent, INetworkCommand { }
     public interface INetworkCommandPolicy<TWorld, TCommand> where TWorld : struct, FFS.Libraries.StaticEcs.IWorldType where TCommand : struct, FFS.Libraries.StaticEcs.IEvent, INetworkCommand { }
 }
 

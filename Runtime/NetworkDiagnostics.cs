@@ -8,27 +8,25 @@ namespace UniGame.StaticEcs.Network
     public enum NetworkPacketKind : byte
     {
         /// <summary>No packet is associated with the event.</summary>
-        None,
+        None = 0,
         /// <summary>A handshake hello packet.</summary>
-        Hello,
+        Hello = 1,
         /// <summary>A handshake ready packet.</summary>
-        Ready,
+        Ready = 2,
         /// <summary>A command batch packet.</summary>
-        CommandBatch,
+        CommandBatch = 3,
         /// <summary>A full snapshot packet.</summary>
-        FullSnapshot,
+        FullSnapshot = 4,
         /// <summary>An acknowledgement packet.</summary>
-        Ack,
+        Ack = 5,
         /// <summary>A resynchronization request packet.</summary>
-        ResyncRequest,
+        ResyncRequest = 6,
         /// <summary>A disconnect packet.</summary>
-        Disconnect,
-        /// <summary>A redundant continuous input batch.</summary>
-        InputBatch,
+        Disconnect = 7,
         /// <summary>A clock synchronization request.</summary>
-        Ping,
+        Ping = 9,
         /// <summary>A clock synchronization response.</summary>
-        Pong
+        Pong = 10
     }
     /// <summary>Identifies a measured networking phase.</summary>
     public enum NetworkPhase : byte
@@ -65,7 +63,7 @@ namespace UniGame.StaticEcs.Network
         Success,
         /// <summary>The operation was rejected.</summary>
         Rejected,
-        /// <summary>The input was malformed.</summary>
+        /// <summary>The packet or command was malformed.</summary>
         Malformed,
         /// <summary>The packet violated session, epoch, or sequence state.</summary>
         Protocol,
@@ -103,13 +101,13 @@ namespace UniGame.StaticEcs.Network
     {
         /// <summary>Creates one session diagnostics sample.</summary>
         public NetworkSessionDiagnostics(NetworkRole role, NetworkSessionState state, uint connectionId, uint peerId,
-            uint epoch, ScopeId scope, uint serverTick, uint acknowledgedSnapshotTick, uint acknowledgedCommandSequence,
+            uint epoch, ScopeId scope, uint serverTick, uint acknowledgedSnapshotTick, uint serverProcessedCommandSequence,
             uint nextSendCommandSequence, uint nextReceiveCommandSequence, uint nextReceivePacketSequence,
             uint nextSendPacketSequence)
         {
             Role = role; State = state; ConnectionId = connectionId; PeerId = peerId; Epoch = epoch; Scope = scope;
             ServerTick = serverTick; AcknowledgedSnapshotTick = acknowledgedSnapshotTick;
-            AcknowledgedCommandSequence = acknowledgedCommandSequence; NextSendCommandSequence = nextSendCommandSequence;
+            ServerProcessedCommandSequence = serverProcessedCommandSequence; NextSendCommandSequence = nextSendCommandSequence;
             NextReceiveCommandSequence = nextReceiveCommandSequence; NextReceivePacketSequence = nextReceivePacketSequence;
             NextSendPacketSequence = nextSendPacketSequence;
         }
@@ -130,8 +128,8 @@ namespace UniGame.StaticEcs.Network
         public uint ServerTick { get; }
         /// <summary>Gets the latest acknowledged snapshot tick.</summary>
         public uint AcknowledgedSnapshotTick { get; }
-        /// <summary>Gets the latest acknowledged command sequence.</summary>
-        public uint AcknowledgedCommandSequence { get; }
+        /// <summary>Gets the latest command sequence processed into authoritative state.</summary>
+        public uint ServerProcessedCommandSequence { get; }
         /// <summary>Gets the next command sequence assigned by this endpoint.</summary>
         public uint NextSendCommandSequence { get; }
         /// <summary>Gets the next command sequence accepted by this endpoint.</summary>

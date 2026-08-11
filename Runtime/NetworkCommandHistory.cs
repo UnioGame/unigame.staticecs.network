@@ -2,26 +2,26 @@ namespace UniGame.StaticEcs.Network
 {
     using System;
 
-    /// <summary>Stores one typed input together with its client sequence and target tick.</summary>
-    public readonly struct NetworkInputFrame<TInput>
-        where TInput : struct, INetworkInput
+    /// <summary>Stores one typed command together with its client sequence and target tick.</summary>
+    public readonly struct NetworkCommandFrame<TCommand>
+        where TCommand : struct, INetworkCommand
     {
-        /// <summary>Creates an immutable input frame.</summary>
-        public NetworkInputFrame(uint tick, uint sequence, in TInput input)
+        /// <summary>Creates an immutable command frame.</summary>
+        public NetworkCommandFrame(uint tick, uint sequence, in TCommand command)
         {
             Tick = tick;
             Sequence = sequence;
-            Input = input;
+            Command = command;
         }
 
         /// <summary>Gets the target authoritative tick.</summary>
         public uint Tick { get; }
 
-        /// <summary>Gets the monotonic client input sequence.</summary>
+        /// <summary>Gets the monotonic client command sequence.</summary>
         public uint Sequence { get; }
 
-        /// <summary>Gets the typed input value.</summary>
-        public TInput Input { get; }
+        /// <summary>Gets the typed command value.</summary>
+        public TCommand Command { get; }
     }
 
     /// <summary>Provides a bounded allocation-free tick-indexed state history.</summary>
@@ -84,40 +84,40 @@ namespace UniGame.StaticEcs.Network
         }
     }
 
-    /// <summary>Provides a bounded typed timeline for continuous network input.</summary>
-    public sealed class NetworkInputTimeline<TInput>
-        where TInput : struct, INetworkInput
+    /// <summary>Provides a bounded typed timeline for predicted network commands.</summary>
+    public sealed class NetworkCommandTimeline<TCommand>
+        where TCommand : struct, INetworkCommand
     {
-        private readonly PredictionHistory<NetworkInputFrame<TInput>> _history;
+        private readonly PredictionHistory<NetworkCommandFrame<TCommand>> _history;
 
         /// <summary>Creates a timeline with fixed tick capacity.</summary>
-        public NetworkInputTimeline(int capacity)
+        public NetworkCommandTimeline(int capacity)
         {
-            _history = new PredictionHistory<NetworkInputFrame<TInput>>(capacity);
+            _history = new PredictionHistory<NetworkCommandFrame<TCommand>>(capacity);
         }
 
         /// <summary>Gets the maximum number of retained ticks.</summary>
         public int Capacity => _history.Capacity;
 
-        /// <summary>Stores or replaces one input frame.</summary>
-        public void Store(in NetworkInputFrame<TInput> frame)
+        /// <summary>Stores or replaces one command frame.</summary>
+        public void Store(in NetworkCommandFrame<TCommand> frame)
         {
             _history.Store(frame.Tick, frame);
         }
 
-        /// <summary>Gets one input frame when its exact tick remains retained.</summary>
-        public bool TryGet(uint tick, out NetworkInputFrame<TInput> frame)
+        /// <summary>Gets one command frame when its exact tick remains retained.</summary>
+        public bool TryGet(uint tick, out NetworkCommandFrame<TCommand> frame)
         {
             return _history.TryGet(tick, out frame);
         }
 
-        /// <summary>Removes all input frames through the supplied tick.</summary>
+        /// <summary>Removes all command frames through the supplied tick.</summary>
         public void DiscardThrough(uint tick)
         {
             _history.DiscardThrough(tick);
         }
 
-        /// <summary>Clears all retained input frames.</summary>
+        /// <summary>Clears all retained command frames.</summary>
         public void Clear()
         {
             _history.Clear();
