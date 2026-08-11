@@ -22,16 +22,14 @@ Mark replicated state and the two kinds of client messages explicitly:
 ```csharp
 public struct PositionComponent : IComponent, INetworkType
 {
-    public int X;
-    public int Y;
-    public int Z;
+    public float X;
+    public float Y;
+    public float Z;
 
     public void Write<TWorld>(ref BinaryPackWriter writer, World<TWorld>.Entity self)
         where TWorld : struct, IWorldType
     {
-        writer.WriteInt(X);
-        writer.WriteInt(Y);
-        writer.WriteInt(Z);
+        writer.WriteFloat(X, Y, Z);
     }
 }
 
@@ -90,7 +88,7 @@ var client = new NetworkClient<ClientWorld>(simulator.Client, schema, scope,
     ticksPerSecond: 20, predictionLeadTicks: 3, inputRedundancy: 3);
 ```
 
-See the repository [network architecture guide](../../../docs/guides/network-static-ecs.md) for the game integration, prediction flow, and current production boundaries.
+See the repository [network architecture guide](../../../docs/guides/network-static-ecs.md) for the implementation maturity, game integration, prediction flow, and production boundaries. Use [Developing Client-Server Static ECS Features](../../../docs/guides/network-feature-development.md) when adding a new game feature.
 
 ## Configuration
 
