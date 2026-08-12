@@ -4,6 +4,7 @@
   "references": [
     "unigame.staticecs.network.protocol",
     "unigame.staticecs.network",
+    "Unity.PerformanceTesting",
     "FFS.StaticEcs",
     "FFS.StaticPack"
   ],

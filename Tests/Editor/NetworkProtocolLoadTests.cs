@@ -1,0 +1,285 @@
+namespace UniGame.StaticEcs.Network.Tests
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Diagnostics;
+    using NUnit.Framework;
+
+    /// <summary>Exercises deterministic multi-peer protocol traffic without creating gameplay worlds.</summary>
+    [TestFixture]
+    internal sealed class NetworkProtocolLoadTests
+    {
+        [TestCase(false, TestName = "Smoke_Immediate")]
+        [TestCase(true, TestName = "Smoke_Adverse")]
+        public void Smoke(bool adverse) => RunProfile("Smoke", 8, 250, 200, adverse);
+
+        [Test, Explicit, Category("NetworkLoad")]
+        public void Baseline() => RunProfile("Baseline", 32, 1_000, 400, true);
+
+        [Test, Explicit, Category("NetworkLoad")]
+        public void Capacity() => RunProfile("Capacity", 64, 2_000, 400, true);
+
+        private static void RunProfile(string name, int peerCount, int actorCount,
+            int ticks, bool adverse)
+        {
+            var allocationStart = GC.GetAllocatedBytesForCurrentThread();
+            var peers = CreatePeers(peerCount, adverse);
+            var tickSamples = new long[ticks];
+            var captureSamples = new long[ticks * peerCount];
+            var applySamples = new long[ticks * peerCount];
+            var actorPayload = new byte[4 + actorCount * 12];
+            var captureIndex = 0;
+            var applyIndex = 0;
+            long bytes = 0;
+            var expectedCommands = ticks;
+
+            try
+            {
+                Handshake(peers, ref bytes);
+                for (uint tick = 1; tick <= ticks; tick++)
+                {
+                    Write32(actorPayload, 0, tick);
+                    var tickStart = Stopwatch.GetTimestamp();
+                    for (var peerIndex = 0; peerIndex < peers.Count; peerIndex++)
+                    {
+                        var peer = peers[peerIndex];
+                        var command = CommandPayload(tick);
+                        var commandPacket = Encode(PacketKind.CommandBatch,
+                            PacketFlags.UnreliableSequenced, tick, tick, command);
+                        Assert.That(peer.Simulator.Client.TrySend(commandPacket), Is.True);
+                        bytes += commandPacket.Length;
+
+                        var captureStart = Stopwatch.GetTimestamp();
+                        var snapshot = Encode(PacketKind.FullSnapshot,
+                            PacketFlags.ReliableOrdered, tick + 1, tick, actorPayload);
+                        captureSamples[captureIndex] = ElapsedNanoseconds(captureStart);
+                        Assert.That(peer.Simulator.Server.TrySend(snapshot), Is.True);
+                        bytes += snapshot.Length;
+                        captureIndex++;
+                    }
+
+                    AdvanceAndDrain(peers, 50, applySamples, ref applyIndex, ref bytes);
+                    tickSamples[tick - 1] = ElapsedNanoseconds(tickStart);
+                }
+
+                for (var index = 0; index < 12; index++)
+                {
+                    var tick = (uint)ticks;
+                    foreach (var peer in peers)
+                    {
+                        var packet = Encode(PacketKind.CommandBatch,
+                            PacketFlags.UnreliableSequenced, tick + (uint)index + 1,
+                            tick, CommandPayload(tick));
+                        Assert.That(peer.Simulator.Client.TrySend(packet), Is.True);
+                        bytes += packet.Length;
+                    }
+                    AdvanceAndDrain(peers, 50, applySamples, ref applyIndex, ref bytes);
+                }
+                AdvanceAndDrain(peers, 500, applySamples, ref applyIndex, ref bytes);
+
+                long maxQueuedPackets = 0;
+                foreach (var peer in peers)
+                {
+                    Assert.That(peer.ProcessedCommands.Count,
+                        adverse
+                            ? Is.GreaterThanOrEqualTo(expectedCommands * 4 / 5)
+                            : Is.EqualTo(expectedCommands),
+                        "The adverse unreliable stream may lose ticks, but must remain bounded.");
+                    Assert.That(peer.ProcessedCommands, Does.Contain((uint)ticks),
+                        "Drain must converge on the latest held command state.");
+                    Assert.That(peer.ProcessedCommands.Count,
+                        Is.LessThanOrEqualTo(expectedCommands),
+                        "Duplicated packets must not apply a command twice.");
+                    Assert.That(peer.LastSnapshotTick, Is.EqualTo((uint)ticks));
+                    Assert.That(peer.ProtocolErrors, Is.Zero);
+                    var stats = peer.Simulator.CaptureStats();
+                    maxQueuedPackets = Math.Max(maxQueuedPackets,
+                        Math.Max(stats.ClientToServer.QueuedPackets,
+                            stats.ServerToClient.QueuedPackets));
+                    Assert.That(stats.ClientToServer.OverflowPackets, Is.Zero);
+                    Assert.That(stats.ServerToClient.OverflowPackets, Is.Zero);
+                    Assert.That(stats.ClientToServer.QueuedPackets, Is.Zero);
+                    Assert.That(stats.ServerToClient.QueuedPackets, Is.Zero);
+                }
+
+                var allocated = GC.GetAllocatedBytesForCurrentThread() - allocationStart;
+                TestContext.Progress.WriteLine(
+                    $"NetworkLoad {name} adverse={adverse} peers={peerCount} actors={actorCount} " +
+                    $"ticks={ticks} tick_p50_ns={Percentile(tickSamples, 0.50)} " +
+                    $"tick_p95_ns={Percentile(tickSamples, 0.95)} " +
+                    $"tick_p99_ns={Percentile(tickSamples, 0.99)} " +
+                    $"tick_max_ns={Percentile(tickSamples, 1.00)} " +
+                    $"capture_p95_ns={Percentile(captureSamples, 0.95)} " +
+                    $"apply_p95_ns={Percentile(applySamples, 0.95)} " +
+                    $"bytes_per_peer_tick={(double)bytes / peerCount / ticks:F1} " +
+                    $"commands={expectedCommands * peerCount} max_queue={maxQueuedPackets} " +
+                    $"protocol_errors=0 allocated_bytes={allocated}");
+            }
+            finally
+            {
+                foreach (var peer in peers)
+                    peer.Simulator.Dispose();
+            }
+        }
+
+        private static List<Peer> CreatePeers(int count, bool adverse)
+        {
+            var peers = new List<Peer>(count);
+            for (var index = 0; index < count; index++)
+            {
+                var config = NetworkSimulationPresets.Create(
+                    adverse ? NetworkSimulationPreset.Unstable : NetworkSimulationPreset.Immediate);
+                config.Seed = (uint)(7_919 + index * 17);
+                if (adverse)
+                {
+                    config.LatencyMilliseconds = 100 + index % 101;
+                    config.JitterMilliseconds = 50;
+                    config.LossProbability = 0.1f;
+                    config.DuplicateProbability = 0.05f;
+                    config.ReorderProbability = 0.1f;
+                    config.BandwidthBytesPerSecond = 8 * 1024 * 1024;
+                }
+                peers.Add(new Peer(new NetworkSimulator(
+                    new ConnectionId((uint)(index + 1)), in config)));
+            }
+            return peers;
+        }
+
+        private static void Handshake(IReadOnlyList<Peer> peers, ref long bytes)
+        {
+            foreach (var peer in peers)
+            {
+                var hello = Encode(PacketKind.Hello, PacketFlags.ReliableOrdered, 1, 0,
+                    ReadOnlySpan<byte>.Empty);
+                Assert.That(peer.Simulator.Client.TrySend(hello), Is.True);
+                bytes += hello.Length;
+            }
+            foreach (var peer in peers)
+            {
+                peer.Simulator.Advance(250);
+                Assert.That(peer.Simulator.Server.TryReceive(out var hello), Is.True);
+                Assert.That(NetworkPacket.TryDecode(hello, out var header, out _), Is.True);
+                Assert.That(header.Kind, Is.EqualTo(PacketKind.Hello));
+                var ready = Encode(PacketKind.Ready, PacketFlags.ReliableOrdered, 1, 0,
+                    ReadOnlySpan<byte>.Empty);
+                Assert.That(peer.Simulator.Server.TrySend(ready), Is.True);
+                bytes += ready.Length;
+                peer.Simulator.Advance(250);
+                Assert.That(peer.Simulator.Client.TryReceive(out var response), Is.True);
+                Assert.That(NetworkPacket.TryDecode(response, out header, out _), Is.True);
+                Assert.That(header.Kind, Is.EqualTo(PacketKind.Ready));
+            }
+        }
+
+        private static void AdvanceAndDrain(IReadOnlyList<Peer> peers, int milliseconds,
+            long[] applySamples, ref int applyIndex, ref long bytes)
+        {
+            foreach (var peer in peers)
+            {
+                peer.Simulator.Advance(milliseconds);
+                DrainServer(peer);
+                while (peer.Simulator.Client.TryReceive(out var snapshotPacket))
+                {
+                    var applyStart = Stopwatch.GetTimestamp();
+                    if (!NetworkPacket.TryDecode(snapshotPacket, out var header, out var payload) ||
+                        header.Kind != PacketKind.FullSnapshot || payload.Length < 4)
+                    {
+                        peer.ProtocolErrors++;
+                        continue;
+                    }
+                    peer.LastSnapshotTick = Read32(payload.Span, 0);
+                    if (applyIndex < applySamples.Length)
+                        applySamples[applyIndex++] = ElapsedNanoseconds(applyStart);
+                    var ack = Encode(PacketKind.Ack, PacketFlags.ReliableOrdered,
+                        ++peer.AckSequence, header.ServerTick, ReadOnlySpan<byte>.Empty);
+                    Assert.That(peer.Simulator.Client.TrySend(ack), Is.True);
+                    bytes += ack.Length;
+                }
+                peer.Simulator.Advance(milliseconds);
+                DrainServer(peer);
+            }
+        }
+
+        private static void DrainServer(Peer peer)
+        {
+            while (peer.Simulator.Server.TryReceive(out var packet))
+            {
+                if (!NetworkPacket.TryDecode(packet, out var header, out var payload))
+                {
+                    peer.ProtocolErrors++;
+                    continue;
+                }
+                if (header.Kind == PacketKind.Ack)
+                    continue;
+                if (header.Kind != PacketKind.CommandBatch || payload.Length % 4 != 0)
+                {
+                    peer.ProtocolErrors++;
+                    continue;
+                }
+                var span = payload.Span;
+                for (var offset = 0; offset < span.Length; offset += 4)
+                    peer.ProcessedCommands.Add(Read32(span, offset));
+            }
+        }
+
+        private static byte[] CommandPayload(uint tick)
+        {
+            var count = (int)Math.Min(4u, tick);
+            var payload = new byte[count * 4];
+            for (var index = 0; index < count; index++)
+                Write32(payload, index * 4, tick - (uint)index);
+            return payload;
+        }
+
+        private static byte[] Encode(PacketKind kind, PacketFlags flags, uint sequence,
+            uint tick, ReadOnlySpan<byte> payload)
+        {
+            var header = new PacketHeader
+            {
+                Kind = kind,
+                Flags = flags,
+                Compression = NetworkCompression.None,
+                SessionEpoch = 1,
+                PacketSequence = sequence,
+                ServerTick = tick,
+            };
+            Assert.That(NetworkPacket.TryEncode(header, payload, out var packet), Is.True);
+            return packet;
+        }
+
+        private static long ElapsedNanoseconds(long start) =>
+            (long)((Stopwatch.GetTimestamp() - start) *
+                   (1_000_000_000d / Stopwatch.Frequency));
+
+        private static long Percentile(long[] samples, double percentile)
+        {
+            var copy = (long[])samples.Clone();
+            Array.Sort(copy);
+            return copy[Math.Min(copy.Length - 1,
+                (int)Math.Ceiling(percentile * copy.Length) - 1)];
+        }
+
+        private static uint Read32(ReadOnlySpan<byte> source, int offset) =>
+            (uint)(source[offset] | source[offset + 1] << 8 |
+                   source[offset + 2] << 16 | source[offset + 3] << 24);
+
+        private static void Write32(Span<byte> destination, int offset, uint value)
+        {
+            destination[offset] = (byte)value;
+            destination[offset + 1] = (byte)(value >> 8);
+            destination[offset + 2] = (byte)(value >> 16);
+            destination[offset + 3] = (byte)(value >> 24);
+        }
+
+        private sealed class Peer
+        {
+            internal readonly NetworkSimulator Simulator;
+            internal readonly HashSet<uint> ProcessedCommands = new HashSet<uint>();
+            internal uint LastSnapshotTick;
+            internal uint AckSequence;
+            internal int ProtocolErrors;
+
+            internal Peer(NetworkSimulator simulator) => Simulator = simulator;
+        }
+    }
+}
