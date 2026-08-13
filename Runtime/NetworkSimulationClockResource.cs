@@ -39,29 +39,29 @@ namespace UniGame.StaticEcs.Network
             Fingerprint = CalculateFingerprint();
         }
 
-        /// <summary>Gets the complete shared simulation configuration.</summary>
-        public NetworkSimulationConfig Config { get; }
+        /// <summary>Complete shared simulation configuration.</summary>
+        public NetworkSimulationConfig Config;
 
-        /// <summary>Gets the fixed simulation frequency.</summary>
-        public int TicksPerSecond { get; }
+        /// <summary>Fixed simulation frequency.</summary>
+        public int TicksPerSecond;
 
-        /// <summary>Gets the duration of one simulation tick in seconds.</summary>
-        public float TickSeconds { get; }
+        /// <summary>Duration of one simulation tick in seconds.</summary>
+        public float TickSeconds;
 
-        /// <summary>Gets the number of prediction ticks retained by clients.</summary>
-        public int PredictionHistoryTicks { get; }
+        /// <summary>Number of prediction ticks retained by clients.</summary>
+        public int PredictionHistoryTicks;
 
-        /// <summary>Gets the number of authoritative ticks presentation renders behind.</summary>
-        public int InterpolationDelayTicks { get; }
+        /// <summary>Number of authoritative ticks presentation renders behind.</summary>
+        public int InterpolationDelayTicks;
 
-        /// <summary>Gets the number of previous command ticks repeated in each send.</summary>
-        public int CommandRedundancy { get; }
+        /// <summary>Number of previous command ticks repeated in each send.</summary>
+        public int CommandRedundancy;
 
-        /// <summary>Gets the maximum resimulation work allowed per rendered frame.</summary>
-        public float MaxResimulationMilliseconds { get; }
+        /// <summary>Maximum resimulation work allowed per rendered frame.</summary>
+        public float MaxResimulationMilliseconds;
 
-        /// <summary>Gets the deterministic wire fingerprint of all simulation settings.</summary>
-        public ulong Fingerprint { get; }
+        /// <summary>Deterministic wire fingerprint of all simulation settings.</summary>
+        public ulong Fingerprint;
 
         private ulong CalculateFingerprint()
         {
