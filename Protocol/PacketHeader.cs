@@ -121,21 +121,29 @@ namespace UniGame.StaticEcs.Network
     public static class NetworkPacket
     {
         /// <summary>Frames one canonical payload with exact length and xxHash64.</summary>
-        public static bool TryEncode(PacketHeader header, ReadOnlySpan<byte> payload, out byte[] packet)
+        public static bool TryEncode(NetworkBufferPool pool, PacketHeader header,
+            ReadOnlySpan<byte> payload, out NetworkBufferLease packet)
         {
             packet = null;
-            if (payload.Length > ProtocolLimits.MaxWirePayloadBytes) return false;
+            if (pool == null || payload.Length > ProtocolLimits.MaxWirePayloadBytes)
+                return false;
             header.PayloadLength = (uint)payload.Length;
             header.PayloadHash = Hashing.XxHash64(payload);
-            var bytes = new byte[PacketHeader.Size + payload.Length];
-            if (!header.TryWrite(bytes)) return false;
-            payload.CopyTo(bytes.AsSpan(PacketHeader.Size));
-            packet = bytes;
+            var lease = pool.Rent(checked(PacketHeader.Size + payload.Length));
+            if (!header.TryWrite(lease.WritableSpan))
+            {
+                lease.Dispose();
+                return false;
+            }
+            payload.CopyTo(lease.WritableSpan.Slice(PacketHeader.Size));
+            packet = lease;
             return true;
         }
 
         /// <summary>Validates framing, exact length, fingerprint and payload hash before exposing payload bytes.</summary>
-        public static bool TryDecode(byte[] packet, SchemaFingerprint expectedFingerprint, out PacketHeader header, out ReadOnlyMemory<byte> payload)
+        public static bool TryDecode(NetworkBufferLease packet,
+            SchemaFingerprint expectedFingerprint, out PacketHeader header,
+            out ReadOnlyMemory<byte> payload)
         {
             if (!TryDecode(packet, out header, out payload)) return false;
             if (header.SchemaFingerprint == expectedFingerprint) return true;
@@ -143,15 +151,17 @@ namespace UniGame.StaticEcs.Network
         }
 
         /// <summary>Validates framing, exact length and payload hash before handshake fingerprint admission.</summary>
-        public static bool TryDecode(byte[] packet, out PacketHeader header, out ReadOnlyMemory<byte> payload)
+        public static bool TryDecode(NetworkBufferLease packet, out PacketHeader header,
+            out ReadOnlyMemory<byte> payload)
         {
             header = default;
             payload = default;
-            if (packet == null || packet.Length < PacketHeader.Size || !PacketHeader.TryRead(packet, out header) ||
+            if (packet == null || packet.Length < PacketHeader.Size ||
+                !PacketHeader.TryRead(packet.Span, out header) ||
                 packet.Length != PacketHeader.Size + header.PayloadLength) return false;
-            var body = new ReadOnlySpan<byte>(packet, PacketHeader.Size, (int)header.PayloadLength);
+            var body = packet.Span.Slice(PacketHeader.Size, (int)header.PayloadLength);
             if (Hashing.XxHash64(body) != header.PayloadHash) return false;
-            payload = new ReadOnlyMemory<byte>(packet, PacketHeader.Size, (int)header.PayloadLength);
+            payload = packet.Memory.Slice(PacketHeader.Size, (int)header.PayloadLength);
             return true;
         }
     }

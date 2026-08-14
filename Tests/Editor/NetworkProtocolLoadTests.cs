@@ -9,6 +9,8 @@ namespace UniGame.StaticEcs.Network.Tests
     [TestFixture]
     internal sealed class NetworkProtocolLoadTests
     {
+        private static readonly NetworkBufferPool Buffers = new NetworkBufferPool(64L << 20);
+
         [TestCase(false, TestName = "Smoke_Immediate")]
         [TestCase(true, TestName = "Smoke_Adverse")]
         public void Smoke(bool adverse) => RunProfile("Smoke", 8, 250, 200, adverse);
@@ -46,15 +48,15 @@ namespace UniGame.StaticEcs.Network.Tests
                         var command = CommandPayload(tick);
                         var commandPacket = Encode(PacketKind.CommandBatch,
                             PacketFlags.UnreliableSequenced, tick, tick, command);
-                        Assert.That(peer.Simulator.Client.TrySend(commandPacket), Is.True);
                         bytes += commandPacket.Length;
+                        Assert.That(peer.Simulator.Client.TrySend(commandPacket), Is.True);
 
                         var captureStart = Stopwatch.GetTimestamp();
                         var snapshot = Encode(PacketKind.FullSnapshot,
                             PacketFlags.ReliableOrdered, tick + 1, tick, actorPayload);
                         captureSamples[captureIndex] = ElapsedNanoseconds(captureStart);
-                        Assert.That(peer.Simulator.Server.TrySend(snapshot), Is.True);
                         bytes += snapshot.Length;
+                        Assert.That(peer.Simulator.Server.TrySend(snapshot), Is.True);
                         captureIndex++;
                     }
 
@@ -70,8 +72,8 @@ namespace UniGame.StaticEcs.Network.Tests
                         var packet = Encode(PacketKind.CommandBatch,
                             PacketFlags.UnreliableSequenced, tick + (uint)index + 1,
                             tick, CommandPayload(tick));
-                        Assert.That(peer.Simulator.Client.TrySend(packet), Is.True);
                         bytes += packet.Length;
+                        Assert.That(peer.Simulator.Client.TrySend(packet), Is.True);
                     }
                     AdvanceAndDrain(peers, 50, applySamples, ref applyIndex, ref bytes);
                 }
@@ -151,8 +153,8 @@ namespace UniGame.StaticEcs.Network.Tests
             {
                 var hello = Encode(PacketKind.Hello, PacketFlags.ReliableOrdered, 1, 0,
                     ReadOnlySpan<byte>.Empty);
-                Assert.That(peer.Simulator.Client.TrySend(hello), Is.True);
                 bytes += hello.Length;
+                Assert.That(peer.Simulator.Client.TrySend(hello), Is.True);
             }
             foreach (var peer in peers)
             {
@@ -160,14 +162,16 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(peer.Simulator.Server.TryReceive(out var hello), Is.True);
                 Assert.That(NetworkPacket.TryDecode(hello, out var header, out _), Is.True);
                 Assert.That(header.Kind, Is.EqualTo(PacketKind.Hello));
+                hello.Dispose();
                 var ready = Encode(PacketKind.Ready, PacketFlags.ReliableOrdered, 1, 0,
                     ReadOnlySpan<byte>.Empty);
-                Assert.That(peer.Simulator.Server.TrySend(ready), Is.True);
                 bytes += ready.Length;
+                Assert.That(peer.Simulator.Server.TrySend(ready), Is.True);
                 peer.Simulator.Advance(250);
                 Assert.That(peer.Simulator.Client.TryReceive(out var response), Is.True);
                 Assert.That(NetworkPacket.TryDecode(response, out header, out _), Is.True);
                 Assert.That(header.Kind, Is.EqualTo(PacketKind.Ready));
+                response.Dispose();
             }
         }
 
@@ -180,20 +184,27 @@ namespace UniGame.StaticEcs.Network.Tests
                 DrainServer(peer);
                 while (peer.Simulator.Client.TryReceive(out var snapshotPacket))
                 {
-                    var applyStart = Stopwatch.GetTimestamp();
-                    if (!NetworkPacket.TryDecode(snapshotPacket, out var header, out var payload) ||
-                        header.Kind != PacketKind.FullSnapshot || payload.Length < 4)
+                    try
                     {
-                        peer.ProtocolErrors++;
-                        continue;
+                        var applyStart = Stopwatch.GetTimestamp();
+                        if (!NetworkPacket.TryDecode(snapshotPacket, out var header, out var payload) ||
+                            header.Kind != PacketKind.FullSnapshot || payload.Length < 4)
+                        {
+                            peer.ProtocolErrors++;
+                            continue;
+                        }
+                        peer.LastSnapshotTick = Read32(payload.Span, 0);
+                        if (applyIndex < applySamples.Length)
+                            applySamples[applyIndex++] = ElapsedNanoseconds(applyStart);
+                        var ack = Encode(PacketKind.Ack, PacketFlags.ReliableOrdered,
+                            ++peer.AckSequence, header.ServerTick, ReadOnlySpan<byte>.Empty);
+                        bytes += ack.Length;
+                        Assert.That(peer.Simulator.Client.TrySend(ack), Is.True);
                     }
-                    peer.LastSnapshotTick = Read32(payload.Span, 0);
-                    if (applyIndex < applySamples.Length)
-                        applySamples[applyIndex++] = ElapsedNanoseconds(applyStart);
-                    var ack = Encode(PacketKind.Ack, PacketFlags.ReliableOrdered,
-                        ++peer.AckSequence, header.ServerTick, ReadOnlySpan<byte>.Empty);
-                    Assert.That(peer.Simulator.Client.TrySend(ack), Is.True);
-                    bytes += ack.Length;
+                    finally
+                    {
+                        snapshotPacket.Dispose();
+                    }
                 }
                 peer.Simulator.Advance(milliseconds);
                 DrainServer(peer);
@@ -204,21 +215,28 @@ namespace UniGame.StaticEcs.Network.Tests
         {
             while (peer.Simulator.Server.TryReceive(out var packet))
             {
-                if (!NetworkPacket.TryDecode(packet, out var header, out var payload))
+                try
                 {
-                    peer.ProtocolErrors++;
-                    continue;
+                    if (!NetworkPacket.TryDecode(packet, out var header, out var payload))
+                    {
+                        peer.ProtocolErrors++;
+                        continue;
+                    }
+                    if (header.Kind == PacketKind.Ack)
+                        continue;
+                    if (header.Kind != PacketKind.CommandBatch || payload.Length % 4 != 0)
+                    {
+                        peer.ProtocolErrors++;
+                        continue;
+                    }
+                    var span = payload.Span;
+                    for (var offset = 0; offset < span.Length; offset += 4)
+                        peer.ProcessedCommands.Add(Read32(span, offset));
                 }
-                if (header.Kind == PacketKind.Ack)
-                    continue;
-                if (header.Kind != PacketKind.CommandBatch || payload.Length % 4 != 0)
+                finally
                 {
-                    peer.ProtocolErrors++;
-                    continue;
+                    packet.Dispose();
                 }
-                var span = payload.Span;
-                for (var offset = 0; offset < span.Length; offset += 4)
-                    peer.ProcessedCommands.Add(Read32(span, offset));
             }
         }
 
@@ -231,7 +249,8 @@ namespace UniGame.StaticEcs.Network.Tests
             return payload;
         }
 
-        private static byte[] Encode(PacketKind kind, PacketFlags flags, uint sequence,
+        private static NetworkBufferLease Encode(PacketKind kind, PacketFlags flags,
+            uint sequence,
             uint tick, ReadOnlySpan<byte> payload)
         {
             var header = new PacketHeader
@@ -243,7 +262,8 @@ namespace UniGame.StaticEcs.Network.Tests
                 PacketSequence = sequence,
                 ServerTick = tick,
             };
-            Assert.That(NetworkPacket.TryEncode(header, payload, out var packet), Is.True);
+            Assert.That(NetworkPacket.TryEncode(Buffers, header, payload,
+                out var packet), Is.True);
             return packet;
         }
 

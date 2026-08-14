@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using FFS.Libraries.StaticEcs;
+using FFS.Libraries.StaticPack;
 
 namespace UniGame.StaticEcs.Network
 {
@@ -104,11 +105,11 @@ namespace UniGame.StaticEcs.Network
     }
 
     /// <summary>Owns one immutable validated command payload.</summary>
-    public sealed class NetworkCommandEnvelope
+    public struct NetworkCommandEnvelope : IDisposable
     {
-        private readonly byte[] _payload;
+        private NetworkBufferLease _payload;
 
-        internal NetworkCommandEnvelope(ConnectionId connection, uint peer, uint epoch, uint sequence, uint targetTick, NetworkTypeId typeId, byte version, byte[] payload)
+        internal NetworkCommandEnvelope(ConnectionId connection, uint peer, uint epoch, uint sequence, uint targetTick, NetworkTypeId typeId, byte version, NetworkBufferLease payload)
         { Connection = connection; PeerId = peer; Epoch = epoch; Sequence = sequence; TargetTick = targetTick; TypeId = typeId; Version = version; _payload = payload ?? throw new ArgumentNullException(nameof(payload)); }
         /// <summary>Gets transport ownership.</summary>
         public ConnectionId Connection { get; }
@@ -125,8 +126,17 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Gets command hook version.</summary>
         public byte Version { get; }
         /// <summary>Gets immutable exact payload.</summary>
-        public ReadOnlyMemory<byte> Payload => _payload;
-        internal byte[] ExactPayload => _payload;
+        public ReadOnlyMemory<byte> Payload => _payload?.Memory ?? ReadOnlyMemory<byte>.Empty;
+        internal byte[] ExactBuffer => _payload?.Buffer;
+        internal int ExactOffset => _payload?.Offset ?? 0;
+        internal int ExactLength => _payload?.Length ?? 0;
+
+        /// <inheritdoc />
+        public void Dispose()
+        {
+            _payload?.Dispose();
+            _payload = null;
+        }
     }
 
     /// <summary>Owns all mutable state for one connection.</summary>
@@ -134,14 +144,18 @@ namespace UniGame.StaticEcs.Network
     {
         private readonly NetworkSchema<TWorld> _schema;
         private readonly INetworkObserver _observer;
+        private readonly NetworkBufferPool _bufferPool;
+        private int _commandWriteCapacity = 256;
         private uint _nextSendSequence = 1;
         private uint _nextReceiveSequence = 1;
         private uint _nextReceivePacketSequence = 1;
         private uint _lastReceiveCommandPacketSequence;
 
         /// <summary>Creates a handshaking per-connection session.</summary>
-        internal NetworkSession(ConnectionId connection, NetworkRole role, NetworkSchema<TWorld> schema, INetworkObserver observer = null)
-        { Connection = connection; Role = role; _schema = schema ?? throw new ArgumentNullException(nameof(schema)); _observer = observer; State = NetworkSessionState.Handshaking; }
+        internal NetworkSession(ConnectionId connection, NetworkRole role,
+            NetworkSchema<TWorld> schema, NetworkBufferPool bufferPool = null,
+            INetworkObserver observer = null)
+        { Connection = connection; Role = role; _schema = schema ?? throw new ArgumentNullException(nameof(schema)); _bufferPool = bufferPool ?? new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes); _observer = observer; State = NetworkSessionState.Handshaking; }
         /// <summary>Gets transport-owned connection.</summary>
         public ConnectionId Connection { get; }
         /// <summary>Gets endpoint role.</summary>
@@ -170,7 +184,7 @@ namespace UniGame.StaticEcs.Network
         internal NetworkCommandResult CreateCommand<TCommand>(in TCommand command, uint targetTick, out NetworkCommandEnvelope envelope)
             where TCommand : struct, IEvent, INetworkCommand
         {
-            envelope = null;
+            envelope = default;
             if (Role != NetworkRole.Client || State != NetworkSessionState.Established) return NetworkCommandResult.WrongSession;
             if (_nextSendSequence == uint.MaxValue) return NetworkCommandResult.Sequence;
             return CreateEnvelope(command, targetTick, _nextSendSequence++, out envelope);
@@ -180,13 +194,38 @@ namespace UniGame.StaticEcs.Network
             uint sequence, out NetworkCommandEnvelope envelope)
             where TCommand : struct, IEvent, INetworkCommand
         {
-            envelope = null;
+            envelope = default;
             var entries = _schema.RetainedEntries;
             for (var i = 0; i < entries.Length; i++)
             {
                 var entry = entries[i];
-                if (entry.Kind != NetworkSchemaKind.Command || entry.RuntimeType != typeof(TCommand) || entry.Invoker is not ICommandNetworkInvoker<TWorld> invoker) continue;
-                var payload = invoker.Capture(command, entry.MaxBytes);
+                if (entry.Kind != NetworkSchemaKind.Command ||
+                    entry.RuntimeType != typeof(TCommand) ||
+                    entry.Invoker is not ICommandNetworkInvoker<TWorld, TCommand> invoker)
+                    continue;
+                var payload = _bufferPool.Rent(_commandWriteCapacity);
+                var writer = BinaryPackWriter.Create(payload.Buffer);
+                try
+                {
+                    invoker.Write(in command, ref writer, entry.MaxBytes);
+                }
+                catch
+                {
+                    payload.Dispose();
+                    throw;
+                }
+                if (!ReferenceEquals(writer.Buffer, payload.Buffer))
+                {
+                    payload.Dispose();
+                    payload = _bufferPool.Adopt(writer.Buffer,
+                        checked((int)writer.Position));
+                }
+                else
+                {
+                    payload.SetLength(checked((int)writer.Position));
+                }
+                _commandWriteCapacity = Math.Max(_commandWriteCapacity,
+                    payload.Capacity);
                 envelope = new NetworkCommandEnvelope(Connection, PeerId, Epoch, sequence,
                     targetTick, entry.TypeId, entry.Version, payload);
                 return NetworkCommandResult.Queued;
@@ -197,9 +236,9 @@ namespace UniGame.StaticEcs.Network
         internal NetworkCommandResult Validate(NetworkCommandEnvelope envelope, uint serverTick, uint pastWindow, uint futureWindow, out NetworkSchemaEntry entry)
         {
             entry = null;
-            if (Role != NetworkRole.Server || State != NetworkSessionState.Established || envelope == null || envelope.Connection != Connection || envelope.PeerId != PeerId || envelope.Epoch != Epoch) return NetworkCommandResult.WrongSession;
+            if (Role != NetworkRole.Server || State != NetworkSessionState.Established || envelope.ExactBuffer == null || envelope.Connection != Connection || envelope.PeerId != PeerId || envelope.Epoch != Epoch) return NetworkCommandResult.WrongSession;
             if (envelope.TargetTick < serverTick - Math.Min(serverTick, pastWindow) || envelope.TargetTick > serverTick + futureWindow) return NetworkCommandResult.TickWindow;
-            if (!_schema.TryGet(envelope.TypeId, out entry) || entry.Kind != NetworkSchemaKind.Command || entry.Version != envelope.Version || envelope.ExactPayload.Length > entry.MaxBytes || entry.Invoker is not ICommandNetworkInvoker<TWorld> invoker || !invoker.HasPolicy) return NetworkCommandResult.SchemaMismatch;
+            if (!_schema.TryGet(envelope.TypeId, out entry) || entry.Kind != NetworkSchemaKind.Command || entry.Version != envelope.Version || envelope.ExactLength > entry.MaxBytes || entry.Invoker is not ICommandNetworkInvoker<TWorld> invoker || !invoker.HasPolicy) return NetworkCommandResult.SchemaMismatch;
             if (envelope.Sequence < _nextReceiveSequence) return NetworkCommandResult.Duplicate;
             if (envelope.Sequence == uint.MaxValue) return NetworkCommandResult.Sequence;
             _nextReceiveSequence = checked(envelope.Sequence + 1);
@@ -209,7 +248,9 @@ namespace UniGame.StaticEcs.Network
         internal NetworkCommandResult Dispatch(NetworkCommandEnvelope envelope, NetworkSchemaEntry entry)
         {
             var context = new NetworkCommandContext(PeerId, Epoch, envelope.Sequence, envelope.TargetTick);
-            return ((ICommandNetworkInvoker<TWorld>)entry.Invoker).Dispatch(envelope.ExactPayload, entry.Version, in context);
+            return ((ICommandNetworkInvoker<TWorld>)entry.Invoker).Dispatch(
+                envelope.ExactBuffer, envelope.ExactOffset, envelope.ExactLength,
+                entry.Version, in context);
         }
 
         internal PacketValidationResult ValidatePacket(in PacketHeader header)
@@ -298,17 +339,46 @@ namespace UniGame.StaticEcs.Network
         private readonly Dictionary<ScopeId, NetworkHistory<NetworkSnapshot>> _history = new Dictionary<ScopeId, NetworkHistory<NetworkSnapshot>>();
         private readonly List<PendingCommand> _commands = new List<PendingCommand>();
         private readonly Dictionary<ConnectionId, ProcessedCommandCursor> _processedCommands = new Dictionary<ConnectionId, ProcessedCommandCursor>();
+        private readonly Dictionary<ConnectionId, int> _pendingCommandCounts = new Dictionary<ConnectionId, int>();
+        private readonly Dictionary<ConnectionId, int> _pendingCommandBytes = new Dictionary<ConnectionId, int>();
         private readonly int _historyCapacity;
         private readonly long _historyBytes;
+        private readonly int _maxPendingCommandsPerPeer;
+        private readonly int _maxPendingBytesPerPeer;
+        private long _pendingCommandBytesTotal;
+        private int _pendingCommandsHighWater;
+        private long _pendingCommandBytesHighWater;
 
         /// <summary>Creates a server coordinator with bounded per-scope history.</summary>
-        internal NetworkServerCoordinator(int historyCapacity = 64, long historyBytes = 32 * 1024 * 1024)
+        internal NetworkServerCoordinator(int historyCapacity = 64,
+            long historyBytes = 32 * 1024 * 1024,
+            int maxPendingCommandsPerPeer = ProtocolLimits.MaxCommandsPerBatch * 3,
+            int maxPendingBytesPerPeer = ProtocolLimits.MaxWirePayloadBytes)
         {
             if (historyCapacity < 1) throw new ArgumentOutOfRangeException(nameof(historyCapacity));
             if (historyBytes < 1) throw new ArgumentOutOfRangeException(nameof(historyBytes));
+            if (maxPendingCommandsPerPeer < 1)
+                throw new ArgumentOutOfRangeException(nameof(maxPendingCommandsPerPeer));
+            if (maxPendingBytesPerPeer < 1)
+                throw new ArgumentOutOfRangeException(nameof(maxPendingBytesPerPeer));
             _historyCapacity = historyCapacity; _historyBytes = historyBytes;
+            _maxPendingCommandsPerPeer = maxPendingCommandsPerPeer;
+            _maxPendingBytesPerPeer = maxPendingBytesPerPeer;
         }
         internal int PendingCommandCount => _commands.Count;
+        internal long PendingCommandBytes => _pendingCommandBytesTotal;
+        internal int PendingCommandsHighWater => _pendingCommandsHighWater;
+        internal long PendingCommandBytesHighWater => _pendingCommandBytesHighWater;
+        internal long HistoryBytes
+        {
+            get
+            {
+                long bytes = 0;
+                foreach (var history in _history.Values)
+                    bytes += history.Bytes;
+                return bytes;
+            }
+        }
 
         /// <summary>Adds one independently owned per-connection session.</summary>
         internal void Add(NetworkSession<TWorld> session)
@@ -321,17 +391,51 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Removes one connection and its queued commands without touching shared capture history.</summary>
         internal bool Remove(ConnectionId connection)
         {
-            for (var i = _commands.Count - 1; i >= 0; i--) if (_commands[i].Session.Connection == connection) _commands.RemoveAt(i);
+            ScopeId scope = default;
+            if (_sessions.TryGetValue(connection, out var removedSession))
+                scope = removedSession.Scope;
+            for (var i = _commands.Count - 1; i >= 0; i--)
+            {
+                if (_commands[i].Session.Connection != connection)
+                    continue;
+                var envelope = _commands[i].Envelope;
+                DecrementPending(envelope);
+                envelope.Dispose();
+                _commands.RemoveAt(i);
+            }
+            _pendingCommandCounts.Remove(connection);
+            _pendingCommandBytes.Remove(connection);
             _processedCommands.Remove(connection);
-            return _sessions.Remove(connection);
+            var removed = _sessions.Remove(connection);
+            if (removed && !ScopeIsActive(scope) && _history.TryGetValue(scope, out var history))
+            {
+                history.Clear();
+                _history.Remove(scope);
+            }
+            return removed;
         }
 
         /// <summary>Validates and queues one command for canonical cross-peer ordering.</summary>
         internal NetworkCommandResult Queue(NetworkCommandEnvelope envelope, uint serverTick, uint pastWindow = 2, uint futureWindow = 8)
         {
-            if (envelope == null || !_sessions.TryGetValue(envelope.Connection, out var session)) return NetworkCommandResult.WrongSession;
+            if (envelope.ExactBuffer == null || !_sessions.TryGetValue(envelope.Connection, out var session)) return NetworkCommandResult.WrongSession;
+            _pendingCommandCounts.TryGetValue(envelope.Connection, out var count);
+            _pendingCommandBytes.TryGetValue(envelope.Connection, out var bytes);
+            if (count >= _maxPendingCommandsPerPeer ||
+                envelope.ExactLength > _maxPendingBytesPerPeer - bytes)
+                return NetworkCommandResult.LimitExceeded;
             var result = session.Validate(envelope, serverTick, pastWindow, futureWindow, out var entry);
-            if (result == NetworkCommandResult.Queued) _commands.Add(new PendingCommand(session, entry, envelope));
+            if (result == NetworkCommandResult.Queued)
+            {
+                _commands.Add(new PendingCommand(session, entry, envelope));
+                _pendingCommandCounts[envelope.Connection] = count + 1;
+                _pendingCommandBytes[envelope.Connection] = bytes + envelope.ExactLength;
+                _pendingCommandBytesTotal += envelope.ExactLength;
+                if (_commands.Count > _pendingCommandsHighWater)
+                    _pendingCommandsHighWater = _commands.Count;
+                if (_pendingCommandBytesTotal > _pendingCommandBytesHighWater)
+                    _pendingCommandBytesHighWater = _pendingCommandBytesTotal;
+            }
             return result;
         }
 
@@ -353,6 +457,9 @@ namespace UniGame.StaticEcs.Network
                         pending.Envelope.TargetTick,
                         pending.Envelope.Sequence);
                 }
+                DecrementPending(pending.Envelope);
+                var envelope = pending.Envelope;
+                envelope.Dispose();
             }
             if (summary.Total > 0) _commands.RemoveRange(0, summary.Total);
             return summary;
@@ -363,7 +470,7 @@ namespace UniGame.StaticEcs.Network
         {
             if (snapshot == null) throw new ArgumentNullException(nameof(snapshot));
             if (snapshot.Scope != scope) throw new InvalidOperationException("Snapshot scope does not match its history key.");
-            if (!_history.TryGetValue(scope, out var history)) { history = new NetworkHistory<NetworkSnapshot>(_historyCapacity, _historyBytes, value => value.ByteLength); _history.Add(scope, history); }
+            if (!_history.TryGetValue(scope, out var history)) { history = new NetworkHistory<NetworkSnapshot>(_historyCapacity, _historyBytes, value => value.ByteLength, value => value.Dispose()); _history.Add(scope, history); }
             history.Store(snapshot.ServerTick, snapshot);
         }
 
@@ -378,6 +485,44 @@ namespace UniGame.StaticEcs.Network
         internal int HistoryCount(ScopeId scope) => _history.TryGetValue(scope, out var history) ? history.Count : 0;
         internal long HistoryByteCount(ScopeId scope) => _history.TryGetValue(scope, out var history) ? history.Bytes : 0;
         internal NetworkHistory<NetworkSnapshot> History(ScopeId scope) => _history.TryGetValue(scope, out var history) ? history : null;
+
+        internal void Clear()
+        {
+            for (var i = 0; i < _commands.Count; i++)
+            {
+                var envelope = _commands[i].Envelope;
+                envelope.Dispose();
+            }
+            _commands.Clear();
+            _processedCommands.Clear();
+            _pendingCommandCounts.Clear();
+            _pendingCommandBytes.Clear();
+            _pendingCommandBytesTotal = 0;
+            _sessions.Clear();
+            foreach (var history in _history.Values)
+                history.Clear();
+            _history.Clear();
+        }
+
+        private void DecrementPending(in NetworkCommandEnvelope envelope)
+        {
+            var connection = envelope.Connection;
+            if (_pendingCommandCounts.TryGetValue(connection, out var count))
+                _pendingCommandCounts[connection] = Math.Max(0, count - 1);
+            if (_pendingCommandBytes.TryGetValue(connection, out var bytes))
+                _pendingCommandBytes[connection] = Math.Max(0,
+                    bytes - envelope.ExactLength);
+            _pendingCommandBytesTotal = Math.Max(0,
+                _pendingCommandBytesTotal - envelope.ExactLength);
+        }
+
+        private bool ScopeIsActive(ScopeId scope)
+        {
+            foreach (var session in _sessions.Values)
+                if (session.Scope == scope)
+                    return true;
+            return false;
+        }
 
         internal bool TryGetProcessedCommand(ConnectionId connection, out ProcessedCommandCursor cursor)
             => _processedCommands.TryGetValue(connection, out cursor);

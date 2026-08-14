@@ -79,6 +79,28 @@ namespace UniGame.StaticEcs.Network
         World
     }
 
+    /// <summary>Reports bounded endpoint memory and queue ownership.</summary>
+    public struct NetworkMemoryDiagnostics
+    {
+        /// <summary>Packet-buffer pool counters.</summary>
+        public NetworkBufferPoolDiagnostics Buffers;
+
+        /// <summary>Bytes retained by active snapshot histories.</summary>
+        public long HistoryBytes;
+
+        /// <summary>Commands retained for redundancy or authority dispatch.</summary>
+        public int PendingCommands;
+
+        /// <summary>Payload bytes retained by pending commands.</summary>
+        public long PendingCommandBytes;
+
+        /// <summary>Largest observed pending command count.</summary>
+        public int PendingCommandsHighWater;
+
+        /// <summary>Largest observed pending command payload byte count.</summary>
+        public long PendingCommandBytesHighWater;
+    }
+
     /// <summary>Receives bounded immutable network telemetry.</summary>
     public interface INetworkObserver
     {

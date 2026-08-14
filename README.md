@@ -12,7 +12,11 @@ Transport-neutral protocol, generated AOT-safe schemas, replication, and tick-in
 - Exposes `ServerProcessedCommandTick` and `ServerProcessedCommandSequence` for the last command actually processed by authority simulation in each snapshot.
 - Estimates the current server tick from validated server ticks, ping/pong round-trip time, and a configured prediction lead.
 - Maps authority GIDs to independently allocated replica GIDs and applies scoped snapshots transactionally.
-- Provides typed bounded command/state timelines and a deterministic adverse-link `NetworkSimulator`.
+- Exposes queryable connection, tick, clock, local-ownership, and replica-identity components for game integration.
+- Uses explicit pooled `NetworkBufferLease` ownership through packet encoding, transports, simulation, history, staging, and disposal.
+- Reuses snapshot descriptors and staged metadata so the warmed command/snapshot core
+  performs no managed allocation per tick.
+- Provides bounded tick-ring snapshot histories and a deterministic adverse-link `NetworkSimulator`.
 - Provides stable `NetworkPrefabId` and `SceneObjectId` value types without Unity dependencies.
 
 ## Usage
@@ -64,7 +68,7 @@ World<ClientWorld>.SendEvent(new UseAbilityCommand
 
 The owning Client feature explicitly registers `NetworkCommandSentEvent<UseAbilityCommand>` and installs `SendNetworkCommandSystem<TWorld, UseAbilityCommand>` before the shared flush. The source generator supplies the wire schema, serializer, decoder, and typed acceptance contracts. Server authorization policy, continuous-command cadence, prediction history, and gameplay handling remain explicit domain behavior and are not generated.
 
-The authority pipeline owns its tick boundary:
+The low-level authority endpoint owns its tick boundary:
 
 ```csharp
 server.Receive();
@@ -72,6 +76,10 @@ server.Tick(serverTick => RunAuthorityGameplay(serverTick));
 ```
 
 Due command events are emitted before the gameplay callback. A snapshot is captured after gameplay, so its state belongs to `Snapshot.ServerTick`; it also carries `ServerProcessedCommandTick` and `ServerProcessedCommandSequence` as acknowledgements. The processed-command cursor is not a prediction reconciliation base.
+
+Game integration normally calls `BeginTick` and `CompleteTick` from ordered ECS
+systems around authority gameplay. Runners advance world time only; they do not
+decode commands, apply snapshots, or invoke feature prediction directly.
 
 Declare generated endpoints in composition assemblies:
 
@@ -104,12 +112,18 @@ See the repository [network architecture guide](../../../docs/guides/network-sta
 
 ## Configuration
 
-- Package version `2026.4.0` implements wire protocol `4` only; v3 packets are rejected.
+- Package version `2026.6.0` implements wire protocol `4` only; v3 packets are rejected.
 - Every endpoint must use the same schema, simulation/config, and content/grid fingerprints.
 - Default locomotion configuration is owned by the game: 20 Hz, 64 history ticks, 2 interpolation ticks, 3 previous command ticks, and a 2 ms replay budget.
 - Snapshot history is bounded by both tick count and byte count.
+- Client and server buffer pools retain at most 32 MiB and 64 MiB by default.
+  `TrySend` always consumes its lease, including failure; a successful
+  `TryReceive` transfers ownership to the caller, which must dispose it.
+- `CaptureMemoryDiagnostics()` reports outstanding/retained/high-water pool bytes,
+  misses, snapshot-history bytes, and current/high-water pending command counts and
+  payload bytes without exposing packet contents.
 - `ScopeId` is server assigned. It controls visibility, not authority.
 - `NetworkOwnerComponent` is replicated metadata; policies trust only admitted `NetworkCommandContext` values.
 - `NetworkPrefabId` identifies a dynamic prefab asset. `SceneObjectId` identifies one authored scene instance.
 - Compression remains `None`; full snapshots remain the current baseline.
-- Production sockets, authentication, encryption, AOI cells, acknowledged delta baselines, MTU fragmentation, pooling, and congestion control are intentionally outside this package slice.
+- Production sockets, authentication, encryption, AOI cells, acknowledged delta baselines, MTU fragmentation, and congestion control are intentionally outside this package slice.

@@ -9,44 +9,55 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Gets transport-owned identity.</summary>
         ConnectionId Connection { get; }
         /// <summary>Sends an exact immutable packet copy.</summary>
-        bool TrySend(byte[] packet);
+        bool TrySend(NetworkBufferLease packet);
         /// <summary>Receives the next exact packet.</summary>
-        bool TryReceive(out byte[] packet);
+        bool TryReceive(out NetworkBufferLease packet);
     }
 
     /// <summary>Provides deterministic in-memory transport for tests and editor sandboxes.</summary>
     public sealed class MemoryNetworkTransport : INetworkTransport
     {
-        private readonly Queue<byte[]> _incoming;
-        private readonly Queue<byte[]> _outgoing;
+        private readonly Queue<NetworkBufferLease> _incoming;
+        private readonly Queue<NetworkBufferLease> _outgoing;
         private bool _disposed;
-        internal MemoryNetworkTransport(ConnectionId connection, Queue<byte[]> incoming, Queue<byte[]> outgoing) { Connection = connection; _incoming = incoming; _outgoing = outgoing; }
+        internal MemoryNetworkTransport(ConnectionId connection,
+            Queue<NetworkBufferLease> incoming, Queue<NetworkBufferLease> outgoing)
+        { Connection = connection; _incoming = incoming; _outgoing = outgoing; }
         /// <inheritdoc />
         public ConnectionId Connection { get; }
         /// <inheritdoc />
-        public bool TrySend(byte[] packet)
+        public bool TrySend(NetworkBufferLease packet)
         {
-            if (_disposed || packet == null) return false;
-            var copy = new byte[packet.Length];
-            packet.CopyTo(copy, 0);
-            _outgoing.Enqueue(copy);
+            if (_disposed || packet == null)
+            {
+                packet?.Dispose();
+                return false;
+            }
+            _outgoing.Enqueue(packet);
             return true;
         }
         /// <inheritdoc />
-        public bool TryReceive(out byte[] packet)
+        public bool TryReceive(out NetworkBufferLease packet)
         {
             if (!_disposed && _incoming.Count > 0) { packet = _incoming.Dequeue(); return true; }
             packet = null;
             return false;
         }
         /// <inheritdoc />
-        public void Dispose() => _disposed = true;
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+            _disposed = true;
+            while (_incoming.Count > 0)
+                _incoming.Dequeue().Dispose();
+        }
 
         /// <summary>Creates two connected endpoints for one transport connection.</summary>
         public static void CreatePair(ConnectionId connection, out MemoryNetworkTransport client, out MemoryNetworkTransport server)
         {
-            var clientIncoming = new Queue<byte[]>();
-            var serverIncoming = new Queue<byte[]>();
+            var clientIncoming = new Queue<NetworkBufferLease>();
+            var serverIncoming = new Queue<NetworkBufferLease>();
             client = new MemoryNetworkTransport(connection, clientIncoming, serverIncoming);
             server = new MemoryNetworkTransport(connection, serverIncoming, clientIncoming);
         }

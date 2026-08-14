@@ -195,8 +195,10 @@ namespace UniGame.StaticEcs.Network
         bool SupportsDisabled { get; }
         bool Has(World<TWorld>.Entity entity);
         bool IsDisabled(World<TWorld>.Entity entity);
-        byte[] Capture(World<TWorld>.Entity entity, uint maxBytes);
-        void Apply(World<TWorld>.Entity entity, byte[] payload, byte version, bool disabled);
+        void Write(World<TWorld>.Entity entity, ref BinaryPackWriter writer,
+            uint maxBytes);
+        void Apply(World<TWorld>.Entity entity, byte[] buffer, int offset,
+            int length, byte version, bool disabled);
         void Remove(World<TWorld>.Entity entity);
     }
 
@@ -220,25 +222,35 @@ namespace UniGame.StaticEcs.Network
         public virtual bool SupportsDisabled => false;
         public bool Has(World<TWorld>.Entity entity) => entity.Has<T>();
         public virtual bool IsDisabled(World<TWorld>.Entity entity) => false;
-        public byte[] Capture(World<TWorld>.Entity entity, uint maxBytes)
+        public void Write(World<TWorld>.Entity entity, ref BinaryPackWriter writer,
+            uint maxBytes)
         {
-            var writer = BinaryPackWriter.CreateFromPool(Math.Min(maxBytes, 512));
+            var start = writer.Position;
+            var value = entity.Read<T>();
+            value.Write<TWorld>(ref writer, entity);
+            if (writer.Position - start > maxBytes)
+                throw new InvalidOperationException(
+                    "Static ECS hook exceeded its generated protocol limit.");
+        }
+        public virtual void Apply(World<TWorld>.Entity entity, byte[] buffer,
+            int offset, int length, byte version, bool disabled)
+        {
+            var scratch = ArrayPool<byte>.Shared.Rent(length);
             try
             {
-                var value = entity.Read<T>();
-                value.Write<TWorld>(ref writer, entity);
-                if (writer.Position > maxBytes) throw new InvalidOperationException("Static ECS hook exceeded its generated protocol limit.");
-                return writer.CopyToBytes();
+                Buffer.BlockCopy(buffer, offset, scratch, 0, length);
+                var reader = new BinaryPackReader(scratch, (uint)length, 0);
+                var value = default(T);
+                value.Read<TWorld>(ref reader, entity, version, disabled);
+                if (reader.Position != length)
+                    throw new InvalidOperationException(
+                        "Static ECS hook did not consume the exact payload.");
+                entity.Set(value);
             }
-            finally { writer.Dispose(); }
-        }
-        public virtual void Apply(World<TWorld>.Entity entity, byte[] payload, byte version, bool disabled)
-        {
-            var reader = new BinaryPackReader(payload, (uint)payload.Length, 0);
-            var value = default(T);
-            value.Read<TWorld>(ref reader, entity, version, disabled);
-            if (reader.Position != payload.Length) throw new InvalidOperationException("Static ECS hook did not consume the exact payload.");
-            entity.Set(value);
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(scratch);
+            }
             if (disabled) throw new InvalidOperationException("A non-disableable component cannot carry disabled state.");
         }
         public void Remove(World<TWorld>.Entity entity) { if (entity.Has<T>()) entity.Delete<T>(); }
@@ -249,9 +261,10 @@ namespace UniGame.StaticEcs.Network
     {
         public override bool SupportsDisabled => true;
         public override bool IsDisabled(World<TWorld>.Entity entity) => entity.HasDisabled<T>();
-        public override void Apply(World<TWorld>.Entity entity, byte[] payload, byte version, bool disabled)
+        public override void Apply(World<TWorld>.Entity entity, byte[] buffer,
+            int offset, int length, byte version, bool disabled)
         {
-            base.Apply(entity, payload, version, false);
+            base.Apply(entity, buffer, offset, length, version, false);
             if (disabled) entity.Disable<T>(); else entity.Enable<T>();
         }
     }
@@ -262,37 +275,62 @@ namespace UniGame.StaticEcs.Network
         public bool SupportsDisabled => false;
         public bool Has(World<TWorld>.Entity entity) => entity.Has<T>();
         public bool IsDisabled(World<TWorld>.Entity entity) => false;
-        public byte[] Capture(World<TWorld>.Entity entity, uint maxBytes) => Array.Empty<byte>();
-        public void Apply(World<TWorld>.Entity entity, byte[] payload, byte version, bool disabled) { if (payload.Length != 0 || disabled) throw new InvalidOperationException("Tags have no payload or disabled state."); entity.Set<T>(); }
+        public void Write(World<TWorld>.Entity entity, ref BinaryPackWriter writer,
+            uint maxBytes) { }
+        public void Apply(World<TWorld>.Entity entity, byte[] buffer, int offset,
+            int length, byte version, bool disabled) { if (length != 0 || disabled) throw new InvalidOperationException("Tags have no payload or disabled state."); entity.Set<T>(); }
         public void Remove(World<TWorld>.Entity entity) { if (entity.Has<T>()) entity.Delete<T>(); }
     }
 
     internal interface ICommandNetworkInvoker<TWorld> where TWorld : struct, IWorldType
     {
         bool HasPolicy { get; }
-        byte[] Capture(object command, uint maxBytes);
-        NetworkCommandResult Dispatch(byte[] payload, byte version, in NetworkCommandContext context);
+        NetworkCommandResult Dispatch(byte[] buffer, int offset, int length,
+            byte version, in NetworkCommandContext context);
     }
 
-    internal class CommandNetworkInvoker<TWorld, T> : ICommandNetworkInvoker<TWorld>
+    internal interface ICommandNetworkInvoker<TWorld, T> :
+        ICommandNetworkInvoker<TWorld>
+        where TWorld : struct, IWorldType
+        where T : struct, IEvent, INetworkCommand
+    {
+        void Write(in T command, ref BinaryPackWriter writer, uint maxBytes);
+    }
+
+    internal class CommandNetworkInvoker<TWorld, T> :
+        ICommandNetworkInvoker<TWorld, T>
         where TWorld : struct, IWorldType where T : struct, IEvent, INetworkCommand
     {
         public virtual bool HasPolicy => false;
-        public byte[] Capture(object command, uint maxBytes)
+        public void Write(in T command, ref BinaryPackWriter writer, uint maxBytes)
         {
-            var value = (T)command;
-            var writer = BinaryPackWriter.CreateFromPool(Math.Min(maxBytes, 256));
-            try { value.Write(ref writer); if (writer.Position > maxBytes) throw new InvalidOperationException("Command hook exceeded its generated protocol limit."); return writer.CopyToBytes(); }
-            finally { writer.Dispose(); }
+            var start = writer.Position;
+            command.Write(ref writer);
+            if (writer.Position - start > maxBytes)
+                throw new InvalidOperationException(
+                    "Command hook exceeded its generated protocol limit.");
         }
-        public virtual NetworkCommandResult Dispatch(byte[] payload, byte version, in NetworkCommandContext context) => NetworkCommandResult.SchemaMismatch;
-        protected static T Read(byte[] payload, byte version)
+        public virtual NetworkCommandResult Dispatch(byte[] buffer, int offset,
+            int length, byte version, in NetworkCommandContext context) =>
+            NetworkCommandResult.SchemaMismatch;
+        protected static T Read(byte[] buffer, int offset, int length, byte version)
         {
-            var reader = new BinaryPackReader(payload, (uint)payload.Length, 0);
-            var value = default(T);
-            value.Read(ref reader, version);
-            if (reader.Position != payload.Length) throw new InvalidOperationException("Command hook did not consume the exact payload.");
-            return value;
+            var scratch = ArrayPool<byte>.Shared.Rent(length);
+            try
+            {
+                Buffer.BlockCopy(buffer, offset, scratch, 0, length);
+                var reader = new BinaryPackReader(scratch, (uint)length, 0);
+                var value = default(T);
+                value.Read(ref reader, version);
+                if (reader.Position != length)
+                    throw new InvalidOperationException(
+                        "Command hook did not consume the exact payload.");
+                return value;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(scratch);
+            }
         }
     }
 
@@ -300,9 +338,10 @@ namespace UniGame.StaticEcs.Network
         where TWorld : struct, IWorldType where T : struct, IEvent, INetworkCommand where TPolicy : struct, INetworkCommandPolicy<TWorld, T>
     {
         public override bool HasPolicy => true;
-        public override NetworkCommandResult Dispatch(byte[] payload, byte version, in NetworkCommandContext context)
+        public override NetworkCommandResult Dispatch(byte[] buffer, int offset,
+            int length, byte version, in NetworkCommandContext context)
         {
-            var command = Read(payload, version);
+            var command = Read(buffer, offset, length, version);
             var accepted = default(TPolicy).Authorize(in context, in command);
             if (accepted) World<TWorld>.SendEvent(new NetworkCommandAcceptedEvent<T> { Command = command, Context = context });
             else World<TWorld>.SendEvent(new NetworkCommandRejectedEvent<T> { Command = command, Context = context });

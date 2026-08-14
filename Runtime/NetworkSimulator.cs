@@ -186,7 +186,7 @@ namespace UniGame.StaticEcs.Network
             ClearQueues();
         }
 
-        private bool Send(NetworkSimulationDirection direction, byte[] packet)
+        private bool Send(NetworkSimulationDirection direction, NetworkBufferLease packet)
         {
             ThrowIfDisposed();
             if (packet == null)
@@ -198,13 +198,14 @@ namespace UniGame.StaticEcs.Network
             {
                 Record(Decision(direction, ordinal, packet.Length,
                     NetworkSimulationDecisionKind.Disconnected, _timeMilliseconds, false, false));
+                packet.Dispose();
                 return false;
             }
 
             if (_replaying)
                 return Replay(state, packet, ordinal);
 
-            bool reliableOrdered = PacketHeader.TryRead(packet, out var header) &&
+            bool reliableOrdered = PacketHeader.TryRead(packet.Span, out var header) &&
                                    header.Flags == PacketFlags.ReliableOrdered;
             var lost = !reliableOrdered && NextUnit() < _config.LossProbability;
             var duplicated = !reliableOrdered &&
@@ -218,20 +219,23 @@ namespace UniGame.StaticEcs.Network
                 state.LostPackets++;
                 Record(Decision(direction, ordinal, packet.Length,
                     NetworkSimulationDecisionKind.Lost, due, reordered, false));
+                packet.Dispose();
                 return true;
             }
 
-            if (!TrySchedule(state, packet, ordinal, 0, due, reordered))
+            if (!TrySchedule(state, packet, ordinal, 0, due, reordered, false))
             {
                 Record(Decision(direction, ordinal, packet.Length,
                     NetworkSimulationDecisionKind.Overflow, due, reordered, false));
+                packet.Dispose();
                 return false;
             }
 
             var duplicateScheduled = false;
             if (duplicated)
             {
-                duplicateScheduled = TrySchedule(state, packet, ordinal, 1, due, reordered);
+                duplicateScheduled = TrySchedule(state, packet, ordinal, 1, due,
+                    reordered, true);
                 if (duplicateScheduled)
                     state.DuplicatePackets++;
             }
@@ -243,13 +247,21 @@ namespace UniGame.StaticEcs.Network
             return true;
         }
 
-        private bool Replay(DirectionState state, byte[] packet, ulong ordinal)
+        private bool Replay(DirectionState state, NetworkBufferLease packet, ulong ordinal)
         {
             if (_replayIndex >= _replay.Count)
-                return ReplayMismatch(state.Direction, ordinal, packet.Length);
+            {
+                var mismatch = ReplayMismatch(state.Direction, ordinal, packet.Length);
+                packet.Dispose();
+                return mismatch;
+            }
             var decision = _replay[_replayIndex++];
             if (decision.Direction != state.Direction || decision.Ordinal != ordinal || decision.Bytes != packet.Length)
-                return ReplayMismatch(state.Direction, ordinal, packet.Length);
+            {
+                var mismatch = ReplayMismatch(state.Direction, ordinal, packet.Length);
+                packet.Dispose();
+                return mismatch;
+            }
 
             var replayed = decision;
             replayed.TimeMilliseconds = _timeMilliseconds;
@@ -257,27 +269,33 @@ namespace UniGame.StaticEcs.Network
             {
                 state.LostPackets++;
                 Record(replayed);
+                packet.Dispose();
                 return true;
             }
             if (decision.Kind == NetworkSimulationDecisionKind.Disconnected ||
                 decision.Kind == NetworkSimulationDecisionKind.ReplayMismatch)
             {
                 Record(replayed);
+                packet.Dispose();
                 return false;
             }
             if (decision.Kind == NetworkSimulationDecisionKind.Overflow)
             {
                 state.OverflowPackets++;
                 Record(replayed);
+                packet.Dispose();
                 return false;
             }
             var delay = Math.Max(0L, decision.ScheduledMilliseconds - decision.TimeMilliseconds);
             var due = checked(_timeMilliseconds + delay);
             replayed.ScheduledMilliseconds = due;
-            if (!TrySchedule(state, packet, ordinal, 0, due, decision.Reordered))
+            if (!TrySchedule(state, packet, ordinal, 0, due, decision.Reordered, false))
+            {
+                packet.Dispose();
                 return ReplayMismatch(state.Direction, ordinal, packet.Length);
+            }
             if (decision.Duplicated && !TrySchedule(state, packet, ordinal, 1,
-                    due, decision.Reordered))
+                    due, decision.Reordered, true))
                 return ReplayMismatch(state.Direction, ordinal, packet.Length);
             if (decision.Duplicated)
                 state.DuplicatePackets++;
@@ -295,8 +313,8 @@ namespace UniGame.StaticEcs.Network
             return false;
         }
 
-        private bool TrySchedule(DirectionState state, byte[] packet, ulong ordinal,
-            int duplicateIndex, long due, bool reordered)
+        private bool TrySchedule(DirectionState state, NetworkBufferLease packet,
+            ulong ordinal, int duplicateIndex, long due, bool reordered, bool retain)
         {
             if (state.QueuedPackets >= _config.MaxQueuedPackets ||
                 packet.Length > _config.MaxQueuedBytes - state.QueuedBytes)
@@ -305,9 +323,9 @@ namespace UniGame.StaticEcs.Network
                 return false;
             }
 
-            var copy = new byte[packet.Length];
-            packet.CopyTo(copy, 0);
-            var scheduled = new ScheduledPacket(copy, due, reordered ? -checked((long)ordinal) : 0,
+            var owned = retain ? packet.Retain() : packet;
+            var scheduled = new ScheduledPacket(owned, due,
+                reordered ? -checked((long)ordinal) : 0,
                 ordinal, duplicateIndex);
             state.Scheduled.Add(scheduled);
             state.QueuedPackets++;
@@ -316,7 +334,8 @@ namespace UniGame.StaticEcs.Network
             return true;
         }
 
-        private bool Receive(NetworkSimulationDirection direction, out byte[] packet)
+        private bool Receive(NetworkSimulationDirection direction,
+            out NetworkBufferLease packet)
         {
             ThrowIfDisposed();
             var state = State(direction);
@@ -491,17 +510,20 @@ namespace UniGame.StaticEcs.Network
 
             public ConnectionId Connection => _owner._connection;
 
-            public bool TrySend(byte[] packet)
+            public bool TrySend(NetworkBufferLease packet)
             {
                 if (_disposed)
+                {
+                    packet?.Dispose();
                     return false;
+                }
                 var direction = _client
                     ? NetworkSimulationDirection.ClientToServer
                     : NetworkSimulationDirection.ServerToClient;
                 return _owner.Send(direction, packet);
             }
 
-            public bool TryReceive(out byte[] packet)
+            public bool TryReceive(out NetworkBufferLease packet)
             {
                 if (_disposed)
                 {
@@ -521,7 +543,8 @@ namespace UniGame.StaticEcs.Network
         {
             internal readonly NetworkSimulationDirection Direction;
             internal readonly List<ScheduledPacket> Scheduled = new List<ScheduledPacket>();
-            internal readonly Queue<byte[]> Ready = new Queue<byte[]>();
+            internal readonly Queue<NetworkBufferLease> Ready =
+                new Queue<NetworkBufferLease>();
             internal ulong Ordinal;
             internal int QueuedPackets;
             internal long QueuedBytes;
@@ -554,8 +577,11 @@ namespace UniGame.StaticEcs.Network
 
             internal void ClearQueues()
             {
+                for (var i = 0; i < Scheduled.Count; i++)
+                    Scheduled[i].Packet.Dispose();
+                while (Ready.Count > 0)
+                    Ready.Dequeue().Dispose();
                 Scheduled.Clear();
-                Ready.Clear();
                 QueuedPackets = 0;
                 QueuedBytes = 0;
                 BandwidthTokens = 0;
@@ -576,13 +602,14 @@ namespace UniGame.StaticEcs.Network
 
         private readonly struct ScheduledPacket
         {
-            internal readonly byte[] Packet;
+            internal readonly NetworkBufferLease Packet;
             internal readonly long DueMilliseconds;
             internal readonly long ReorderPriority;
             internal readonly ulong Ordinal;
             internal readonly int DuplicateIndex;
 
-            internal ScheduledPacket(byte[] packet, long dueMilliseconds, long reorderPriority,
+            internal ScheduledPacket(NetworkBufferLease packet, long dueMilliseconds,
+                long reorderPriority,
                 ulong ordinal, int duplicateIndex)
             {
                 Packet = packet;

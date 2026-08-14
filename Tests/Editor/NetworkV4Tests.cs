@@ -9,6 +9,8 @@ namespace UniGame.StaticEcs.Network.Tests
 {
     public sealed class NetworkV4Tests
     {
+        private static readonly NetworkBufferPool Buffers = new NetworkBufferPool(64L << 20);
+
         [Test]
         public void TypeIdsAndPacketHeaderAreCanonicalV4AndRejectV3()
         {
@@ -42,9 +44,13 @@ namespace UniGame.StaticEcs.Network.Tests
             bytes[10] = 1;
             Assert.That(PacketHeader.TryRead(bytes, out _), Is.False);
             header.Kind = PacketKind.Hello;
-            Assert.That(NetworkPacket.TryEncode(header, new byte[] { 1, 2, 3 }, out var packet), Is.True);
-            packet[packet.Length - 1] ^= 1;
+            Assert.That(NetworkPacket.TryEncode(Buffers, header, new byte[] { 1, 2, 3 }, out var packet), Is.True);
+            var corruptBytes = packet.Memory.ToArray();
+            packet.Dispose();
+            corruptBytes[corruptBytes.Length - 1] ^= 1;
+            packet = Buffers.Copy(corruptBytes);
             Assert.That(NetworkPacket.TryDecode(packet, header.SchemaFingerprint, out _, out _), Is.False);
+            packet.Dispose();
         }
 
         [Test]
@@ -52,9 +58,9 @@ namespace UniGame.StaticEcs.Network.Tests
         {
             var config = NetworkSimulationPresets.Create(
                 NetworkSimulationPreset.Immediate);
-            var first = new NetworkSimulationClockResource(in config);
-            var second = new NetworkSimulationClockResource(20, 64, 2, 3, 2f);
-            var changed = new NetworkSimulationClockResource(30, 64, 2, 3, 2f);
+            var first = new NetworkSimulationConfigResource(in config);
+            var second = new NetworkSimulationConfigResource(20, 64, 2, 3, 2f);
+            var changed = new NetworkSimulationConfigResource(30, 64, 2, 3, 2f);
 
             Assert.That(first.Config.TicksPerSecond, Is.EqualTo(20));
             Assert.That(first.Fingerprint, Is.EqualTo(second.Fingerprint));
@@ -80,12 +86,14 @@ namespace UniGame.StaticEcs.Network.Tests
         public void TwoClientsKeepQueuesAndPacketsIsolated()
         {
             using var mock = new TwoClientNetworkMock();
-            Assert.That(mock.ClientA.TrySend(new byte[] { 1 }), Is.True);
-            Assert.That(mock.ClientB.TrySend(new byte[] { 2 }), Is.True);
+            Assert.That(mock.ClientA.TrySend(Lease(new byte[] { 1 })), Is.True);
+            Assert.That(mock.ClientB.TrySend(Lease(new byte[] { 2 })), Is.True);
             Assert.That(mock.ServerA.TryReceive(out var first), Is.True);
             Assert.That(mock.ServerB.TryReceive(out var second), Is.True);
-            CollectionAssert.AreEqual(new byte[] { 1 }, first);
-            CollectionAssert.AreEqual(new byte[] { 2 }, second);
+            CollectionAssert.AreEqual(new byte[] { 1 }, first.Memory.ToArray());
+            CollectionAssert.AreEqual(new byte[] { 2 }, second.Memory.ToArray());
+            first.Dispose();
+            second.Dispose();
         }
 
         [Test]
@@ -275,7 +283,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     client.Process();
                     server.Receive();
 
-                    byte[] latestPacket = null;
+                    NetworkBufferLease latestPacket = null;
                     for (uint tick = 2; tick <= 6; tick++)
                     {
                         var command = new TestCommand { Value = (int)tick };
@@ -347,7 +355,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     var malformedPayload = new byte[validPayload.Length + 5];
                     validPayload.Span.CopyTo(malformedPayload);
                     malformedPayload[0] = 2;
-                    Assert.That(NetworkPacket.TryEncode(header, malformedPayload,
+                    Assert.That(NetworkPacket.TryEncode(Buffers, header, malformedPayload,
                         out var malformedPacket), Is.True);
                     Assert.That(clientTransport.TrySend(malformedPacket), Is.True);
                     server.Receive();
@@ -361,7 +369,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     Write32(oversizedPayload, 14,
                         ProtocolLimits.MaxCommandBytes + 1u);
                     header.PacketSequence = 2;
-                    Assert.That(NetworkPacket.TryEncode(header, oversizedPayload,
+                    Assert.That(NetworkPacket.TryEncode(Buffers, header, oversizedPayload,
                         out var oversizedPacket), Is.True);
                     Assert.That(clientTransport.TrySend(oversizedPacket), Is.True);
                     server.Receive();
@@ -414,7 +422,7 @@ namespace UniGame.StaticEcs.Network.Tests
 
                     var disconnect = Packet(PacketKind.Disconnect, 9, 3);
                     disconnect.SchemaFingerprint = clientSchema.Fingerprint;
-                    Assert.That(NetworkPacket.TryEncode(disconnect, ReadOnlySpan<byte>.Empty,
+                    Assert.That(NetworkPacket.TryEncode(Buffers, disconnect, ReadOnlySpan<byte>.Empty,
                         out var packet), Is.True);
                     Assert.That(serverTransport.TrySend(packet), Is.True);
                     client.Process();
@@ -443,7 +451,8 @@ namespace UniGame.StaticEcs.Network.Tests
             Assert.That(bytes.TryGet(1, out _), Is.False);
             Assert.That(bytes.Bytes, Is.EqualTo(2));
             var coordinator = new NetworkServerCoordinator<TestWorld>(2);
-            var capture = new NetworkSnapshot(7, default, new ScopeId(9), new byte[] { 1 }, 0, 0);
+            var capture = new NetworkSnapshot(7, default, new ScopeId(9),
+                Lease(new byte[] { 1 }), 0, 0);
             coordinator.StoreCapture(new ScopeId(9), capture);
             Assert.That(coordinator.TryGetCapture(new ScopeId(9), 7, out var retained), Is.True);
             Assert.That(retained, Is.SameAs(capture));
@@ -519,7 +528,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(clientA.AcknowledgedSnapshotTick, Is.EqualTo(3));
                 Assert.That(clientA.ServerProcessedCommandSequence, Is.EqualTo(1));
 
-                Assert.That(mock.ServerA.TrySend(new byte[] { 1, 2, 3 }), Is.True);
+                Assert.That(mock.ServerA.TrySend(Lease(new byte[] { 1, 2, 3 })), Is.True);
                 clientA.Process();
                 Assert.That(clientA.ResyncRequested, Is.True);
 
@@ -620,7 +629,9 @@ namespace UniGame.StaticEcs.Network.Tests
 
                 var malformed = new byte[snapshot.ByteLength - 1];
                 snapshot.Bytes.Span.Slice(0, malformed.Length).CopyTo(malformed);
-                var bad = new NetworkSnapshot(1, snapshot.SchemaFingerprint, snapshot.Scope, malformed, snapshot.EntityCount, snapshot.RecordCount);
+                var bad = new NetworkSnapshot(1, snapshot.SchemaFingerprint,
+                    snapshot.Scope, Lease(malformed), snapshot.EntityCount,
+                    snapshot.RecordCount);
                 Assert.That(apply.Stage(bad, out _), Is.Not.EqualTo(SnapshotApplyResult.Success));
                 Assert.That(local.Read<TestComponent>().Value, Is.EqualTo(99));
             }
@@ -714,14 +725,14 @@ namespace UniGame.StaticEcs.Network.Tests
                         ServerTick = 7,
                         SchemaFingerprint = clientSchema.Fingerprint
                     };
-                    Assert.That(NetworkPacket.TryEncode(nonSnapshot, ReadOnlySpan<byte>.Empty, out var nonSnapshotPacket), Is.True);
+                    Assert.That(NetworkPacket.TryEncode(Buffers, nonSnapshot, ReadOnlySpan<byte>.Empty, out var nonSnapshotPacket), Is.True);
                     Assert.That(serverTransport.TrySend(nonSnapshotPacket), Is.True);
                     client.Process();
                     Assert.That(client.ServerTick, Is.EqualTo(7));
                     Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(1));
                     nonSnapshot.PacketSequence = 4;
                     nonSnapshot.ServerTick = 3;
-                    Assert.That(NetworkPacket.TryEncode(nonSnapshot, ReadOnlySpan<byte>.Empty, out var olderTickPacket), Is.True);
+                    Assert.That(NetworkPacket.TryEncode(Buffers, nonSnapshot, ReadOnlySpan<byte>.Empty, out var olderTickPacket), Is.True);
                     Assert.That(serverTransport.TrySend(olderTickPacket), Is.True);
                     client.Process();
                     Assert.That(client.ServerTick, Is.EqualTo(7), "validated non-snapshot ticks must not regress the authoritative cursor");
@@ -767,7 +778,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(dispatch.ActiveConnections, Is.EqualTo(3)); Assert.That(dispatch.ActivePeers, Is.EqualTo(2));
 
                     var disconnect = Packet(PacketKind.Disconnect, 5, 3); disconnect.SchemaFingerprint = serverSchema.Fingerprint;
-                    Assert.That(NetworkPacket.TryEncode(disconnect, ReadOnlySpan<byte>.Empty, out var packet), Is.True);
+                    Assert.That(NetworkPacket.TryEncode(Buffers, disconnect, ReadOnlySpan<byte>.Empty, out var packet), Is.True);
                     Assert.That(clientTransport.TrySend(packet), Is.True); server.Receive();
                     Assert.That(session.State, Is.EqualTo(NetworkSessionState.Closed));
                     var decoded = observer.Single(NetworkPhase.Decode, NetworkPacketKind.Disconnect);
@@ -826,9 +837,11 @@ namespace UniGame.StaticEcs.Network.Tests
                 var client = new NetworkReplicator<ClientAWorld>(schema, new ScopeId(1));
 
                 Assert.That(NetworkClient<ClientAWorld>.DiagnosticResult(client.Stage(null, out _)), Is.EqualTo(NetworkResultCategory.Limits));
-                var wrongScope = new NetworkSnapshot(1, schema.Fingerprint, new ScopeId(2), Array.Empty<byte>(), 0, 0);
+                var wrongScope = new NetworkSnapshot(1, schema.Fingerprint,
+                    new ScopeId(2), Lease(Array.Empty<byte>()), 0, 0);
                 Assert.That(NetworkClient<ClientAWorld>.DiagnosticResult(client.Stage(wrongScope, out _)), Is.EqualTo(NetworkResultCategory.Schema));
-                var malformed = new NetworkSnapshot(1, schema.Fingerprint, new ScopeId(1), new byte[] { 0, 0, 0, 0, 1 }, 0, 0);
+                var malformed = new NetworkSnapshot(1, schema.Fingerprint,
+                    new ScopeId(1), Lease(new byte[] { 0, 0, 0, 0, 1 }), 0, 0);
                 Assert.That(NetworkClient<ClientAWorld>.DiagnosticResult(client.Stage(malformed, out _)), Is.EqualTo(NetworkResultCategory.Malformed));
                 Assert.That(client.Stage(capture, out var staged), Is.EqualTo(SnapshotApplyResult.Success));
                 Assert.That(client.Apply(staged), Is.EqualTo(SnapshotApplyResult.Success));
@@ -886,7 +899,9 @@ namespace UniGame.StaticEcs.Network.Tests
                 var bytes = snapshot.Bytes.ToArray();
                 Assert.That(bytes.Length, Is.GreaterThan(40));
                 bytes[40] = 1; // second sorted record is TestTag; byte 40 is its disabled flag.
-                var malformed = new NetworkSnapshot(snapshot.ServerTick, snapshot.SchemaFingerprint, snapshot.Scope, bytes, snapshot.EntityCount, snapshot.RecordCount);
+                var malformed = new NetworkSnapshot(snapshot.ServerTick,
+                    snapshot.SchemaFingerprint, snapshot.Scope, Lease(bytes),
+                    snapshot.EntityCount, snapshot.RecordCount);
                 var apply = new NetworkReplicator<ClientAWorld>(Schema<ClientAWorld>(false), new ScopeId(5));
                 Assert.That(apply.Stage(malformed, out _), Is.EqualTo(SnapshotApplyResult.Malformed));
                 Assert.That(entity.GID.TryUnpack<ClientAWorld>(out _), Is.False);
@@ -1120,6 +1135,70 @@ namespace UniGame.StaticEcs.Network.Tests
             }
         }
 
+        [Test]
+        public void WarmCommandAndSnapshotCoreAllocatesNoManagedMemoryPerTick()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            var pool = new NetworkBufferPool(4L << 20);
+            MemoryNetworkTransport.CreatePair(new ConnectionId(801),
+                out var clientTransport, out var serverTransport);
+            var server = new NetworkServer<AuthorityWorld>(Schema<AuthorityWorld>(true),
+                static (_, _) => true, bufferPool: pool);
+            var client = new NetworkClient<ClientAWorld>(clientTransport,
+                Schema<ClientAWorld>(false), new ScopeId(1), bufferPool: pool);
+            try
+            {
+                var authority = World<AuthorityWorld>.NewEntity<TestEntity>();
+                authority.Set(new TestComponent { Value = 1 });
+                server.AddConnection(serverTransport, 1, 1, new ScopeId(1));
+                client.BeginHandshake();
+                server.Receive();
+                server.BeginTick();
+                server.CompleteTick();
+                client.Process();
+
+                for (uint tick = 2; tick < 130; tick++)
+                    RunCoreTick(client, server, tick);
+
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+                var before = GC.GetAllocatedBytesForCurrentThread();
+                for (uint tick = 130; tick < 1_130; tick++)
+                    RunCoreTick(client, server, tick);
+                var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+                Assert.That(allocated, Is.Zero);
+                Assert.That(client.CaptureMemoryDiagnostics().PendingCommands,
+                    Is.LessThanOrEqualTo(4));
+                Assert.That(server.CaptureMemoryDiagnostics().PendingCommands,
+                    Is.Zero);
+            }
+            finally
+            {
+                client.Dispose();
+                server.Dispose();
+                clientTransport.Dispose();
+                serverTransport.Dispose();
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                pool.Dispose();
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        private static void RunCoreTick(NetworkClient<ClientAWorld> client,
+            NetworkServer<AuthorityWorld> server, uint tick)
+        {
+            client.QueueCommand(new TestCommand { Value = (int)tick }, tick, out _);
+            client.FlushCommands(tick);
+            server.Receive();
+            server.BeginTick();
+            server.CompleteTick();
+            client.Process();
+        }
+
         private static void CreateReplicationWorld<TWorld>(bool server) where TWorld : struct, IWorldType
         {
             World<TWorld>.Create(WorldConfig.Default());
@@ -1152,6 +1231,11 @@ namespace UniGame.StaticEcs.Network.Tests
             SessionEpoch = epoch,
             PacketSequence = sequence
         };
+
+        private static NetworkBufferLease Lease(ReadOnlySpan<byte> source)
+        {
+            return Buffers.Copy(source);
+        }
 
         private static uint Read32(ReadOnlySpan<byte> source, int offset) =>
             (uint)(source[offset] | source[offset + 1] << 8 |

@@ -87,6 +87,16 @@ namespace UniGame.StaticEcs.Network
         }
     }
 
+    /// <summary>Links one local replica to its authoritative entity identity.</summary>
+    public struct NetworkReplicaIdentityComponent : IComponent
+    {
+        /// <summary>Authoritative source entity identifier.</summary>
+        public EntityGID AuthorityGid;
+
+        /// <summary>Generated network entity-kind identifier.</summary>
+        public NetworkTypeId KindId;
+    }
+
     /// <summary>Contains trusted command ordering and authorization data.</summary>
     public readonly struct NetworkCommandContext
     {

@@ -4,10 +4,10 @@ namespace UniGame.StaticEcs.Network
     using FFS.Libraries.StaticEcs;
 
     /// <summary>Provides the shared authoritative and predicted simulation timing contract.</summary>
-    public sealed class NetworkSimulationClockResource : IResource
+    public sealed class NetworkSimulationConfigResource : IResource
     {
         /// <summary>Creates validated simulation timing settings.</summary>
-        public NetworkSimulationClockResource(
+        public NetworkSimulationConfigResource(
             int ticksPerSecond,
             int predictionHistoryTicks = 64,
             int interpolationDelayTicks = 2,
@@ -25,7 +25,7 @@ namespace UniGame.StaticEcs.Network
         }
 
         /// <summary>Creates the clock resource from one shared simulation configuration.</summary>
-        public NetworkSimulationClockResource(in NetworkSimulationConfig config)
+        public NetworkSimulationConfigResource(in NetworkSimulationConfig config)
         {
             if (config.TicksPerSecond <= 0)
                 throw new ArgumentException("Simulation config is not initialized.", nameof(config));

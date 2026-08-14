@@ -5,6 +5,8 @@ namespace UniGame.StaticEcs.Network.Tests
 {
     internal sealed class NetworkSimulatorTests
     {
+        private static readonly NetworkBufferPool Buffers = new NetworkBufferPool(1 << 20);
+
         [Test]
         public void SameSeedProducesSameDecisionsAndDelivery()
         {
@@ -37,7 +39,8 @@ namespace UniGame.StaticEcs.Network.Tests
             Assert.That(simulator.Server.TryReceive(out _), Is.False);
             simulator.Advance(1);
             Assert.That(simulator.Server.TryReceive(out var packet), Is.True);
-            Assert.That(packet[0], Is.EqualTo(1));
+            Assert.That(packet.Span[0], Is.EqualTo(1));
+            packet.Dispose();
         }
 
         [Test]
@@ -47,12 +50,13 @@ namespace UniGame.StaticEcs.Network.Tests
             config.BandwidthBytesPerSecond = 10;
             using var simulator = new NetworkSimulator(new ConnectionId(3), in config);
 
-            Assert.That(simulator.Client.TrySend(new byte[15]), Is.True);
+            Assert.That(simulator.Client.TrySend(Bytes(15)), Is.True);
             simulator.Advance(1000);
             Assert.That(simulator.Server.TryReceive(out _), Is.False);
             simulator.Advance(500);
             Assert.That(simulator.Server.TryReceive(out var packet), Is.True);
             Assert.That(packet.Length, Is.EqualTo(15));
+            packet.Dispose();
         }
 
         [Test]
@@ -64,9 +68,9 @@ namespace UniGame.StaticEcs.Network.Tests
             config.MaxQueuedBytes = 4;
             using var simulator = new NetworkSimulator(new ConnectionId(4), in config);
 
-            Assert.That(simulator.Client.TrySend(new byte[2]), Is.True);
-            Assert.That(simulator.Client.TrySend(new byte[2]), Is.True);
-            Assert.That(simulator.Client.TrySend(new byte[1]), Is.False);
+            Assert.That(simulator.Client.TrySend(Bytes(2)), Is.True);
+            Assert.That(simulator.Client.TrySend(Bytes(2)), Is.True);
+            Assert.That(simulator.Client.TrySend(Bytes(1)), Is.False);
 
             var stats = simulator.CaptureStats().ClientToServer;
             Assert.That(stats.QueuedPackets, Is.EqualTo(2));
@@ -87,7 +91,8 @@ namespace UniGame.StaticEcs.Network.Tests
 
             simulator.SetPaused(false);
             simulator.Advance(0);
-            Assert.That(simulator.Server.TryReceive(out _), Is.True);
+            Assert.That(simulator.Server.TryReceive(out var resumed), Is.True);
+            resumed.Dispose();
         }
 
         [Test]
@@ -123,7 +128,8 @@ namespace UniGame.StaticEcs.Network.Tests
             simulator.Advance(14);
             Assert.That(simulator.Server.TryReceive(out _), Is.False);
             simulator.Advance(20);
-            Assert.That(simulator.Server.TryReceive(out _), Is.True);
+            Assert.That(simulator.Server.TryReceive(out var replayed), Is.True);
+            replayed.Dispose();
             Assert.That(simulator.CaptureStats().ReplayErrors, Is.Zero);
         }
 
@@ -164,8 +170,10 @@ namespace UniGame.StaticEcs.Network.Tests
             simulator.Advance(10);
             Assert.That(simulator.Server.TryReceive(out var serverPacket), Is.True);
             Assert.That(simulator.Client.TryReceive(out var clientPacket), Is.True);
-            Assert.That(serverPacket[0], Is.EqualTo(1));
-            Assert.That(clientPacket[0], Is.EqualTo(2));
+            Assert.That(serverPacket.Span[0], Is.EqualTo(1));
+            Assert.That(clientPacket.Span[0], Is.EqualTo(2));
+            serverPacket.Dispose();
+            clientPacket.Dispose();
         }
 
         [Test]
@@ -182,13 +190,21 @@ namespace UniGame.StaticEcs.Network.Tests
             Assert.That(simulator.CaptureStats().ServerToClient.DeliveredPackets, Is.EqualTo(1));
         }
 
-        private static byte[] Packet(int value) => new[] { (byte)value };
+        private static NetworkBufferLease Packet(int value)
+        {
+            return Buffers.Copy(new[] { (byte)value });
+        }
+
+        private static NetworkBufferLease Bytes(int length) => Buffers.Rent(length);
 
         private static List<byte> ReadAll(INetworkTransport transport)
         {
             var result = new List<byte>();
             while (transport.TryReceive(out var packet))
-                result.Add(packet[0]);
+            {
+                result.Add(packet.Span[0]);
+                packet.Dispose();
+            }
             return result;
         }
     }
