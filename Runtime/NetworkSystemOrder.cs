@@ -9,8 +9,12 @@ namespace UniGame.StaticEcs.Network
         public const int ClientReceive = -31000;
         /// <summary>Projects client session and local ownership into ECS data.</summary>
         public const int ClientStateProjection = -30000;
-        /// <summary>Runs feature-owned reconciliation after authoritative apply.</summary>
+        /// <summary>Initializes entity-owned prediction state after ownership projection.</summary>
+        public const int ClientPredictionInitialization = -29500;
+        /// <summary>Runs shared reconciliation after authoritative apply.</summary>
         public const int ClientReconciliation = -29000;
+        /// <summary>Advances shared prediction after feature command histories are recorded.</summary>
+        public const int ClientPredictionAdvance = 1120;
         /// <summary>Flushes gameplay commands after feature-owned command senders.</summary>
         public const int ClientCommandFlush = 1200;
         /// <summary>Sends clock synchronization after command flushing.</summary>
