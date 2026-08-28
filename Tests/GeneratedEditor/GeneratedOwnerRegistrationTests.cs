@@ -3,8 +3,8 @@ using UniGame.StaticEcs.Network;
 using NUnit.Framework;
 using UniGame.StaticEcs.Network.GeneratedTests.Shared;
 
-[assembly: UniGame.StaticEcs.Network.NetworkEndpoint("OwnerAuthority", typeof(UniGame.StaticEcs.Network.GeneratedTests.OwnerAuthorityWorld), UniGame.StaticEcs.Network.NetworkRole.Server, typeof(NetworkOwnerComponent))]
-[assembly: UniGame.StaticEcs.Network.NetworkEndpoint("OwnerReplica", typeof(UniGame.StaticEcs.Network.GeneratedTests.OwnerReplicaWorld), UniGame.StaticEcs.Network.NetworkRole.Client, typeof(NetworkOwnerComponent))]
+[assembly: UniGame.StaticEcs.Network.NetworkEndpoint("OwnerAuthority", typeof(UniGame.StaticEcs.Network.GeneratedTests.OwnerAuthorityWorld), UniGame.StaticEcs.Network.NetworkRole.Server, typeof(GeneratedOwnerEntity), typeof(NetworkOwnerComponent))]
+[assembly: UniGame.StaticEcs.Network.NetworkEndpoint("OwnerReplica", typeof(UniGame.StaticEcs.Network.GeneratedTests.OwnerReplicaWorld), UniGame.StaticEcs.Network.NetworkRole.Client, typeof(GeneratedOwnerEntity), typeof(NetworkOwnerComponent))]
 
 namespace UniGame.StaticEcs.Network.GeneratedTests
 {

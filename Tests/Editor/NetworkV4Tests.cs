@@ -997,7 +997,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(client.SendCommand(new TestCommand { Value = 5 }, 8), Is.EqualTo(NetworkCommandResult.Queued));
                     var commandDiagnostics = clientObserver.Sessions[clientObserver.Sessions.Count - 1];
                     Assert.That(commandDiagnostics.ServerTick, Is.EqualTo(7));
-                    Assert.That(commandDiagnostics.NextSendPacketSequence, Is.EqualTo(3));
+                    Assert.That(commandDiagnostics.NextSendPacketSequence, Is.EqualTo(5));
                 }
             }
             finally { World<AuthorityWorld>.Destroy(); World<ClientAWorld>.Destroy(); }
