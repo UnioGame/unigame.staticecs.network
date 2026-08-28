@@ -24,11 +24,13 @@ namespace UniGame.StaticEcs.Network
     public sealed class NetworkEndpointAttribute : Attribute
     {
         /// <summary>Creates an endpoint declaration.</summary>
-        public NetworkEndpointAttribute(string name, Type worldType, NetworkRole role)
+        public NetworkEndpointAttribute(string name, Type worldType, NetworkRole role,
+            params Type[] rootTypes)
         {
             Name = name ?? throw new ArgumentNullException(nameof(name));
             WorldType = worldType ?? throw new ArgumentNullException(nameof(worldType));
             Role = role;
+            RootTypes = rootTypes ?? Array.Empty<Type>();
         }
 
         /// <summary>Gets the generated endpoint identifier.</summary>
@@ -37,6 +39,8 @@ namespace UniGame.StaticEcs.Network
         public Type WorldType { get; }
         /// <summary>Gets the endpoint role.</summary>
         public NetworkRole Role { get; }
+        /// <summary>Gets the explicit root types whose assemblies contribute wire contracts.</summary>
+        public Type[] RootTypes { get; }
     }
 
     /// <summary>Marks a generated world-neutral manifest for compiler aggregation.</summary>

@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Collections.Immutable;
 using System.Linq;
 using System.Text;
 using Microsoft.CodeAnalysis;
@@ -48,9 +47,9 @@ namespace UniGame.StaticEcs.Network.Generator
             if (records.Count == 0 && !hasEndpoints) return;
             var referenced = CollectReferenced(compilation, context);
             if (hasEndpoints) foreach (var record in records) context.ReportDiagnostic(Diagnostic.Create(SharedOnly, record.Symbol.Locations.FirstOrDefault(), record.Symbol.ToDisplayString()));
-            ValidateCollisions(records.Concat(referenced), context);
+            ValidateCollisions(records, context);
             EmitManifest(records, context);
-            EmitEndpoints(compilation, records, referenced, context);
+            EmitEndpoints(compilation, referenced, context);
         }
 
         private static void CollectTypes(INamespaceSymbol ns, string assemblyName, List<Record> records, SourceProductionContext context)
@@ -91,7 +90,7 @@ namespace UniGame.StaticEcs.Network.Generator
             var metadataName = MetadataName(type);
             var id = Hash(Encoding.UTF8.GetBytes(assemblyName + ":" + metadataName));
             if (id == 0) { context.ReportDiagnostic(Diagnostic.Create(ZeroId, type.Locations.FirstOrDefault(), type.ToDisplayString())); return; }
-            records.Add(new Record(id, shapes[0], type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), metadataName, 0, type));
+            records.Add(new Record(id, shapes[0], type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), metadataName, 0, type, type.ContainingAssembly));
         }
 
         private static List<Record> CollectReferenced(Compilation compilation, SourceProductionContext context)
@@ -105,10 +104,41 @@ namespace UniGame.StaticEcs.Network.Generator
                 var kind = (Kind)Convert.ToInt32(attribute.ConstructorArguments[1].Value);
                 var type = attribute.ConstructorArguments[2].Value as INamedTypeSymbol;
                 var version = attribute.ConstructorArguments.Length > 3 ? (byte)attribute.ConstructorArguments[3].Value : (byte)0;
-                if (id == 0) { context.ReportDiagnostic(Diagnostic.Create(ZeroId, Location.None, type?.ToDisplayString() ?? "<unknown>")); continue; }
-                if (type != null) records.Add(new Record(id, kind, type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), MetadataName(type), version, type));
+                if (type != null) records.Add(new Record(id, kind, type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), MetadataName(type), version, type, reference));
             }
             return records;
+        }
+
+        private static List<Record> SelectReferenced(List<Record> referenced, AttributeData endpoint)
+        {
+            var assemblies = new List<IAssemblySymbol>();
+            if (endpoint.ConstructorArguments.Length > 3)
+            {
+                var roots = endpoint.ConstructorArguments[3];
+                if (roots.Kind == TypedConstantKind.Array)
+                    foreach (var root in roots.Values)
+                        if (root.Value is INamedTypeSymbol symbol) AddRootAssembly(assemblies, symbol);
+                else if (roots.Value is INamedTypeSymbol singleRoot) AddRootAssembly(assemblies, singleRoot);
+            }
+            var records = new List<Record>();
+            foreach (var record in referenced)
+                if (record.OriginAssembly != null && assemblies.Any(assembly => SymbolEqualityComparer.Default.Equals(assembly, record.OriginAssembly)))
+                    records.Add(record);
+            return records;
+        }
+
+        private static void AddRootAssembly(List<IAssemblySymbol> assemblies, INamedTypeSymbol root)
+        {
+            if (root.ContainingAssembly == null || assemblies.Any(assembly => SymbolEqualityComparer.Default.Equals(assembly, root.ContainingAssembly))) return;
+            assemblies.Add(root.ContainingAssembly);
+        }
+
+        private static void ReportZeroIds(IEnumerable<Record> records, SourceProductionContext context)
+        {
+            var reported = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var record in records)
+                if (record.Id == 0 && reported.Add(record.TypeName))
+                    context.ReportDiagnostic(Diagnostic.Create(ZeroId, record.Symbol.Locations.FirstOrDefault(), record.TypeName));
         }
 
         private static void ValidateCollisions(IEnumerable<Record> source, SourceProductionContext context)
@@ -134,26 +164,30 @@ namespace UniGame.StaticEcs.Network.Generator
             context.AddSource("NetworkManifest.g.cs", SourceText.From(source.ToString(), Encoding.UTF8));
         }
 
-        private static void EmitEndpoints(Compilation compilation, List<Record> local, List<Record> referenced, SourceProductionContext context)
+        private static void EmitEndpoints(Compilation compilation, List<Record> referenced, SourceProductionContext context)
         {
             var endpoints = compilation.Assembly.GetAttributes().Where(a => a.AttributeClass?.ToDisplayString() == EndpointAttribute).ToArray();
             var names = new HashSet<string>(StringComparer.Ordinal);
             foreach (var endpoint in endpoints)
             {
-                if (endpoint.ConstructorArguments.Length != 3) continue;
+                if (endpoint.ConstructorArguments.Length < 3) continue;
                 var name = endpoint.ConstructorArguments[0].Value as string ?? string.Empty;
                 var world = endpoint.ConstructorArguments[1].Value as INamedTypeSymbol;
                 var role = Convert.ToInt32(endpoint.ConstructorArguments[2].Value);
                 if (!Microsoft.CodeAnalysis.CSharp.SyntaxFacts.IsValidIdentifier(name) || !names.Add(name)) { context.ReportDiagnostic(Diagnostic.Create(InvalidEndpoint, Location.None, name)); continue; }
                 if (world == null || world.TypeKind != TypeKind.Struct || !Implements(world, "FFS.Libraries.StaticEcs.IWorldType")) { context.ReportDiagnostic(Diagnostic.Create(EndpointWorld, Location.None, name)); continue; }
+                var selected = SelectReferenced(referenced, endpoint);
+                ReportZeroIds(selected, context);
+                selected.RemoveAll(record => record.Id == 0);
+                ValidateCollisions(selected, context);
                 var source = new StringBuilder("// <auto-generated/>\npublic static class Generated").Append(name).Append("Network\n{\n");
                 var worldName = world.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
                 source.Append("    public static global::UniGame.StaticEcs.Network.NetworkSchema<").Append(worldName).Append("> CreateSchema()\n    {\n")
                     .Append("        var factory = global::UniGame.StaticEcs.Network.NetworkCompilerSupport.Create<").Append(worldName).Append(">();\n");
-                foreach (var record in local.Concat(referenced).GroupBy(r => r.TypeName).Select(g => g.First()).OrderBy(r => r.Kind).ThenBy(r => r.Id)) AppendRegistration(source, record, "factory", 8);
+                foreach (var record in selected.GroupBy(r => r.TypeName).Select(g => g.First()).OrderBy(r => r.Kind).ThenBy(r => r.Id)) AppendRegistration(source, record, "factory", 8);
                 if (role == 2)
                 {
-                    var commands = local.Concat(referenced).Where(r => r.Kind == Kind.Command).GroupBy(r => r.TypeName).Select(g => g.First()).ToArray();
+                    var commands = selected.Where(r => r.Kind == Kind.Command).GroupBy(r => r.TypeName).Select(g => g.First()).ToArray();
                     var policies = CollectPolicies(compilation.Assembly.GlobalNamespace, world);
                     foreach (var command in commands)
                     {
@@ -162,11 +196,16 @@ namespace UniGame.StaticEcs.Network.Generator
                         else if (matches.Length > 1) context.ReportDiagnostic(Diagnostic.Create(DuplicatePolicy, Location.None, name, command.MetadataName));
                     }
                     foreach (var policy in policies) if (!commands.Any(c => c.TypeName == policy.CommandName)) context.ReportDiagnostic(Diagnostic.Create(UnknownPolicy, policy.Type.Locations.FirstOrDefault(), policy.Type.ToDisplayString(), policy.CommandName));
-                    AppendPolicies(policies, source);
+                    AppendPolicies(policies.Where(policy => commands.Any(command => command.TypeName == policy.CommandName)), source);
                 }
                 source.Append("        return factory.Freeze();\n    }\n")
                     .Append("    public static void RegisterTypes(global::FFS.Libraries.StaticEcs.World<").Append(worldName).Append(">.TypeRegistrar registrar)\n    {\n");
-                if (role == 2) AppendPolicyEvents(CollectPolicies(compilation.Assembly.GlobalNamespace, world), source);
+                if (role == 2)
+                {
+                    var commands = selected.Where(record => record.Kind == Kind.Command).Select(record => record.TypeName).ToArray();
+                    AppendPolicyEvents(CollectPolicies(compilation.Assembly.GlobalNamespace, world)
+                        .Where(policy => commands.Contains(policy.CommandName)), source);
+                }
                 source.Append("    }\n}\n");
                 context.AddSource("Generated" + name + "Network.g.cs", SourceText.From(source.ToString(), Encoding.UTF8));
             }
@@ -266,8 +305,8 @@ namespace UniGame.StaticEcs.Network.Generator
         private enum Kind { Entity, Component, Tag, Link, Links, Multi, Command }
         private readonly struct Record
         {
-            internal Record(uint id, Kind kind, string typeName, string metadataName, byte version, INamedTypeSymbol symbol) { Id = id; Kind = kind; TypeName = typeName; MetadataName = metadataName; Version = version; Symbol = symbol; }
-            internal uint Id { get; } internal Kind Kind { get; } internal string TypeName { get; } internal string MetadataName { get; } internal byte Version { get; } internal INamedTypeSymbol Symbol { get; }
+            internal Record(uint id, Kind kind, string typeName, string metadataName, byte version, INamedTypeSymbol symbol, IAssemblySymbol originAssembly) { Id = id; Kind = kind; TypeName = typeName; MetadataName = metadataName; Version = version; Symbol = symbol; OriginAssembly = originAssembly; }
+            internal uint Id { get; } internal Kind Kind { get; } internal string TypeName { get; } internal string MetadataName { get; } internal byte Version { get; } internal INamedTypeSymbol Symbol { get; } internal IAssemblySymbol OriginAssembly { get; }
         }
         private readonly struct Policy { internal Policy(INamedTypeSymbol type, string commandName) { Type = type; CommandName = commandName; } internal INamedTypeSymbol Type { get; } internal string CommandName { get; } }
     }

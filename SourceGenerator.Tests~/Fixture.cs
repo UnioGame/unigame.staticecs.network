@@ -1,5 +1,5 @@
-[assembly: UniGame.StaticEcs.Network.NetworkEndpointAttribute("Client", typeof(Demo.ClientWorld), UniGame.StaticEcs.Network.NetworkRole.Client)]
-[assembly: UniGame.StaticEcs.Network.NetworkEndpointAttribute("Server", typeof(Demo.ServerWorld), UniGame.StaticEcs.Network.NetworkRole.Server)]
+[assembly: UniGame.StaticEcs.Network.NetworkEndpointAttribute("Client", typeof(Demo.ClientWorld), UniGame.StaticEcs.Network.NetworkRole.Client, typeof(Shared.Move))]
+[assembly: UniGame.StaticEcs.Network.NetworkEndpointAttribute("Server", typeof(Demo.ServerWorld), UniGame.StaticEcs.Network.NetworkRole.Server, typeof(Shared.Move))]
 
 namespace Demo
 {

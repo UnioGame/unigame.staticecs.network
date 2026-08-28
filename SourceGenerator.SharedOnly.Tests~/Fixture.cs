@@ -1,4 +1,4 @@
-[assembly: UniGame.StaticEcs.Network.NetworkEndpoint("Local", typeof(InvalidSharedOnly.LocalWorld), UniGame.StaticEcs.Network.NetworkRole.Client)]
+[assembly: UniGame.StaticEcs.Network.NetworkEndpoint("Local", typeof(InvalidSharedOnly.LocalWorld), UniGame.StaticEcs.Network.NetworkRole.Client, typeof(Shared.Move))]
 namespace InvalidSharedOnly
 {
     public struct LocalWorld : FFS.Libraries.StaticEcs.IWorldType { }

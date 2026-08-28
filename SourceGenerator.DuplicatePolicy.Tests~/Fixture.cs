@@ -1,4 +1,4 @@
-[assembly: UniGame.StaticEcs.Network.NetworkEndpointAttribute("Server", typeof(Duplicate.ServerWorld), UniGame.StaticEcs.Network.NetworkRole.Server)]
+[assembly: UniGame.StaticEcs.Network.NetworkEndpointAttribute("Server", typeof(Duplicate.ServerWorld), UniGame.StaticEcs.Network.NetworkRole.Server, typeof(Shared.Move))]
 namespace Duplicate
 {
     public struct ServerWorld : FFS.Libraries.StaticEcs.IWorldType { }

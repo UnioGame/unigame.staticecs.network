@@ -30,7 +30,7 @@ namespace UniGame.StaticEcs.Network
     }
     public enum NetworkRole : byte { Client = 1, Server = 2 }
     public enum NetworkSchemaKind : byte { Entity, Component, Tag, Link, Links, Multi, Command }
-    [System.AttributeUsage(System.AttributeTargets.Assembly, AllowMultiple = true)] public sealed class NetworkEndpointAttribute : System.Attribute { public NetworkEndpointAttribute(string name, System.Type world, NetworkRole role) { } }
+    [System.AttributeUsage(System.AttributeTargets.Assembly, AllowMultiple = true)] public sealed class NetworkEndpointAttribute : System.Attribute { public NetworkEndpointAttribute(string name, System.Type world, NetworkRole role, params System.Type[] rootTypes) { } }
     [System.AttributeUsage(System.AttributeTargets.Class)] public sealed class NetworkManifestAttribute : System.Attribute { }
     [System.AttributeUsage(System.AttributeTargets.Assembly, AllowMultiple = true)] public sealed class NetworkManifestRecordAttribute : System.Attribute { public NetworkManifestRecordAttribute(uint id, NetworkSchemaKind kind, System.Type type, byte version = 1) { } }
     public readonly struct NetworkTypeId { public NetworkTypeId(uint value) { Value = value; } public uint Value { get; } }
