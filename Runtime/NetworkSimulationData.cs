@@ -47,6 +47,13 @@ namespace UniGame.StaticEcs.Network
     /// <summary>Configures future packet decisions made by <see cref="NetworkSimulator"/>.</summary>
     public struct NetworkSimulationConfig
     {
+        /// <summary>Smallest valid number of command ticks sent redundantly.</summary>
+        public const int MinimumCommandRedundancy = 1;
+        /// <summary>Default number of command ticks sent redundantly.</summary>
+        public const int DefaultCommandRedundancy = 3;
+        /// <summary>Largest valid number of command ticks sent redundantly.</summary>
+        public const int MaximumCommandRedundancy = 32;
+
         /// <summary>Authoritative gameplay ticks per second.</summary>
         public int TicksPerSecond;
 
@@ -237,7 +244,7 @@ namespace UniGame.StaticEcs.Network
                 TicksPerSecond = 20,
                 PredictionHistoryTicks = 64,
                 InterpolationDelayTicks = 2,
-                CommandRedundancy = 3,
+                CommandRedundancy = NetworkSimulationConfig.DefaultCommandRedundancy,
                 MaxResimulationMilliseconds = 2f,
                 Seed = 1,
                 MaxQueuedPackets = 1024,

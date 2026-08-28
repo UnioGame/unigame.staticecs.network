@@ -11,7 +11,7 @@ namespace UniGame.StaticEcs.Network
             int ticksPerSecond,
             int predictionHistoryTicks = 64,
             int interpolationDelayTicks = 2,
-            int commandRedundancy = 3,
+            int commandRedundancy = NetworkSimulationConfig.DefaultCommandRedundancy,
             float maxResimulationMilliseconds = 2f)
             : this(new NetworkSimulationConfig
             {
@@ -29,6 +29,9 @@ namespace UniGame.StaticEcs.Network
         {
             if (config.TicksPerSecond <= 0)
                 throw new ArgumentException("Simulation config is not initialized.", nameof(config));
+            if (config.CommandRedundancy < NetworkSimulationConfig.MinimumCommandRedundancy ||
+                config.CommandRedundancy > NetworkSimulationConfig.MaximumCommandRedundancy)
+                throw new ArgumentOutOfRangeException(nameof(config.CommandRedundancy));
             Config = config;
             TicksPerSecond = config.TicksPerSecond;
             TickSeconds = 1f / config.TicksPerSecond;

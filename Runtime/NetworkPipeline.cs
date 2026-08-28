@@ -41,14 +41,16 @@ namespace UniGame.StaticEcs.Network
         public NetworkClient(INetworkTransport transport, NetworkSchema<TWorld> schema,
             ScopeId scope = default, INetworkObserver observer = null,
             int ticksPerSecond = 20, int predictionLeadTicks = 1,
-            int commandRedundancy = 3, ulong simulationFingerprint = 0,
+            int commandRedundancy = NetworkSimulationConfig.DefaultCommandRedundancy,
+            ulong simulationFingerprint = 0,
             ulong contentFingerprint = 0, NetworkBufferPool bufferPool = null)
         {
             _transport = transport ?? throw new ArgumentNullException(nameof(transport));
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
             if (ticksPerSecond <= 0) throw new ArgumentOutOfRangeException(nameof(ticksPerSecond));
             if (predictionLeadTicks < 0) throw new ArgumentOutOfRangeException(nameof(predictionLeadTicks));
-            if (commandRedundancy <= 0 || commandRedundancy > ProtocolLimits.MaxCommandsPerBatch)
+            if (commandRedundancy < NetworkSimulationConfig.MinimumCommandRedundancy ||
+                commandRedundancy > NetworkSimulationConfig.MaximumCommandRedundancy)
                 throw new ArgumentOutOfRangeException(nameof(commandRedundancy));
             _ticksPerSecond = ticksPerSecond;
             _predictionLeadTicks = predictionLeadTicks;

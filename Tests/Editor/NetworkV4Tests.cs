@@ -63,6 +63,17 @@ namespace UniGame.StaticEcs.Network.Tests
             var changed = new NetworkSimulationConfigResource(30, 64, 2, 3, 2f);
 
             Assert.That(first.Config.TicksPerSecond, Is.EqualTo(20));
+            Assert.That(NetworkSimulationConfig.MinimumCommandRedundancy, Is.EqualTo(1));
+            Assert.That(NetworkSimulationConfig.DefaultCommandRedundancy, Is.EqualTo(3));
+            Assert.That(NetworkSimulationConfig.MaximumCommandRedundancy, Is.EqualTo(32));
+            Assert.That(first.CommandRedundancy,
+                Is.EqualTo(NetworkSimulationConfig.DefaultCommandRedundancy));
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                new NetworkSimulationConfigResource(20, commandRedundancy:
+                    NetworkSimulationConfig.MinimumCommandRedundancy - 1));
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                new NetworkSimulationConfigResource(20, commandRedundancy:
+                    NetworkSimulationConfig.MaximumCommandRedundancy + 1));
             Assert.That(first.Fingerprint, Is.EqualTo(second.Fingerprint));
             Assert.That(changed.Fingerprint, Is.Not.EqualTo(first.Fingerprint));
         }
