@@ -34,6 +34,8 @@ namespace UniGame.StaticEcs.Network
         private long _lastPingTimestamp;
         private double _roundTripSeconds;
         private bool _handshakeStarted;
+        private NetworkRecoveryTransition _recoveryTransition;
+        private bool _hasRecoveryTransition;
 
         /// <summary>Creates an isolated client pipeline.</summary>
         public NetworkClient(INetworkTransport transport, NetworkSchema<TWorld> schema,
@@ -90,10 +92,21 @@ namespace UniGame.StaticEcs.Network
                 return checked(ServerTick + (uint)Math.Max(1d, Math.Ceiling(ahead)));
             }
         }
-        /// <summary>Gets whether malformed or rejected network state requested resynchronization.</summary>
-        public bool ResyncRequested { get; private set; }
-        /// <summary>Gets whether snapshot hooks left the replica world requiring full recreation.</summary>
-        public bool ReplicaResetRequired { get; private set; }
+
+        /// <summary>Consumes the next recovery transition without retaining ECS state in the pipeline.</summary>
+        public bool TryConsumeRecoveryTransition(out NetworkRecoveryTransition transition)
+        {
+            if (!_hasRecoveryTransition)
+            {
+                transition = default;
+                return false;
+            }
+
+            transition = _recoveryTransition;
+            _recoveryTransition = default;
+            _hasRecoveryTransition = false;
+            return true;
+        }
 
         /// <summary>Captures current packet-buffer ownership diagnostics.</summary>
         public NetworkBufferPoolDiagnostics CaptureBufferDiagnostics() =>
@@ -132,8 +145,8 @@ namespace UniGame.StaticEcs.Network
             _lastCommandFlushTick = 0;
             _commandsDirty = false;
             _handshakeStarted = false;
-            ResyncRequested = false;
-            ReplicaResetRequired = false;
+            _recoveryTransition = default;
+            _hasRecoveryTransition = false;
             _session.ReportSession(0, 0, 0, _packetSequence);
         }
 
@@ -201,12 +214,44 @@ namespace UniGame.StaticEcs.Network
                 {
                     _session.Trace(NetworkPhase.Receive, NetworkTraceKind.Point, NetworkResultCategory.Success, NetworkPacketKind.None, AcknowledgedSnapshotTick, 0, packet.Length, History.Count, History.Bytes, 0, ElapsedNanoseconds(receiveStarted));
                     var started = Stopwatch.GetTimestamp();
-                    if (!NetworkPacket.TryDecode(packet, out var header, out var payload) ||
-                    header.Kind != PacketKind.Disconnect &&
-                    (header.SchemaFingerprint != _schema.Fingerprint ||
-                     header.SimulationFingerprint != _simulationFingerprint ||
-                     header.ContentFingerprint != _contentFingerprint) ||
-                    _session.ValidatePacket(in header) != PacketValidationResult.Success) { _session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, NetworkResultCategory.Protocol, NetworkPacketKind.None, AcknowledgedSnapshotTick, 0, packet.Length, History.Count, History.Bytes, 0, ElapsedNanoseconds(started)); RequestResync(AcknowledgedSnapshotTick); continue; }
+                    if (!NetworkPacket.TryDecode(packet, out var header, out var payload))
+                    {
+                        _session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point,
+                            NetworkResultCategory.Protocol, NetworkPacketKind.None,
+                            AcknowledgedSnapshotTick, 0, packet.Length, History.Count,
+                            History.Bytes, 0, ElapsedNanoseconds(started));
+                        if (PacketHeader.IsProtocolVersionMismatch(packet.Span))
+                        {
+                            RequestDisconnect(
+                                NetworkRecoveryReason.ProtocolIncompatible);
+                            return;
+                        }
+                        RequestResync(AcknowledgedSnapshotTick,
+                            NetworkRecoveryReason.SnapshotRejected);
+                        continue;
+                    }
+                    if (header.Kind != PacketKind.Disconnect &&
+                        (header.SchemaFingerprint != _schema.Fingerprint ||
+                         header.SimulationFingerprint != _simulationFingerprint ||
+                         header.ContentFingerprint != _contentFingerprint))
+                    {
+                        _session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point,
+                            NetworkResultCategory.Protocol, NetworkPacketKind.None,
+                            AcknowledgedSnapshotTick, 0, packet.Length, History.Count,
+                            History.Bytes, 0, ElapsedNanoseconds(started));
+                        RequestDisconnect(NetworkRecoveryReason.ProtocolIncompatible);
+                        return;
+                    }
+                    if (_session.ValidatePacket(in header) != PacketValidationResult.Success)
+                    {
+                        _session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point,
+                            NetworkResultCategory.Protocol, NetworkPacketKind.None,
+                            AcknowledgedSnapshotTick, 0, packet.Length, History.Count,
+                            History.Bytes, 0, ElapsedNanoseconds(started));
+                        RequestResync(AcknowledgedSnapshotTick,
+                            NetworkRecoveryReason.SnapshotRejected);
+                        continue;
+                    }
                 if (header.ServerTick != PacketHeader.NoneTick && header.ServerTick >= ServerTick)
                 {
                     ServerTick = header.ServerTick;
@@ -220,7 +265,7 @@ namespace UniGame.StaticEcs.Network
                 if (header.Kind == PacketKind.Ready) DecodeReady(header, payload);
                 else if (header.Kind == PacketKind.FullSnapshot) decodeResult = DiagnosticResult(TryStageSnapshot(packet, header, payload, out staged, out entities, out records, out decodedBytes));
                 else if (header.Kind == PacketKind.Pong) DecodePong(payload);
-                else if (header.Kind == PacketKind.ResyncRequest) ResyncRequested = true;
+                else if (header.Kind == PacketKind.ResyncRequest) RequestResync(header.ServerTick, NetworkRecoveryReason.SnapshotRejected);
                 var disconnected = header.Kind == PacketKind.Disconnect;
                 _session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, decodeResult, DiagnosticKind(header.Kind), header.ServerTick, 0, decodedBytes, History.Count, History.Bytes, unchecked((int)(header.ServerTick - AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), entities, records);
                 if (disconnected)
@@ -230,8 +275,8 @@ namespace UniGame.StaticEcs.Network
                 }
                 if (header.Kind == PacketKind.FullSnapshot)
                 {
-                    if (staged.Snapshot == null) RequestResync(header.ServerTick);
-                    else ApplySnapshot(staged, header, entities, records);
+                    if (staged.Snapshot == null) RequestResync(header.ServerTick, NetworkRecoveryReason.SnapshotRejected);
+                    else if (!ApplySnapshot(staged, header, entities, records)) return;
                 }
                 _session.ReportSession(ServerTick, AcknowledgedSnapshotTick, ServerProcessedCommandSequence, _packetSequence);
                 }
@@ -340,9 +385,9 @@ namespace UniGame.StaticEcs.Network
         }
 
         /// <summary>Requests a clean full snapshot after local history or replica state became unusable.</summary>
-        public void RequestFullResync()
+        public void RequestFullResync(NetworkRecoveryReason reason)
         {
-            RequestResync(ServerTick);
+            RequestResync(ServerTick, reason);
         }
 
         /// <summary>Sends a periodic clock synchronization sample for server-tick estimation.</summary>
@@ -389,11 +434,11 @@ namespace UniGame.StaticEcs.Network
 
         private void DecodeReady(PacketHeader header, ReadOnlyMemory<byte> payload)
         {
-            if (_session.State != NetworkSessionState.Handshaking || header.SessionEpoch == 0 || payload.Length != 12) { ResyncRequested = true; return; }
+            if (_session.State != NetworkSessionState.Handshaking || header.SessionEpoch == 0 || payload.Length != 12) { RequestRecovery(NetworkRecoveryPhase.AwaitingKeyframe, NetworkRecoveryReason.SnapshotRejected, header.ServerTick); return; }
             var bytes = payload.Span;
             var peer = Hashing.Read32(bytes, 0);
             var scope = new ScopeId(Hashing.Read64(bytes, 4));
-            if (_session.Admit(header.SchemaFingerprint, peer, header.SessionEpoch, scope) != NetworkAdmissionResult.Accepted) ResyncRequested = true;
+            if (_session.Admit(header.SchemaFingerprint, peer, header.SessionEpoch, scope) != NetworkAdmissionResult.Accepted) RequestRecovery(NetworkRecoveryPhase.AwaitingKeyframe, NetworkRecoveryReason.SnapshotRejected, header.ServerTick);
         }
 
         private SnapshotApplyResult TryStageSnapshot(NetworkBufferLease packet,
@@ -416,7 +461,7 @@ namespace UniGame.StaticEcs.Network
             return result;
         }
 
-        private void ApplySnapshot(StagedNetworkSnapshot staged, PacketHeader header,
+        private bool ApplySnapshot(StagedNetworkSnapshot staged, PacketHeader header,
             int entities, int records)
         {
             var started = Stopwatch.GetTimestamp();
@@ -427,35 +472,56 @@ namespace UniGame.StaticEcs.Network
             }
             catch (Exception)
             {
-                ReplicaResetRequired = true;
-                try { _replicator.ClearReplicas(); }
-                catch { }
-                RequestResync(staged.ServerTick);
+                RequestRecovery(NetworkRecoveryPhase.RecreateReplicaWorld,
+                    NetworkRecoveryReason.SnapshotApplyFailed, staged.ServerTick);
                 staged.Snapshot.Dispose();
                 staged.Dispose();
-                return;
+                return false;
             }
             _session.Trace(NetworkPhase.SnapshotApply, NetworkTraceKind.Point, DiagnosticResult(result), NetworkPacketKind.FullSnapshot, staged.ServerTick, 0, staged.Snapshot.ByteLength, History.Count, History.Bytes, unchecked((int)(staged.ServerTick - AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), entities, records);
             if (result != SnapshotApplyResult.Success)
             {
-                RequestResync(staged.ServerTick);
+                RequestRecovery(NetworkRecoveryPhase.RecreateReplicaWorld,
+                    NetworkRecoveryReason.SnapshotApplyFailed, staged.ServerTick);
                 staged.Snapshot.Dispose();
                 staged.Dispose();
-                return;
+                return false;
             }
             AcknowledgedSnapshotTick = staged.ServerTick;
             ServerProcessedCommandTick = header.ServerProcessedCommandTick;
             ServerProcessedCommandSequence = header.ServerProcessedCommandSequence;
-            ResyncRequested = false;
             _session.ReportSnapshot(staged.Snapshot, History);
             Send(PacketKind.Ack, _session.Epoch, PacketHeader.NoneTick, AcknowledgedSnapshotTick, ReadOnlySpan<byte>.Empty);
+            RequestRecovery(NetworkRecoveryPhase.None, NetworkRecoveryReason.None,
+                staged.ServerTick);
             staged.Dispose();
+            return true;
         }
 
-        private void RequestResync(uint serverTick)
+        private void RequestResync(uint serverTick, NetworkRecoveryReason reason)
         {
-            ResyncRequested = true;
+            RequestRecovery(NetworkRecoveryPhase.AwaitingKeyframe, reason, serverTick);
             Send(PacketKind.ResyncRequest, _session.Epoch, serverTick, AcknowledgedSnapshotTick, ReadOnlySpan<byte>.Empty);
+        }
+
+        private void RequestDisconnect(NetworkRecoveryReason reason)
+        {
+            RequestRecovery(NetworkRecoveryPhase.DisconnectRequired, reason, ServerTick);
+            Send(PacketKind.Disconnect, _session.Epoch, ServerTick,
+                AcknowledgedSnapshotTick, ReadOnlySpan<byte>.Empty);
+            _session.Close();
+        }
+
+        private void RequestRecovery(NetworkRecoveryPhase phase,
+            NetworkRecoveryReason reason, uint requestedAtTick)
+        {
+            if (phase == NetworkRecoveryPhase.None)
+                _recoveryTransition = new NetworkRecoveryTransition(phase,
+                    NetworkRecoveryReason.None, requestedAtTick);
+            else
+                _recoveryTransition = new NetworkRecoveryTransition(phase, reason,
+                    requestedAtTick);
+            _hasRecoveryTransition = true;
         }
 
         private bool Send(PacketKind kind, uint epoch, uint serverTick, uint acknowledgedTick, ReadOnlySpan<byte> payload)

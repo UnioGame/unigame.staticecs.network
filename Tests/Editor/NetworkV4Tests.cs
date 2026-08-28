@@ -530,7 +530,11 @@ namespace UniGame.StaticEcs.Network.Tests
 
                 Assert.That(mock.ServerA.TrySend(Lease(new byte[] { 1, 2, 3 })), Is.True);
                 clientA.Process();
-                Assert.That(clientA.ResyncRequested, Is.True);
+                Assert.That(clientA.TryConsumeRecoveryTransition(out var recovery),
+                    Is.True);
+                Assert.That(recovery.Phase,
+                    Is.EqualTo(NetworkRecoveryPhase.AwaitingKeyframe));
+                Assert.That(recovery.Reason, Is.EqualTo(NetworkRecoveryReason.SnapshotRejected));
 
                 authority.Destroy();
                 server.Receive(); server.Tick(_ => { });
@@ -591,10 +595,132 @@ namespace UniGame.StaticEcs.Network.Tests
                     client.BeginHandshake(); server.Receive(); server.Tick(_ => { }); client.Process();
                     Assert.That(serverSession.State, Is.EqualTo(NetworkSessionState.Closed));
                     Assert.That(client.Session.State, Is.EqualTo(NetworkSessionState.Closed));
-                    Assert.That(client.ResyncRequested, Is.False);
+                    Assert.That(client.TryConsumeRecoveryTransition(out _), Is.False);
                 }
             }
             finally { World<AuthorityWorld>.Destroy(); }
+        }
+
+        [Test]
+        public void IncompatibleClientPacketTerminatesInsteadOfRequestingResync()
+        {
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var schema = Schema<ClientAWorld>(false);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(98),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                using (var client = new NetworkClient<ClientAWorld>(clientTransport,
+                           schema, new ScopeId(1)))
+                {
+                    Assert.That(client.Session.Admit(schema.Fingerprint, 1, 1,
+                        new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
+                    var packetHeader = Packet(PacketKind.FullSnapshot, 1, 1);
+                    packetHeader.ServerTick = 1;
+                    packetHeader.SchemaFingerprint = default;
+                    Assert.That(packetHeader.SchemaFingerprint,
+                        Is.Not.EqualTo(schema.Fingerprint));
+                    Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
+                        ReadOnlySpan<byte>.Empty, out var packet), Is.True);
+                    Assert.That(serverTransport.TrySend(packet), Is.True);
+
+                    client.Process();
+
+                    Assert.That(client.Session.State,
+                        Is.EqualTo(NetworkSessionState.Closed));
+                    Assert.That(client.TryConsumeRecoveryTransition(out var recovery),
+                        Is.True);
+                    Assert.That(recovery.Phase,
+                        Is.EqualTo(NetworkRecoveryPhase.DisconnectRequired));
+                    Assert.That(recovery.Reason,
+                        Is.EqualTo(NetworkRecoveryReason.ProtocolIncompatible));
+                }
+            }
+            finally { World<ClientAWorld>.Destroy(); }
+        }
+
+        [Test]
+        public void ProtocolVersionMismatchTerminatesClientInsteadOfRequestingResync()
+        {
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var schema = Schema<ClientAWorld>(false);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(97),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                using (var client = new NetworkClient<ClientAWorld>(clientTransport,
+                           schema, new ScopeId(1)))
+                {
+                    Assert.That(client.Session.Admit(schema.Fingerprint, 1, 1,
+                        new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
+                    var packetHeader = Packet(PacketKind.FullSnapshot, 1, 1);
+                    packetHeader.ServerTick = 1;
+                    packetHeader.SchemaFingerprint = schema.Fingerprint;
+                    Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
+                        ReadOnlySpan<byte>.Empty, out var packet), Is.True);
+                    var bytes = packet.Memory.ToArray();
+                    packet.Dispose();
+                    bytes[4] = 3;
+                    bytes[5] = 0;
+                    Write32(bytes, 80, 0);
+                    Write32(bytes, 80, Crc32(bytes));
+                    Assert.That(serverTransport.TrySend(Buffers.Copy(bytes)), Is.True);
+
+                    client.Process();
+
+                    Assert.That(client.Session.State,
+                        Is.EqualTo(NetworkSessionState.Closed));
+                    Assert.That(client.TryConsumeRecoveryTransition(out var recovery),
+                        Is.True);
+                    Assert.That(recovery.Phase,
+                        Is.EqualTo(NetworkRecoveryPhase.DisconnectRequired));
+                    Assert.That(recovery.Reason,
+                        Is.EqualTo(NetworkRecoveryReason.ProtocolIncompatible));
+                }
+            }
+            finally { World<ClientAWorld>.Destroy(); }
+        }
+
+        [Test]
+        public void CurrentVersionMalformedSnapshotRequestsKeyframe()
+        {
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var schema = Schema<ClientAWorld>(false);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(96),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                using (var client = new NetworkClient<ClientAWorld>(clientTransport,
+                           schema, new ScopeId(1)))
+                {
+                    Assert.That(client.Session.Admit(schema.Fingerprint, 1, 1,
+                        new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
+                    var packetHeader = Packet(PacketKind.FullSnapshot, 1, 1);
+                    packetHeader.ServerTick = 1;
+                    packetHeader.SchemaFingerprint = schema.Fingerprint;
+                    Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
+                        new byte[] { 1 }, out var packet), Is.True);
+                    Assert.That(serverTransport.TrySend(packet), Is.True);
+
+                    client.Process();
+
+                    Assert.That(client.Session.State,
+                        Is.EqualTo(NetworkSessionState.Established));
+                    Assert.That(client.TryConsumeRecoveryTransition(out var recovery),
+                        Is.True);
+                    Assert.That(recovery.Phase,
+                        Is.EqualTo(NetworkRecoveryPhase.AwaitingKeyframe));
+                    Assert.That(recovery.Reason,
+                        Is.EqualTo(NetworkRecoveryReason.SnapshotRejected));
+                }
+            }
+            finally { World<ClientAWorld>.Destroy(); }
         }
 
         [Test]
@@ -1247,6 +1373,22 @@ namespace UniGame.StaticEcs.Network.Tests
             destination[offset + 1] = (byte)(value >> 8);
             destination[offset + 2] = (byte)(value >> 16);
             destination[offset + 3] = (byte)(value >> 24);
+        }
+
+        private static uint Crc32(ReadOnlySpan<byte> source)
+        {
+            var crc = uint.MaxValue;
+            for (var i = 0; i < source.Length; i++)
+            {
+                crc ^= source[i];
+                for (var bit = 0; bit < 8; bit++)
+                {
+                    crc = (crc & 1) == 0
+                        ? crc >> 1
+                        : 0xedb88320U ^ crc >> 1;
+                }
+            }
+            return ~crc;
         }
 
         private static void AssertMetadataOnly(Type type)

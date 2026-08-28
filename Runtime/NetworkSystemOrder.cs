@@ -7,6 +7,8 @@ namespace UniGame.StaticEcs.Network
         public const int ClientConnectionLifecycle = -32000;
         /// <summary>Receives and applies client packets.</summary>
         public const int ClientReceive = -31000;
+        /// <summary>Projects a consume-once protocol recovery transition before gameplay state.</summary>
+        public const int ClientRecoveryProjection = -30250;
         /// <summary>Projects client session and local ownership into ECS data.</summary>
         public const int ClientStateProjection = -30000;
         /// <summary>Initializes entity-owned prediction state after ownership projection.</summary>
