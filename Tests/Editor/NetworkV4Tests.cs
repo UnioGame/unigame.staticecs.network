@@ -747,7 +747,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     packetHeader.ServerTick = 1;
                     packetHeader.SchemaFingerprint = schema.Fingerprint;
                     Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
-                        ReadOnlySpan<byte>.Empty, out var packet), Is.True);
+                        new byte[] { 1 }, out var packet), Is.True);
                     var bytes = packet.Memory.ToArray();
                     packet.Dispose();
                     bytes[4] = 3;
@@ -755,7 +755,52 @@ namespace UniGame.StaticEcs.Network.Tests
                     Write32(bytes, 80, 0);
                     Write32(bytes, 80, Crc32(bytes));
                     Assert.That(serverTransport.TrySend(Buffers.Copy(
-                        bytes.AsSpan(0, PacketHeader.Size - 1))), Is.True);
+                        bytes.AsSpan(0, bytes.Length - 1))), Is.True);
+
+                    client.Process();
+
+                    Assert.That(client.Session.State,
+                        Is.EqualTo(NetworkSessionState.Established));
+                    Assert.That(client.TryConsumeRecoveryTransition(out var recovery),
+                        Is.True);
+                    Assert.That(recovery.Phase,
+                        Is.EqualTo(NetworkRecoveryPhase.AwaitingKeyframe));
+                    Assert.That(recovery.Reason,
+                        Is.EqualTo(NetworkRecoveryReason.SnapshotRejected));
+                }
+            }
+            finally { World<ClientAWorld>.Destroy(); }
+        }
+
+        [Test]
+        public void ForeignVersionWithCorruptPayloadHashRequestsKeyframe()
+        {
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var schema = Schema<ClientAWorld>(false);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(93),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                using (var client = new NetworkClient<ClientAWorld>(clientTransport,
+                           schema, new ScopeId(1)))
+                {
+                    Assert.That(client.Session.Admit(schema.Fingerprint, 1, 1,
+                        new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
+                    var packetHeader = Packet(PacketKind.FullSnapshot, 1, 1);
+                    packetHeader.ServerTick = 1;
+                    packetHeader.SchemaFingerprint = schema.Fingerprint;
+                    Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
+                        new byte[] { 1 }, out var packet), Is.True);
+                    var bytes = packet.Memory.ToArray();
+                    packet.Dispose();
+                    bytes[4] = 3;
+                    bytes[5] = 0;
+                    Write32(bytes, 80, 0);
+                    Write32(bytes, 80, Crc32(bytes));
+                    bytes[PacketHeader.Size] ^= 1;
+                    Assert.That(serverTransport.TrySend(Buffers.Copy(bytes)), Is.True);
 
                     client.Process();
 

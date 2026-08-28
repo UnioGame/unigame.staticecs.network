@@ -75,11 +75,13 @@ namespace UniGame.StaticEcs.Network
             return true;
         }
 
-        /// <summary>Checks whether a complete valid header declares a different wire protocol version.</summary>
+        /// <summary>Checks whether a complete valid packet declares a different wire protocol version.</summary>
         internal static bool IsProtocolVersionMismatch(ReadOnlySpan<byte> source)
         {
             return TryReadFixedEnvelope(source, out var header, out var version) &&
-                   version != Version && IsValid(header);
+                   version != Version && IsValid(header) &&
+                   source.Length == Size + (int)header.PayloadLength &&
+                   Hashing.XxHash64(source.Slice(Size, (int)header.PayloadLength)) == header.PayloadHash;
         }
 
         /// <summary>Reads and validates a complete fixed header without touching payload bytes.</summary>
