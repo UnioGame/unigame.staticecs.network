@@ -13,8 +13,12 @@ namespace UniGame.StaticEcs.Network
         public const int ClientStateProjection = -30000;
         /// <summary>Initializes entity-owned prediction state after ownership projection.</summary>
         public const int ClientPredictionInitialization = -29500;
-        /// <summary>Runs shared reconciliation after authoritative apply.</summary>
+        /// <summary>Clears prediction state from entities that lost local ownership.</summary>
+        public const int ClientPredictionCleanup = -29490;
+        /// <summary>Runs read-only reconciliation preflight after authoritative apply.</summary>
         public const int ClientReconciliation = -29000;
+        /// <summary>Continues bounded replay after reconciliation preflight.</summary>
+        public const int ClientReconciliationReplay = -28990;
         /// <summary>Advances shared prediction after feature command histories are recorded.</summary>
         public const int ClientPredictionAdvance = 1120;
         /// <summary>Flushes gameplay commands after feature-owned command senders.</summary>
