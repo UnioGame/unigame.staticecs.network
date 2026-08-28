@@ -1,4 +1,5 @@
 using FFS.Libraries.StaticEcs;
+using Game.Ecs.Network;
 using NUnit.Framework;
 using UniGame.StaticEcs.Network.GeneratedTests.Shared;
 
