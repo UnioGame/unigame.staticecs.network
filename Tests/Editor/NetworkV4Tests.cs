@@ -753,7 +753,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     bytes[4] = 3;
                     bytes[5] = 0;
                     Write32(bytes, 80, 0);
-                    Write32(bytes, 80, Crc32(bytes));
+                    Write32(bytes, 80, Crc32(bytes.AsSpan(0, PacketHeader.Size)));
                     Assert.That(serverTransport.TrySend(Buffers.Copy(
                         bytes.AsSpan(0, bytes.Length - 1))), Is.True);
 
@@ -798,7 +798,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     bytes[4] = 3;
                     bytes[5] = 0;
                     Write32(bytes, 80, 0);
-                    Write32(bytes, 80, Crc32(bytes));
+                    Write32(bytes, 80, Crc32(bytes.AsSpan(0, PacketHeader.Size)));
                     bytes[PacketHeader.Size] ^= 1;
                     Assert.That(serverTransport.TrySend(Buffers.Copy(bytes)), Is.True);
 
