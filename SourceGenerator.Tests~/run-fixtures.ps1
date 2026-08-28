@@ -71,7 +71,10 @@ if ($declaredVersionFingerprint -eq $changedVersionFingerprint) { throw 'Generat
 Assert-Diagnostic 'SourceGenerator.MissingPolicy.Tests~/SourceGenerator.MissingPolicy.Tests.csproj' @('NETV2009')
 Assert-Diagnostic 'SourceGenerator.DuplicatePolicy.Tests~/SourceGenerator.DuplicatePolicy.Tests.csproj' @('NETV2010')
 Assert-Diagnostic 'SourceGenerator.MissingHooks.Tests~/SourceGenerator.MissingHooks.Tests.csproj' @('NETV2007')
+$sharedOnlyManifest = 'SourceGenerator.SharedOnly.Tests~/obj/generated/StaticEcs.Network.Generator/UniGame.StaticEcs.Network.Generator.NetworkSourceGenerator/NetworkManifest.g.cs'
+Remove-Item -LiteralPath $sharedOnlyManifest -Force -ErrorAction SilentlyContinue
 Assert-Diagnostic 'SourceGenerator.SharedOnly.Tests~/SourceGenerator.SharedOnly.Tests.csproj' @('NETV2006')
+if (Test-Path $sharedOnlyManifest) { throw 'Generator emitted a local manifest for an endpoint assembly.' }
 Assert-Pass 'SourceGenerator.BadManifest.Tests~/SourceGenerator.BadManifest.Tests.csproj'
 Assert-Pass 'SourceGenerator.Shared.Tests~/SourceGenerator.Shared.Tests.csproj'
 Assert-Pass 'SourceGenerator.InvalidManifest.Tests~/SourceGenerator.InvalidManifest.Tests.csproj'

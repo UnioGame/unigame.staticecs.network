@@ -46,10 +46,17 @@ namespace UniGame.StaticEcs.Network.Generator
             var hasEndpoints = compilation.Assembly.GetAttributes().Any(a => a.AttributeClass?.ToDisplayString() == EndpointAttribute);
             if (records.Count == 0 && !hasEndpoints) return;
             var referenced = CollectReferenced(compilation, context);
-            if (hasEndpoints) foreach (var record in records) context.ReportDiagnostic(Diagnostic.Create(SharedOnly, record.Symbol.Locations.FirstOrDefault(), record.Symbol.ToDisplayString()));
+            if (hasEndpoints)
+            {
+                foreach (var record in records)
+                    context.ReportDiagnostic(Diagnostic.Create(SharedOnly,
+                        record.Symbol.Locations.FirstOrDefault(), record.Symbol.ToDisplayString()));
+                EmitEndpoints(compilation, referenced, context);
+                return;
+            }
+
             ValidateCollisions(records, context);
             EmitManifest(records, context);
-            EmitEndpoints(compilation, referenced, context);
         }
 
         private static void CollectTypes(INamespaceSymbol ns, string assemblyName, List<Record> records, SourceProductionContext context)

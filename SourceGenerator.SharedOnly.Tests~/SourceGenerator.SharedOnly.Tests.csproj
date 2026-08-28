@@ -1,5 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><TargetFramework>net8.0</TargetFramework><LangVersion>latest</LangVersion><ImplicitUsings>disable</ImplicitUsings><Nullable>disable</Nullable></PropertyGroup>
+  <PropertyGroup><TargetFramework>net8.0</TargetFramework><LangVersion>latest</LangVersion><ImplicitUsings>disable</ImplicitUsings><Nullable>disable</Nullable><EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles><CompilerGeneratedFilesOutputPath>$(BaseIntermediateOutputPath)generated</CompilerGeneratedFilesOutputPath></PropertyGroup>
   <ItemGroup>
     <Reference Include="SourceGenerator.Shared.Tests" HintPath="..\SourceGenerator.Shared.Tests~\bin\Debug\net8.0\SourceGenerator.Shared.Tests.dll" />
     <Analyzer Include="..\Analyzers\StaticEcs.Network.Generator.dll" />
