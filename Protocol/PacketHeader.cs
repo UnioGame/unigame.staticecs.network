@@ -75,25 +75,38 @@ namespace UniGame.StaticEcs.Network
             return true;
         }
 
-        /// <summary>Checks whether a packet declares a different wire protocol version.</summary>
+        /// <summary>Checks whether a complete valid header declares a different wire protocol version.</summary>
         internal static bool IsProtocolVersionMismatch(ReadOnlySpan<byte> source)
         {
-            return source.Length >= 6 &&
-                   Hashing.Read32(source, 0) == 0x53434553 &&
-                   Read16(source, 4) != Version;
+            return TryReadFixedEnvelope(source, out var header, out var version) &&
+                   version != Version && IsValid(header);
         }
 
         /// <summary>Reads and validates a complete fixed header without touching payload bytes.</summary>
         public static bool TryRead(ReadOnlySpan<byte> source, out PacketHeader header)
         {
+            if (!TryReadFixedEnvelope(source, out header, out var version) ||
+                version != Version)
+            {
+                header = default;
+                return false;
+            }
+            return IsValid(header);
+        }
+
+        private static bool TryReadFixedEnvelope(ReadOnlySpan<byte> source,
+            out PacketHeader header, out ushort version)
+        {
             header = default;
+            version = default;
             if (source.Length < Size || Hashing.Read32(source, 0) != 0x53434553 ||
-                Read16(source, 4) != Version || Read16(source, 6) != Size || source[11] != 0) return false;
+                Read16(source, 6) != Size || source[11] != 0) return false;
             Span<byte> copy = stackalloc byte[Size];
             source.Slice(0, Size).CopyTo(copy);
             var expected = Hashing.Read32(copy, 80);
             copy.Slice(80, 4).Clear();
             if (Hashing.Crc32(copy) != expected) return false;
+            version = Read16(source, 4);
             header = new PacketHeader
             {
                 Kind = (PacketKind)source[8], Flags = (PacketFlags)source[9], Compression = (NetworkCompression)source[10],
@@ -107,7 +120,7 @@ namespace UniGame.StaticEcs.Network
                 ContentFingerprint = Hashing.Read64(source, 64),
                 PayloadHash = Hashing.Read64(source, 72)
             };
-            return IsValid(header);
+            return true;
         }
 
         private static ushort Read16(ReadOnlySpan<byte> source, int offset) => (ushort)(source[offset] | source[offset + 1] << 8);
