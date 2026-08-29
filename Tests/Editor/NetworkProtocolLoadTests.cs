@@ -26,57 +26,72 @@ namespace UniGame.StaticEcs.Network.Tests
         private static void RunProfile(string name, int peerCount, int actorCount,
             int ticks, bool adverse)
         {
-            CreateWorld();
-            var schema = Schema();
-            var replicator = new NetworkReplicator<LoadWorld>(schema,
-                static (_, _) => true, new ScopeId(1));
-            var actors = new World<LoadWorld>.Entity[actorCount];
-            for (var index = 0; index < actors.Length; index++)
-            {
-                actors[index] = World<LoadWorld>.NewEntity<LoadEntity>();
-                actors[index].Set(new LoadComponent { Value = index });
-            }
-            var allocationStart = GC.GetAllocatedBytesForCurrentThread();
-            var peers = CreatePeers(peerCount, adverse);
-            var tickSamples = new long[ticks];
-            var captureSamples = new long[ticks * peerCount];
-            var applySamples = new long[ticks * peerCount];
-            var captureIndex = 0;
-            var applyIndex = 0;
-            long bytes = 0;
-            var expectedCommands = ticks;
-
+            NetworkReplicator<LoadWorld> replicator = null;
+            NetworkReplicator<LoadClientWorld> client = null;
+            List<Peer> peers = null;
             try
             {
+                CreateWorld();
+                CreateClientWorld();
+                var schema = Schema();
+                var clientSchema = ClientSchema();
+                Assert.That(clientSchema.Fingerprint,
+                    Is.EqualTo(schema.Fingerprint));
+                replicator = new NetworkReplicator<LoadWorld>(schema,
+                    static (_, _) => true, new ScopeId(1));
+                client = new NetworkReplicator<LoadClientWorld>(clientSchema,
+                    new ScopeId(1));
+                var actors = new World<LoadWorld>.Entity[actorCount];
+                for (var index = 0; index < actors.Length; index++)
+                {
+                    actors[index] = World<LoadWorld>.NewEntity<LoadEntity>();
+                    actors[index].Set(new LoadComponent { Value = index });
+                }
+                var allocationStart = GC.GetAllocatedBytesForCurrentThread();
+                peers = CreatePeers(peerCount, adverse);
+                var tickSamples = new long[ticks];
+                var captureSamples = new long[ticks * peerCount];
+                var applySamples = new long[ticks * peerCount];
+                var captureIndex = 0;
+                var applyIndex = 0;
+                long bytes = 0;
+                var expectedCommands = ticks;
                 Handshake(peers, ref bytes);
                 for (uint tick = 1; tick <= ticks; tick++)
                 {
-                    actors[(tick - 1) % (uint)actors.Length].Set(
+                    actors[(int)((tick - 1) % (uint)actors.Length)].Set(
                         new LoadComponent { Value = checked((int)tick) });
-                    Assert.That(replicator.Capture(tick, out var capture),
-                        Is.EqualTo(SnapshotCaptureResult.Success));
-                    var tickStart = Stopwatch.GetTimestamp();
-                    for (var peerIndex = 0; peerIndex < peers.Count; peerIndex++)
+                    NetworkSnapshot capture = null;
+                    try
                     {
-                        var peer = peers[peerIndex];
-                        var command = CommandPayload(tick);
-                        var commandPacket = Encode(PacketKind.CommandBatch,
-                            PacketFlags.UnreliableSequenced, tick, tick, command);
-                        bytes += commandPacket.Length;
-                        Assert.That(peer.Simulator.Client.TrySend(commandPacket), Is.True);
+                        Assert.That(replicator.Capture(tick, out capture),
+                            Is.EqualTo(SnapshotCaptureResult.Success));
+                        var tickStart = Stopwatch.GetTimestamp();
+                        for (var peerIndex = 0; peerIndex < peers.Count; peerIndex++)
+                        {
+                            var peer = peers[peerIndex];
+                            var command = CommandPayload(tick);
+                            var commandPacket = Encode(PacketKind.CommandBatch,
+                                PacketFlags.UnreliableSequenced, tick, tick, command);
+                            bytes += commandPacket.Length;
+                            Assert.That(peer.Simulator.Client.TrySend(commandPacket), Is.True);
 
-                        var captureStart = Stopwatch.GetTimestamp();
-                        var snapshot = EncodeSnapshot(
-                            ++peer.SnapshotSequence, capture);
-                        captureSamples[captureIndex] = ElapsedNanoseconds(captureStart);
-                        bytes += snapshot.Length;
-                        Assert.That(peer.Simulator.Server.TrySend(snapshot), Is.True);
-                        captureIndex++;
+                            var captureStart = Stopwatch.GetTimestamp();
+                            var snapshot = EncodeSnapshot(
+                                ++peer.SnapshotSequence, capture);
+                            captureSamples[captureIndex] = ElapsedNanoseconds(captureStart);
+                            bytes += snapshot.Length;
+                            Assert.That(peer.Simulator.Server.TrySend(snapshot), Is.True);
+                            captureIndex++;
+                        }
+                        AdvanceAndDrain(peers, 50, applySamples, ref applyIndex,
+                            ref bytes, client, clientSchema.Fingerprint);
+                        tickSamples[tick - 1] = ElapsedNanoseconds(tickStart);
                     }
-                    capture.Dispose();
-
-                    AdvanceAndDrain(peers, 50, applySamples, ref applyIndex, ref bytes);
-                    tickSamples[tick - 1] = ElapsedNanoseconds(tickStart);
+                    finally
+                    {
+                        capture?.Dispose();
+                    }
                 }
 
                 for (var index = 0; index < 12; index++)
@@ -90,9 +105,11 @@ namespace UniGame.StaticEcs.Network.Tests
                         bytes += packet.Length;
                         Assert.That(peer.Simulator.Client.TrySend(packet), Is.True);
                     }
-                    AdvanceAndDrain(peers, 50, applySamples, ref applyIndex, ref bytes);
+                    AdvanceAndDrain(peers, 50, applySamples, ref applyIndex,
+                        ref bytes, client, clientSchema.Fingerprint);
                 }
-                AdvanceAndDrain(peers, 500, applySamples, ref applyIndex, ref bytes);
+                AdvanceAndDrain(peers, 500, applySamples, ref applyIndex,
+                    ref bytes, client, clientSchema.Fingerprint);
 
                 long maxQueuedPackets = 0;
                 foreach (var peer in peers)
@@ -134,10 +151,16 @@ namespace UniGame.StaticEcs.Network.Tests
             }
             finally
             {
-                foreach (var peer in peers)
-                    peer.Simulator.Dispose();
-                replicator.Dispose();
-                World<LoadWorld>.Destroy();
+                if (peers != null)
+                    foreach (var peer in peers)
+                        peer.Simulator.Dispose();
+                client?.ClearReplicas();
+                client?.Dispose();
+                replicator?.Dispose();
+                if (World<LoadWorld>.Status == WorldStatus.Initialized)
+                    World<LoadWorld>.Destroy();
+                if (World<LoadClientWorld>.Status == WorldStatus.Initialized)
+                    World<LoadClientWorld>.Destroy();
             }
         }
 
@@ -193,7 +216,9 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         private static void AdvanceAndDrain(IReadOnlyList<Peer> peers, int milliseconds,
-            long[] applySamples, ref int applyIndex, ref long bytes)
+            long[] applySamples, ref int applyIndex, ref long bytes,
+            NetworkReplicator<LoadClientWorld> client,
+            SchemaFingerprint fingerprint)
         {
             foreach (var peer in peers)
             {
@@ -218,11 +243,30 @@ namespace UniGame.StaticEcs.Network.Tests
                         }
                         var canonical = payload.Span.Slice(
                             SnapshotChunkHeader.Size);
+                        int entities;
+                        int records;
                         if (chunk.TotalLength != (uint)canonical.Length ||
                             chunk.TotalHash != Hashing.XxHash64(canonical) ||
                             !SnapshotDeltaCodec.TryInspectCanonical(canonical,
-                                out _, out _))
+                                out entities, out records))
                         {
+                            peer.ProtocolErrors++;
+                            continue;
+                        }
+                        var exact = snapshotPacket.RetainSlice(
+                            PacketHeader.Size + SnapshotChunkHeader.Size,
+                            canonical.Length);
+                        var snapshot = client.CreateSnapshot(chunk.SnapshotTick,
+                            fingerprint, new ScopeId(1), exact, entities, records);
+                        var result = client.Stage(snapshot, out var staged);
+                        if (result == SnapshotApplyResult.Success)
+                        {
+                            result = client.Apply(in staged);
+                            staged.Dispose();
+                        }
+                        if (result != SnapshotApplyResult.Success)
+                        {
+                            snapshot.Dispose();
                             peer.ProtocolErrors++;
                             continue;
                         }
@@ -304,7 +348,8 @@ namespace UniGame.StaticEcs.Network.Tests
                     SnapshotChunkHeader.Size));
                 return Encode(PacketKind.SnapshotChunk,
                     PacketFlags.ReliableOrdered, sequence,
-                    snapshot.ServerTick, payload.Span);
+                    snapshot.ServerTick, payload.Span,
+                    snapshot.SchemaFingerprint);
             }
             finally
             {
@@ -314,7 +359,8 @@ namespace UniGame.StaticEcs.Network.Tests
 
         private static NetworkBufferLease Encode(PacketKind kind, PacketFlags flags,
             uint sequence,
-            uint tick, ReadOnlySpan<byte> payload)
+            uint tick, ReadOnlySpan<byte> payload,
+            SchemaFingerprint fingerprint = default)
         {
             var header = new PacketHeader
             {
@@ -324,6 +370,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 SessionEpoch = 1,
                 PacketSequence = sequence,
                 ServerTick = tick,
+                SchemaFingerprint = fingerprint,
             };
             Assert.That(NetworkPacket.TryEncode(Buffers, header, payload,
                 out var packet), Is.True);
@@ -363,6 +410,16 @@ namespace UniGame.StaticEcs.Network.Tests
             World<LoadWorld>.Initialize();
         }
 
+        private static void CreateClientWorld()
+        {
+            World<LoadClientWorld>.Create(WorldConfig.Default());
+            var types = World<LoadClientWorld>.Types();
+            types.RegisterAll(typeof(NetworkOwnerComponent).Assembly);
+            types.EntityType<LoadEntity>();
+            types.Component<LoadComponent>();
+            World<LoadClientWorld>.Initialize();
+        }
+
         private static NetworkSchema<LoadWorld> Schema()
         {
             var factory = NetworkCompilerSupport.Create<LoadWorld>();
@@ -371,7 +428,16 @@ namespace UniGame.StaticEcs.Network.Tests
             return factory.Freeze();
         }
 
+        private static NetworkSchema<LoadClientWorld> ClientSchema()
+        {
+            var factory = NetworkCompilerSupport.Create<LoadClientWorld>();
+            factory.Entity<LoadEntity>(new NetworkTypeId(1));
+            factory.DisableableComponent<LoadComponent>(new NetworkTypeId(2));
+            return factory.Freeze();
+        }
+
         private struct LoadWorld : IWorldType { }
+        private struct LoadClientWorld : IWorldType { }
         private struct LoadEntity : IEntityType, INetworkType
         {
             public byte Id() => 1;

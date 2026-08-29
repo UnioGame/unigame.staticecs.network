@@ -51,6 +51,9 @@ namespace UniGame.StaticEcs.Network.Tests
             packet = Buffers.Copy(corruptBytes);
             Assert.That(NetworkPacket.TryDecode(packet, header.SchemaFingerprint, out _, out _), Is.False);
             packet.Dispose();
+            header.Kind = (PacketKind)4;
+            header.PayloadLength = 0;
+            Assert.That(header.TryWrite(bytes), Is.False);
         }
 
         [Test]
@@ -1765,6 +1768,216 @@ namespace UniGame.StaticEcs.Network.Tests
             }
         }
 
+        [Test]
+        public void ServerAckValidationKeepsKeyframeRequiredUntilValidBaseline()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(811),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true, historyTicks: 4))
+                {
+                    server.AddConnection(serverTransport, 1, 1,
+                        new ScopeId(1));
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready), Is.True);
+                    ready.Dispose();
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+
+                    for (var tick = 1; tick <= 5; tick++)
+                    {
+                        server.Tick(_ => { });
+                        Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                            Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                    }
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 2, 1);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe),
+                        "evicted ACK must not advance the baseline cursor");
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 3, 6);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    var delta = ReceiveChunk(clientTransport);
+                    Assert.That(delta.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(delta.BaselineTick, Is.EqualTo(6));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 4, 6);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    delta = ReceiveChunk(clientTransport);
+                    Assert.That(delta.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(delta.BaselineTick, Is.EqualTo(6));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 5, 99);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 6, 9);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 7, 8);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 8, 0);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ClientRequiresBaselineAndOnlyKeyframeClearsRecovery()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            var schema = Schema<AuthorityWorld>(true);
+            NetworkReplicator<AuthorityWorld> capture = null;
+            try
+            {
+            var clientSchema = Schema<ClientAWorld>(false);
+            var scope = new ScopeId(23);
+            Assert.That(clientSchema.Fingerprint, Is.EqualTo(schema.Fingerprint));
+            capture = new NetworkReplicator<AuthorityWorld>(schema,
+                static (_, _) => true, scope);
+            MemoryNetworkTransport.CreatePair(new ConnectionId(812),
+                out var clientTransport, out var serverTransport);
+            using (clientTransport)
+            using (serverTransport)
+            using (var client = new NetworkClient<ClientAWorld>(clientTransport,
+                       clientSchema, scope))
+            {
+                NetworkSnapshot baseline = null;
+                NetworkSnapshot target = null;
+                NetworkSnapshot next = null;
+                NetworkSnapshot rejected = null;
+                NetworkBufferLease delta = null;
+                try
+                {
+                    Assert.That(client.Session.Admit(clientSchema.Fingerprint,
+                        1, 1, scope), Is.EqualTo(NetworkAdmissionResult.Accepted));
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    Assert.That(capture.Capture(1, out baseline),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    entity.Set(new TestComponent { Value = 2 });
+                    Assert.That(capture.Capture(2, out target),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(SnapshotDeltaCodec.TryEncode(Buffers, baseline,
+                        target, out delta), Is.True);
+                    SendSnapshotChunk(serverTransport, clientSchema.Fingerprint,
+                        1, DeltaHeader(baseline, target), delta.Span);
+                    client.Process();
+                    Assert.That(client.AcknowledgedSnapshotTick, Is.Zero);
+                    Assert.That(client.History.Count, Is.Zero);
+                    Assert.That(client.TryConsumeRecoveryTransition(
+                        out var recovery), Is.True);
+                    Assert.That(recovery.Phase,
+                        Is.EqualTo(NetworkRecoveryPhase.AwaitingKeyframe));
+                    delta.Dispose();
+                    delta = null;
+
+                    var keyframe = KeyframeHeader(target);
+                    SendSnapshotChunk(serverTransport, clientSchema.Fingerprint,
+                        2, keyframe, target.Bytes.Span);
+                    client.Process();
+                    Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(2));
+                    Assert.That(client.TryConsumeRecoveryTransition(out recovery),
+                        Is.True);
+                    Assert.That(recovery.Phase,
+                        Is.EqualTo(NetworkRecoveryPhase.None));
+                    Assert.That(ReadReplicaValue(), Is.EqualTo(2));
+
+                    entity.Set(new TestComponent { Value = 3 });
+                    Assert.That(capture.Capture(3, out next),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(SnapshotDeltaCodec.TryEncode(Buffers, target,
+                        next, out delta), Is.True);
+                    SendSnapshotChunk(serverTransport, clientSchema.Fingerprint,
+                        3, DeltaHeader(target, next), delta.Span);
+                    client.Process();
+                    Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(3));
+                    Assert.That(ReadReplicaValue(), Is.EqualTo(3));
+                    Assert.That(client.TryConsumeRecoveryTransition(out _),
+                        Is.False, "delta apply must not clear recovery");
+                    delta.Dispose();
+                    delta = null;
+
+                    entity.Set(new TestComponent { Value = 4 });
+                    Assert.That(capture.Capture(4, out rejected),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(SnapshotDeltaCodec.TryEncode(Buffers, next,
+                        rejected, out delta), Is.True);
+                    var corrupt = delta.Span.ToArray();
+                    corrupt[corrupt.Length - 1] ^= 1;
+                    SendSnapshotChunk(serverTransport, clientSchema.Fingerprint,
+                        4, DeltaHeader(next, rejected), corrupt);
+                    client.Process();
+                    Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(3));
+                    Assert.That(ReadReplicaValue(), Is.EqualTo(3),
+                        "rejected delta must not partially mutate ECS");
+                    Assert.That(client.History.Count, Is.EqualTo(2));
+                    Assert.That(client.History.Bytes,
+                        Is.LessThanOrEqualTo(client.History.MaxBytes));
+                    Assert.That(client.TryConsumeRecoveryTransition(out recovery),
+                        Is.True);
+                    Assert.That(recovery.Phase,
+                        Is.EqualTo(NetworkRecoveryPhase.AwaitingKeyframe));
+                }
+                finally
+                {
+                    delta?.Dispose();
+                    rejected?.Dispose();
+                    next?.Dispose();
+                    target?.Dispose();
+                    baseline?.Dispose();
+                }
+            }
+            }
+            finally
+            {
+                capture?.Dispose();
+                if (World<AuthorityWorld>.Status == WorldStatus.Initialized)
+                    World<AuthorityWorld>.Destroy();
+                if (World<ClientAWorld>.Status == WorldStatus.Initialized)
+                    World<ClientAWorld>.Destroy();
+            }
+        }
+
         private static SnapshotChunkHeader DeltaHeader(NetworkSnapshot baseline,
             NetworkSnapshot target) => new SnapshotChunkHeader
         {
@@ -1776,6 +1989,91 @@ namespace UniGame.StaticEcs.Network.Tests
             ChunkIndex = 0,
             ChunkCount = 1
         };
+
+        private static SnapshotChunkHeader KeyframeHeader(
+            NetworkSnapshot snapshot) => new SnapshotChunkHeader
+        {
+            PayloadKind = SnapshotPayloadKind.Keyframe,
+            SnapshotTick = snapshot.ServerTick,
+            BaselineTick = 0,
+            TotalLength = checked((uint)snapshot.ByteLength),
+            TotalHash = snapshot.PayloadHash,
+            ChunkIndex = 0,
+            ChunkCount = 1
+        };
+
+        private static void SendPeerPacket(INetworkTransport transport,
+            SchemaFingerprint schema, PacketKind kind, uint epoch,
+            uint sequence, uint acknowledgedTick)
+        {
+            var header = Packet(kind, epoch, sequence);
+            header.SchemaFingerprint = schema;
+            header.AcknowledgedSnapshotTick = acknowledgedTick;
+            Assert.That(NetworkPacket.TryEncode(Buffers, header,
+                ReadOnlySpan<byte>.Empty, out var packet), Is.True);
+            Assert.That(transport.TrySend(packet), Is.True);
+        }
+
+        private static SnapshotChunkHeader ReceiveChunk(
+            INetworkTransport transport)
+        {
+            Assert.That(transport.TryReceive(out var packet), Is.True);
+            try
+            {
+                Assert.That(NetworkPacket.TryDecode(packet, out var header,
+                    out var payload), Is.True);
+                Assert.That(header.Kind, Is.EqualTo(PacketKind.SnapshotChunk));
+                Assert.That(SnapshotChunkHeader.TryRead(payload.Span,
+                    out var chunk), Is.True);
+                Assert.That(chunk.SnapshotTick, Is.EqualTo(header.ServerTick));
+                Assert.That(chunk.ChunkIndex, Is.Zero);
+                Assert.That(chunk.ChunkCount, Is.EqualTo(1));
+                return chunk;
+            }
+            finally
+            {
+                packet.Dispose();
+            }
+        }
+
+        private static void SendSnapshotChunk(INetworkTransport transport,
+            SchemaFingerprint schema, uint sequence,
+            SnapshotChunkHeader chunk, ReadOnlySpan<byte> body)
+        {
+            var payload = Buffers.Rent(checked(
+                SnapshotChunkHeader.Size + body.Length));
+            try
+            {
+                Assert.That(chunk.TryWrite(payload.WritableSpan), Is.True);
+                body.CopyTo(payload.WritableSpan.Slice(
+                    SnapshotChunkHeader.Size));
+                var header = Packet(PacketKind.SnapshotChunk, 1, sequence);
+                header.ServerTick = chunk.SnapshotTick;
+                header.SchemaFingerprint = schema;
+                Assert.That(NetworkPacket.TryEncode(Buffers, header,
+                    payload.Span, out var packet), Is.True);
+                Assert.That(transport.TrySend(packet), Is.True);
+            }
+            finally
+            {
+                payload.Dispose();
+            }
+        }
+
+        private static int ReadReplicaValue()
+        {
+            var found = false;
+            var value = 0;
+            foreach (var entity in World<ClientAWorld>.Query(
+                         default(EntityIs<TestEntity>)).Entities())
+            {
+                Assert.That(found, Is.False);
+                found = true;
+                value = entity.Read<TestComponent>().Value;
+            }
+            Assert.That(found, Is.True);
+            return value;
+        }
 
         private static void AssertDeltaRejected(NetworkBufferPool pool,
             NetworkSnapshot baseline, ReadOnlySpan<byte> delta,
