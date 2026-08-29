@@ -438,11 +438,11 @@ namespace UniGame.StaticEcs.Network.Tests
 
         private struct LoadWorld : IWorldType { }
         private struct LoadClientWorld : IWorldType { }
-        private struct LoadEntity : IEntityType, INetworkType
+        internal struct LoadEntity : IEntityType, INetworkType
         {
             public byte Id() => 1;
         }
-        private struct LoadComponent : IComponent, IDisableable, INetworkType
+        internal struct LoadComponent : IComponent, IDisableable, INetworkType
         {
             public int Value;
             public void Write<TWorld>(ref BinaryPackWriter writer,
