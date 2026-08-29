@@ -1391,6 +1391,24 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void NdjsonWritesServerTickNameAndDuration()
+        {
+            using var stream = new MemoryStream();
+            using (var log = new NetworkNdjsonLog(stream, 1))
+            {
+                var value = new NetworkTraceEvent(NetworkPhase.ServerTick,
+                    NetworkTraceKind.Point, NetworkResultCategory.Success,
+                    NetworkRole.Server, 0, 0, 0, 19, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 7, durationNanoseconds: 1234);
+                log.Observe(in value);
+            }
+
+            var text = System.Text.Encoding.UTF8.GetString(stream.ToArray());
+            StringAssert.Contains("\"phase\":\"server_tick\"", text);
+            StringAssert.Contains("\"duration_ns\":1234", text);
+        }
+
+        [Test]
         public void AdmissionPolicy_CommitsBeforeLifecycleNotification()
         {
             CreateReplicationWorld<AuthorityWorld>(true);

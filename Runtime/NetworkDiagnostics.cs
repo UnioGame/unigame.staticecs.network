@@ -42,7 +42,9 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Snapshot capture work.</summary>
         SnapshotCapture,
         /// <summary>Transport send work.</summary>
-        Send
+        Send,
+        /// <summary>Complete authoritative simulation tick.</summary>
+        ServerTick
     }
     /// <summary>Identifies trace event timing semantics.</summary>
     public enum NetworkTraceKind : byte
@@ -342,7 +344,9 @@ namespace UniGame.StaticEcs.Network
             ",\"client_server_tick_gap\":" + v.ClientServerTickGap + ",\"duration_ns\":" + v.DurationNanoseconds + ",\"schema_fingerprint\":\"" + v.SchemaFingerprint + "\"}";
 
         private static string PhaseName(NetworkPhase phase) => phase == NetworkPhase.CommandDispatch ? "command_dispatch" :
-            phase == NetworkPhase.SnapshotApply ? "snapshot_apply" : phase == NetworkPhase.SnapshotCapture ? "snapshot_capture" : phase.ToString().ToLowerInvariant();
+            phase == NetworkPhase.SnapshotApply ? "snapshot_apply" :
+            phase == NetworkPhase.SnapshotCapture ? "snapshot_capture" :
+            phase == NetworkPhase.ServerTick ? "server_tick" : phase.ToString().ToLowerInvariant();
         private static string PacketName(NetworkPacketKind kind) => kind == NetworkPacketKind.CommandBatch ? "command_batch" : kind == NetworkPacketKind.SnapshotChunk ? "snapshot_chunk" : kind == NetworkPacketKind.ResyncRequest ? "resync_request" : kind.ToString().ToLowerInvariant();
     }
 }
