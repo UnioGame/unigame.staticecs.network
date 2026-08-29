@@ -3,8 +3,17 @@ using System.Collections.Generic;
 
 namespace UniGame.StaticEcs.Network
 {
+    /// <summary>Exposes complete wire packet limits for one transport.</summary>
+    public interface INetworkTransportCapabilities
+    {
+        /// <summary>Gets the maximum complete reliable packet bytes, including <see cref="PacketHeader"/>.</summary>
+        int MaxReliablePayloadBytes { get; }
+        /// <summary>Gets the maximum complete unreliable packet bytes, including <see cref="PacketHeader"/>.</summary>
+        int MaxUnreliablePayloadBytes { get; }
+    }
+
     /// <summary>Defines an exact-packet transport with transport-owned connection identity.</summary>
-    public interface INetworkTransport : IDisposable
+    public interface INetworkTransport : INetworkTransportCapabilities, IDisposable
     {
         /// <summary>Gets transport-owned identity.</summary>
         ConnectionId Connection { get; }
@@ -25,6 +34,12 @@ namespace UniGame.StaticEcs.Network
         { Connection = connection; _incoming = incoming; _outgoing = outgoing; }
         /// <inheritdoc />
         public ConnectionId Connection { get; }
+        /// <inheritdoc />
+        public int MaxReliablePayloadBytes =>
+            PacketHeader.Size + ProtocolLimits.MaxWirePayloadBytes;
+        /// <inheritdoc />
+        public int MaxUnreliablePayloadBytes =>
+            PacketHeader.Size + ProtocolLimits.MaxWirePayloadBytes;
         /// <inheritdoc />
         public bool TrySend(NetworkBufferLease packet)
         {

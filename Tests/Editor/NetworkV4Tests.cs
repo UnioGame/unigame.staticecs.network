@@ -271,6 +271,46 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void CommandQueueRejectsOneByteOverTransportLimitAndReleasesEnvelope()
+        {
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var schema = Schema<ClientAWorld>(false);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(95),
+                    out var clientEndpoint, out var serverTransport);
+                var exactPacketBytes = PacketHeader.Size + 1 + 17 + sizeof(int);
+                using (var clientTransport = new LimitedNetworkTransport(
+                           clientEndpoint, exactPacketBytes - 1))
+                using (serverTransport)
+                using (var client = new NetworkClient<ClientAWorld>(clientTransport,
+                           schema, new ScopeId(1)))
+                {
+                    Assert.That(client.Session.Admit(schema.Fingerprint, 1, 1,
+                        new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
+                    var command = new TestCommand { Value = 1 };
+
+                    Assert.That(client.QueueCommand(in command, 2, out var rejectedSequence),
+                        Is.EqualTo(NetworkCommandResult.LimitExceeded));
+                    Assert.That(rejectedSequence, Is.Zero);
+                    Assert.That(client.CaptureMemoryDiagnostics().PendingCommands, Is.Zero);
+                    Assert.That(client.CaptureBufferDiagnostics().OutstandingLeases, Is.Zero);
+
+                    clientTransport.MaxUnreliablePayloadBytes = exactPacketBytes;
+                    Assert.That(client.QueueCommand(in command, 3, out var acceptedSequence),
+                        Is.EqualTo(NetworkCommandResult.Queued));
+                    Assert.That(acceptedSequence, Is.Not.Zero);
+                    Assert.That(client.CaptureMemoryDiagnostics().PendingCommands, Is.EqualTo(1));
+                    Assert.That(client.CaptureBufferDiagnostics().OutstandingLeases, Is.EqualTo(1));
+                }
+            }
+            finally
+            {
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
         public void CommandBatchRepeatsCurrentAndThreePreviousTicks()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
@@ -1567,6 +1607,29 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(session.ValidatePacket(in fallback), Is.EqualTo(PacketValidationResult.Success), $"{role} rejected {kind} without consuming sequence");
             }
             Assert.That(session.State, Is.EqualTo(NetworkSessionState.Established));
+        }
+
+        private sealed class LimitedNetworkTransport : INetworkTransport
+        {
+            private readonly INetworkTransport _inner;
+
+            internal LimitedNetworkTransport(INetworkTransport inner,
+                int maxUnreliablePayloadBytes)
+            {
+                _inner = inner;
+                MaxUnreliablePayloadBytes = maxUnreliablePayloadBytes;
+            }
+
+            public ConnectionId Connection => _inner.Connection;
+            public int MaxReliablePayloadBytes => _inner.MaxReliablePayloadBytes;
+            public int MaxUnreliablePayloadBytes { get; set; }
+
+            public bool TrySend(NetworkBufferLease packet) => _inner.TrySend(packet);
+
+            public bool TryReceive(out NetworkBufferLease packet) =>
+                _inner.TryReceive(out packet);
+
+            public void Dispose() => _inner.Dispose();
         }
 
         public struct TestWorld : IWorldType { }

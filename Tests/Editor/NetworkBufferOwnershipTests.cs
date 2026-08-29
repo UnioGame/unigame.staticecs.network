@@ -19,6 +19,25 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void DisposedSimulatorOwnerConsumesSendLeaseAndReceiveReturnsFalse()
+        {
+            using var pool = new NetworkBufferPool(1024);
+            var config = NetworkSimulationPresets.Create(NetworkSimulationPreset.Immediate);
+            using var simulator = new NetworkSimulator(new ConnectionId(2), in config);
+            var endpoint = simulator.Client;
+            var completePacketLimit = PacketHeader.Size + ProtocolLimits.MaxWirePayloadBytes;
+            Assert.That(endpoint.MaxReliablePayloadBytes, Is.EqualTo(completePacketLimit));
+            Assert.That(endpoint.MaxUnreliablePayloadBytes, Is.EqualTo(completePacketLimit));
+
+            simulator.Dispose();
+
+            Assert.That(endpoint.TrySend(pool.Copy(new byte[] { 1 })), Is.False);
+            AssertReleased(pool);
+            Assert.That(endpoint.TryReceive(out var packet), Is.False);
+            Assert.That(packet, Is.Null);
+        }
+
+        [Test]
         public void HistoryEvictionAndClearReleaseSnapshots()
         {
             using var pool = new NetworkBufferPool(1024);

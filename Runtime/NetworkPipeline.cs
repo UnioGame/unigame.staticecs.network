@@ -317,6 +317,15 @@ namespace UniGame.StaticEcs.Network
                 return NetworkCommandResult.LimitExceeded;
             var result = _session.CreateCommand(in command, targetTick, out var envelope);
             if (result != NetworkCommandResult.Queued) return result;
+            var projectedCount = _recentCommands.Count + 1;
+            var projectedPayloadBytes = 1L + 17L * projectedCount +
+                                        _recentCommandBytes + envelope.ExactLength;
+            if (projectedPayloadBytes > ProtocolLimits.MaxWirePayloadBytes ||
+                PacketHeader.Size + projectedPayloadBytes > _transport.MaxUnreliablePayloadBytes)
+            {
+                envelope.Dispose();
+                return NetworkCommandResult.LimitExceeded;
+            }
             sequence = envelope.Sequence;
             _recentCommands.Add(envelope);
             _recentCommandBytes += envelope.ExactLength;
@@ -342,13 +351,24 @@ namespace UniGame.StaticEcs.Network
                 _commandsDirty = false;
                 return NetworkCommandResult.Queued;
             }
-            int length = 1;
+            long length = 1;
             for (var i = 0; i < _recentCommands.Count; i++)
-                length = checked(length + 17 + _recentCommands[i].ExactLength);
+                length += 17L + _recentCommands[i].ExactLength;
             if (_recentCommands.Count > Math.Min((int)byte.MaxValue, ProtocolLimits.MaxCommandsPerBatch) ||
-                length > ProtocolLimits.MaxWirePayloadBytes)
+                length > ProtocolLimits.MaxWirePayloadBytes ||
+                PacketHeader.Size + length > _transport.MaxUnreliablePayloadBytes)
+            {
+                for (var i = 0; i < _recentCommands.Count; i++)
+                {
+                    var command = _recentCommands[i];
+                    command.Dispose();
+                }
+                _recentCommands.Clear();
+                _recentCommandBytes = 0;
+                _commandsDirty = false;
                 return NetworkCommandResult.LimitExceeded;
-            var payload = _bufferPool.Rent(length);
+            }
+            var payload = _bufferPool.Rent(checked((int)length));
             var payloadBytes = payload.WritableSpan;
             payloadBytes[0] = checked((byte)_recentCommands.Count);
             int offset = 1;

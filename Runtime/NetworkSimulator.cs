@@ -510,9 +510,15 @@ namespace UniGame.StaticEcs.Network
 
             public ConnectionId Connection => _owner._connection;
 
+            public int MaxReliablePayloadBytes =>
+                PacketHeader.Size + ProtocolLimits.MaxWirePayloadBytes;
+
+            public int MaxUnreliablePayloadBytes =>
+                PacketHeader.Size + ProtocolLimits.MaxWirePayloadBytes;
+
             public bool TrySend(NetworkBufferLease packet)
             {
-                if (_disposed)
+                if (_disposed || _owner._disposed)
                 {
                     packet?.Dispose();
                     return false;
@@ -525,7 +531,7 @@ namespace UniGame.StaticEcs.Network
 
             public bool TryReceive(out NetworkBufferLease packet)
             {
-                if (_disposed)
+                if (_disposed || _owner._disposed)
                 {
                     packet = null;
                     return false;
