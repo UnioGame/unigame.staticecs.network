@@ -537,7 +537,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(World<ClientAWorld>.Query(default(EntityIs<TestEntity>))
                         .EntitiesCount(), Is.EqualTo(1));
 
-                    var disconnect = Packet(PacketKind.Disconnect, 9, 3);
+                    var disconnect = Packet(PacketKind.Disconnect, 9, 2);
                     disconnect.SchemaFingerprint = clientSchema.Fingerprint;
                     Assert.That(NetworkPacket.TryEncode(Buffers, disconnect, ReadOnlySpan<byte>.Empty,
                         out var packet), Is.True);
@@ -1089,14 +1089,14 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(clientObserver.Snapshots.Count, Is.EqualTo(1));
                     Assert.That(serverObserver.Snapshots[0].PayloadHash, Is.EqualTo(clientObserver.Snapshots[0].PayloadHash));
                     Assert.That(clientObserver.Sessions[clientObserver.Sessions.Count - 1].AcknowledgedSnapshotTick, Is.EqualTo(1));
-                    Assert.That(serverObserver.Sessions[serverObserver.Sessions.Count - 1].NextSendPacketSequence, Is.EqualTo(3));
+                    Assert.That(serverObserver.Sessions[serverObserver.Sessions.Count - 1].NextSendPacketSequence, Is.EqualTo(2));
 
                     var nonSnapshot = new PacketHeader
                     {
                         Kind = PacketKind.ResyncRequest,
                         Flags = PacketFlags.ReliableOrdered,
                         SessionEpoch = 9,
-                        PacketSequence = 3,
+                        PacketSequence = 2,
                         ServerTick = 7,
                         SchemaFingerprint = clientSchema.Fingerprint
                     };
@@ -1105,7 +1105,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     client.Process();
                     Assert.That(client.ServerTick, Is.EqualTo(7));
                     Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(1));
-                    nonSnapshot.PacketSequence = 4;
+                    nonSnapshot.PacketSequence = 3;
                     nonSnapshot.ServerTick = 3;
                     Assert.That(NetworkPacket.TryEncode(Buffers, nonSnapshot, ReadOnlySpan<byte>.Empty, out var olderTickPacket), Is.True);
                     Assert.That(serverTransport.TrySend(olderTickPacket), Is.True);
@@ -2127,7 +2127,7 @@ namespace UniGame.StaticEcs.Network.Tests
 
                     var keyframe = KeyframeHeader(target);
                     SendSnapshotChunk(serverTransport, clientSchema.Fingerprint,
-                        2, keyframe, target.Bytes.Span);
+                        1, keyframe, target.Bytes.Span);
                     client.Process();
                     Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(2));
                     Assert.That(client.TryConsumeRecoveryTransition(out recovery),
@@ -2142,7 +2142,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(SnapshotDeltaCodec.TryEncode(Buffers, target,
                         next, out delta), Is.True);
                     SendSnapshotChunk(serverTransport, clientSchema.Fingerprint,
-                        3, DeltaHeader(target, next), delta.Span);
+                        1, DeltaHeader(target, next), delta.Span);
                     client.Process();
                     Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(3));
                     Assert.That(ReadReplicaValue(), Is.EqualTo(3));
@@ -2159,7 +2159,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     var corrupt = delta.Span.ToArray();
                     corrupt[corrupt.Length - 1] ^= 1;
                     SendSnapshotChunk(serverTransport, clientSchema.Fingerprint,
-                        4, DeltaHeader(next, rejected), corrupt);
+                        1, DeltaHeader(next, rejected), corrupt);
                     client.Process();
                     Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(3));
                     Assert.That(ReadReplicaValue(), Is.EqualTo(3),

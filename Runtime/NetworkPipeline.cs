@@ -284,8 +284,9 @@ namespace UniGame.StaticEcs.Network
                 var decodeResult = NetworkResultCategory.Success;
                 var snapshotKind = default(SnapshotPayloadKind);
                 var awaitingSnapshotChunks = false;
+                var discardRejectedSnapshot = false;
                 if (header.Kind == PacketKind.Ready) DecodeReady(header, payload);
-                else if (header.Kind == PacketKind.SnapshotChunk) decodeResult = DiagnosticResult(TryStageSnapshot(packet, header, payload, out staged, out entities, out records, out decodedBytes, out snapshotKind, out awaitingSnapshotChunks));
+                else if (header.Kind == PacketKind.SnapshotChunk) decodeResult = DiagnosticResult(TryStageSnapshot(packet, header, payload, out staged, out entities, out records, out decodedBytes, out snapshotKind, out awaitingSnapshotChunks, out discardRejectedSnapshot));
                 else if (header.Kind == PacketKind.Pong) DecodePong(payload);
                 else if (header.Kind == PacketKind.ResyncRequest) RequestResync(header.ServerTick, NetworkRecoveryReason.SnapshotRejected);
                 var disconnected = header.Kind == PacketKind.Disconnect;
@@ -301,9 +302,10 @@ namespace UniGame.StaticEcs.Network
                     {
                         if (staged.Snapshot == null)
                         {
-                            _snapshotDiscardThroughTick = Math.Max(
-                                _snapshotDiscardThroughTick,
-                                header.ServerTick);
+                            if (discardRejectedSnapshot)
+                                _snapshotDiscardThroughTick = Math.Max(
+                                    _snapshotDiscardThroughTick,
+                                    header.ServerTick);
                             RequestResync(header.ServerTick, NetworkRecoveryReason.SnapshotRejected);
                         }
                         else if (!ApplySnapshot(staged, header, entities, records, snapshotKind)) return;
@@ -496,17 +498,21 @@ namespace UniGame.StaticEcs.Network
             PacketHeader header, ReadOnlyMemory<byte> payload,
             out StagedNetworkSnapshot staged, out int entities, out int records,
             out int decodedBytes, out SnapshotPayloadKind payloadKind,
-            out bool awaitingChunks)
+            out bool awaitingChunks, out bool discardRejectedTick)
         {
             staged = default;
             entities = 0;
             records = 0;
             decodedBytes = payload.Length;
             payloadKind = default;
+            discardRejectedTick = false;
             NetworkBufferLease body = null;
             if (!TryAssembleSnapshot(packet, in header, payload, out var chunk,
                     out body, out awaitingChunks))
+            {
+                discardRejectedTick = true;
                 return SnapshotApplyResult.Malformed;
+            }
             if (awaitingChunks)
                 return SnapshotApplyResult.Success;
             payloadKind = chunk.PayloadKind;
@@ -519,7 +525,10 @@ namespace UniGame.StaticEcs.Network
                         Hashing.XxHash64(body.Span) != chunk.TotalHash ||
                         !SnapshotDeltaCodec.TryInspectCanonical(body.Span,
                             out entities, out records))
+                    {
+                        discardRejectedTick = true;
                         return SnapshotApplyResult.Malformed;
+                    }
                     snapshot = _replicator.CreateSnapshot(chunk.SnapshotTick,
                         header.SchemaFingerprint, _session.Scope, body,
                         entities, records);
@@ -530,12 +539,16 @@ namespace UniGame.StaticEcs.Network
                     NetworkBufferLease canonical = null;
                     if (!History.TryGet(chunk.BaselineTick, out var baseline) ||
                         baseline.SchemaFingerprint != header.SchemaFingerprint ||
-                        baseline.Scope != _session.Scope ||
-                        !SnapshotDeltaCodec.TryReconstruct(_bufferPool, baseline,
+                        baseline.Scope != _session.Scope)
+                        return SnapshotApplyResult.Malformed;
+                    if (!SnapshotDeltaCodec.TryReconstruct(_bufferPool, baseline,
                             body.Span, in chunk, header.SchemaFingerprint,
                             _session.Scope, out canonical, out entities,
                             out records))
+                    {
+                        discardRejectedTick = true;
                         return SnapshotApplyResult.Malformed;
+                    }
                     try
                     {
                         snapshot = _replicator.CreateSnapshot(chunk.SnapshotTick,
@@ -551,7 +564,10 @@ namespace UniGame.StaticEcs.Network
                 decodedBytes = snapshot.ByteLength;
                 var result = _replicator.Stage(snapshot, out staged);
                 if (result != SnapshotApplyResult.Success)
+                {
+                    discardRejectedTick = true;
                     snapshot.Dispose();
+                }
                 return result;
             }
             finally
