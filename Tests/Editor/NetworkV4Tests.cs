@@ -1779,6 +1779,190 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void SnapshotChunksRespectBoundariesReorderRecoveryAndOwnership()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            var pool = new NetworkBufferPool(64L << 20);
+            NetworkReplicator<AuthorityWorld> probe = null;
+            NetworkSnapshot sample = null;
+            NetworkBufferLease first = null;
+            NetworkBufferLease second = null;
+            NetworkBufferLease late = null;
+            LimitedNetworkTransport clientTransport = null;
+            LimitedNetworkTransport serverTransport = null;
+            NetworkServer<AuthorityWorld> server = null;
+            NetworkClient<ClientAWorld> client = null;
+            try
+            {
+                var authoritySchema = Schema<AuthorityWorld>(true);
+                var clientSchema = Schema<ClientAWorld>(false);
+                var scope = new ScopeId(41);
+                Assert.That(clientSchema.Fingerprint,
+                    Is.EqualTo(authoritySchema.Fingerprint));
+                MemoryNetworkTransport.CreatePair(new ConnectionId(841),
+                    out var clientEndpoint, out var serverEndpoint);
+                clientTransport = new LimitedNetworkTransport(clientEndpoint,
+                    clientEndpoint.MaxUnreliablePayloadBytes);
+                serverTransport = new LimitedNetworkTransport(serverEndpoint,
+                    serverEndpoint.MaxUnreliablePayloadBytes);
+                server = new NetworkServer<AuthorityWorld>(authoritySchema,
+                    static (_, _) => true, bufferPool: pool);
+                client = new NetworkClient<ClientAWorld>(clientTransport,
+                    clientSchema, scope, bufferPool: pool);
+                probe = new NetworkReplicator<AuthorityWorld>(authoritySchema,
+                    static (_, _) => true, scope, bufferPool: pool);
+                var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                entity.Set(new TestComponent { Value = 1 });
+                Assert.That(probe.Capture(1, out sample),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                var exactPacketBytes = checked(PacketHeader.Size +
+                    SnapshotChunkHeader.Size + sample.ByteLength);
+                Assert.That(sample.ByteLength, Is.GreaterThan(1));
+
+                server.AddConnection(serverTransport, 1, 1, scope);
+                Assert.That(client.BeginHandshake(), Is.True);
+                server.Receive();
+                client.Process();
+                clientTransport.MaxReliablePayloadBytes = exactPacketBytes;
+                serverTransport.MaxReliablePayloadBytes = exactPacketBytes;
+                serverTransport.ResetSentPackets();
+                server.Tick(_ => { });
+                Assert.That(serverTransport.SentPacketCount, Is.EqualTo(1));
+                Assert.That(serverTransport.LargestSentPacketBytes,
+                    Is.EqualTo(exactPacketBytes));
+                client.Process();
+                server.Receive();
+                Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(1));
+                Assert.That(ReadReplicaValue(), Is.EqualTo(1));
+
+                entity.Set(new TestComponent { Value = 2 });
+                client.RequestFullResync(
+                    NetworkRecoveryReason.PredictionHistoryUnavailable);
+                server.Receive();
+                clientTransport.MaxReliablePayloadBytes = exactPacketBytes - 1;
+                serverTransport.MaxReliablePayloadBytes = exactPacketBytes - 1;
+                serverTransport.ResetSentPackets();
+                server.Tick(_ => { });
+                Assert.That(serverTransport.SentPacketCount, Is.EqualTo(2));
+                Assert.That(serverTransport.LargestSentPacketBytes,
+                    Is.LessThanOrEqualTo(exactPacketBytes - 1));
+                Assert.That(clientTransport.TryReceive(out first), Is.True);
+                Assert.That(clientTransport.TryReceive(out second), Is.True);
+                Assert.That(InspectSnapshotChunk(first, out _).ChunkIndex,
+                    Is.Zero);
+                Assert.That(InspectSnapshotChunk(second, out _).ChunkIndex,
+                    Is.EqualTo(1));
+                Assert.That(serverTransport.TrySend(second.Retain()), Is.True);
+                Assert.That(serverTransport.TrySend(second), Is.True);
+                second = null;
+                Assert.That(serverTransport.TrySend(first), Is.True);
+                first = null;
+                client.Process();
+                server.Receive();
+                Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(2));
+                Assert.That(ReadReplicaValue(), Is.EqualTo(2));
+
+                entity.Set(new TestComponent { Value = 3 });
+                client.RequestFullResync(NetworkRecoveryReason.SnapshotRejected);
+                server.Receive();
+                serverTransport.ResetSentPackets();
+                serverTransport.FailOnSendNumber = 2;
+                server.Tick(_ => { });
+                Assert.That(serverTransport.SentPacketCount, Is.EqualTo(2));
+                Assert.That(clientTransport.TryReceive(out first), Is.True);
+                Assert.That(InspectSnapshotChunk(first, out _).ChunkIndex,
+                    Is.Zero);
+                late = first.Retain();
+                serverTransport.FailOnSendNumber = 0;
+                Assert.That(serverTransport.TrySend(first), Is.True);
+                first = null;
+                client.Process();
+                Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(2));
+
+                entity.Set(new TestComponent { Value = 4 });
+                serverTransport.ResetSentPackets();
+                server.Tick(_ => { });
+                Assert.That(serverTransport.SentPacketCount, Is.EqualTo(2));
+                Assert.That(clientTransport.TryReceive(out first), Is.True);
+                Assert.That(clientTransport.TryReceive(out second), Is.True);
+                Assert.That(serverTransport.TrySend(second.Retain()), Is.True);
+                Assert.That(serverTransport.TrySend(second), Is.True);
+                second = null;
+                Assert.That(serverTransport.TrySend(first), Is.True);
+                first = null;
+                Assert.That(serverTransport.TrySend(late), Is.True);
+                late = null;
+                client.Process();
+                server.Receive();
+                Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(4));
+                Assert.That(ReadReplicaValue(), Is.EqualTo(4));
+
+                entity.Set(new TestComponent { Value = 5 });
+                client.RequestFullResync(NetworkRecoveryReason.SnapshotRejected);
+                server.Receive();
+                server.Tick(_ => { });
+                Assert.That(clientTransport.TryReceive(out first), Is.True);
+                Assert.That(clientTransport.TryReceive(out second), Is.True);
+                var conflictChunk = InspectSnapshotChunk(first,
+                    out var conflictBody);
+                var conflict = conflictBody.ToArray();
+                conflict[conflict.Length - 1] ^= 1;
+                Assert.That(serverTransport.TrySend(first), Is.True);
+                first = null;
+                SendSnapshotChunk(serverTransport, clientSchema.Fingerprint,
+                    conflictChunk.ChunkIndex + 1, conflictChunk, conflict);
+                second.Dispose();
+                second = null;
+                client.Process();
+                Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(4));
+                Assert.That(ReadReplicaValue(), Is.EqualTo(4));
+                Assert.That(client.TryConsumeRecoveryTransition(
+                    out var recovery), Is.True);
+                Assert.That(recovery.Phase,
+                    Is.EqualTo(NetworkRecoveryPhase.AwaitingKeyframe));
+
+                server.Receive();
+                entity.Set(new TestComponent { Value = 6 });
+                server.Tick(_ => { });
+                Assert.That(clientTransport.TryReceive(out first), Is.True);
+                Assert.That(clientTransport.TryReceive(out second), Is.True);
+                Assert.That(serverTransport.TrySend(first), Is.True);
+                first = null;
+                second.Dispose();
+                second = null;
+                client.Process();
+                Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(4));
+                client.Process(long.MaxValue);
+                Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(4));
+                Assert.That(ReadReplicaValue(), Is.EqualTo(4));
+                Assert.That(client.TryConsumeRecoveryTransition(out recovery),
+                    Is.True);
+                Assert.That(recovery.Phase,
+                    Is.EqualTo(NetworkRecoveryPhase.AwaitingKeyframe));
+            }
+            finally
+            {
+                late?.Dispose();
+                second?.Dispose();
+                first?.Dispose();
+                sample?.Dispose();
+                probe?.Dispose();
+                client?.Dispose();
+                server?.Dispose();
+                clientTransport?.Dispose();
+                serverTransport?.Dispose();
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+                pool.Dispose();
+                if (World<AuthorityWorld>.Status == WorldStatus.Initialized)
+                    World<AuthorityWorld>.Destroy();
+                if (World<ClientAWorld>.Status == WorldStatus.Initialized)
+                    World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
         public void ServerAckValidationKeepsKeyframeRequiredUntilValidBaseline()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
@@ -2046,6 +2230,18 @@ namespace UniGame.StaticEcs.Network.Tests
             }
         }
 
+        private static SnapshotChunkHeader InspectSnapshotChunk(
+            NetworkBufferLease packet, out ReadOnlyMemory<byte> body)
+        {
+            Assert.That(NetworkPacket.TryDecode(packet, out var header,
+                out var payload), Is.True);
+            Assert.That(header.Kind, Is.EqualTo(PacketKind.SnapshotChunk));
+            Assert.That(SnapshotChunkHeader.TryRead(payload.Span,
+                out var chunk), Is.True);
+            body = payload.Slice(SnapshotChunkHeader.Size);
+            return chunk;
+        }
+
         private static void SendSnapshotChunk(INetworkTransport transport,
             SchemaFingerprint schema, uint sequence,
             SnapshotChunkHeader chunk, ReadOnlySpan<byte> body)
@@ -2196,7 +2392,8 @@ namespace UniGame.StaticEcs.Network.Tests
             Assert.That(session.Admit(schema.Fingerprint, 1, 7, default), Is.EqualTo(NetworkAdmissionResult.Accepted));
             var wrongEpoch = Packet(kind, 6, 1); Assert.That(session.ValidatePacket(in wrongEpoch), Is.EqualTo(allowed ? PacketValidationResult.WrongEpoch : PacketValidationResult.WrongRole));
             var outOfOrder = Packet(kind, 7, 2);
-            var outOfOrderResult = allowed && kind == PacketKind.CommandBatch
+            var outOfOrderResult = allowed &&
+                                   (kind == PacketKind.CommandBatch || kind == PacketKind.SnapshotChunk)
                 ? PacketValidationResult.Success
                 : allowed ? PacketValidationResult.Sequence : PacketValidationResult.WrongRole;
             Assert.That(session.ValidatePacket(in outOfOrder), Is.EqualTo(outOfOrderResult));
@@ -2205,7 +2402,10 @@ namespace UniGame.StaticEcs.Network.Tests
                 ? PacketValidationResult.Sequence
                 : allowed ? PacketValidationResult.Success : PacketValidationResult.WrongRole;
             Assert.That(session.ValidatePacket(in candidate), Is.EqualTo(candidateResult));
-            if (allowed && kind != PacketKind.CommandBatch)
+            if (allowed && kind == PacketKind.SnapshotChunk)
+                Assert.That(session.ValidatePacket(in candidate),
+                    Is.EqualTo(PacketValidationResult.Success));
+            else if (allowed && kind != PacketKind.CommandBatch)
                 Assert.That(session.ValidatePacket(in candidate), Is.EqualTo(PacketValidationResult.Sequence));
             else
             {
@@ -2220,17 +2420,41 @@ namespace UniGame.StaticEcs.Network.Tests
             private readonly INetworkTransport _inner;
 
             internal LimitedNetworkTransport(INetworkTransport inner,
-                int maxUnreliablePayloadBytes)
+                int maxUnreliablePayloadBytes,
+                int maxReliablePayloadBytes = 0)
             {
                 _inner = inner;
                 MaxUnreliablePayloadBytes = maxUnreliablePayloadBytes;
+                MaxReliablePayloadBytes = maxReliablePayloadBytes > 0
+                    ? maxReliablePayloadBytes
+                    : inner.MaxReliablePayloadBytes;
             }
 
             public ConnectionId Connection => _inner.Connection;
-            public int MaxReliablePayloadBytes => _inner.MaxReliablePayloadBytes;
+            public int MaxReliablePayloadBytes { get; set; }
             public int MaxUnreliablePayloadBytes { get; set; }
+            internal int SentPacketCount { get; private set; }
+            internal int LargestSentPacketBytes { get; private set; }
+            internal int FailOnSendNumber { get; set; }
 
-            public bool TrySend(NetworkBufferLease packet) => _inner.TrySend(packet);
+            public bool TrySend(NetworkBufferLease packet)
+            {
+                SentPacketCount++;
+                LargestSentPacketBytes = Math.Max(LargestSentPacketBytes,
+                    packet?.Length ?? 0);
+                if (FailOnSendNumber == SentPacketCount)
+                {
+                    packet?.Dispose();
+                    return false;
+                }
+                return _inner.TrySend(packet);
+            }
+
+            internal void ResetSentPackets()
+            {
+                SentPacketCount = 0;
+                LargestSentPacketBytes = 0;
+            }
 
             public bool TryReceive(out NetworkBufferLease packet) =>
                 _inner.TryReceive(out packet);
