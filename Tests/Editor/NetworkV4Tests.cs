@@ -7,7 +7,7 @@ using NUnit.Framework;
 
 namespace UniGame.StaticEcs.Network.Tests
 {
-    public sealed class NetworkV4Tests
+    public sealed class NetworkV5Tests
     {
         private static readonly NetworkBufferPool Buffers = new NetworkBufferPool(64L << 20);
 
@@ -731,7 +731,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 {
                     Assert.That(client.Session.Admit(schema.Fingerprint, 1, 1,
                         new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
-                    var packetHeader = Packet(PacketKind.FullSnapshot, 1, 1);
+                    var packetHeader = Packet(PacketKind.SnapshotChunk, 1, 1);
                     packetHeader.ServerTick = 1;
                     packetHeader.SchemaFingerprint = default;
                     Assert.That(packetHeader.SchemaFingerprint,
@@ -771,7 +771,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 {
                     Assert.That(client.Session.Admit(schema.Fingerprint, 1, 1,
                         new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
-                    var packetHeader = Packet(PacketKind.FullSnapshot, 1, 1);
+                    var packetHeader = Packet(PacketKind.SnapshotChunk, 1, 1);
                     packetHeader.ServerTick = 1;
                     packetHeader.SchemaFingerprint = schema.Fingerprint;
                     Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
@@ -815,7 +815,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 {
                     Assert.That(client.Session.Admit(schema.Fingerprint, 1, 1,
                         new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
-                    var packetHeader = Packet(PacketKind.FullSnapshot, 1, 1);
+                    var packetHeader = Packet(PacketKind.SnapshotChunk, 1, 1);
                     packetHeader.ServerTick = 1;
                     packetHeader.SchemaFingerprint = schema.Fingerprint;
                     Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
@@ -857,7 +857,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 {
                     Assert.That(client.Session.Admit(schema.Fingerprint, 1, 1,
                         new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
-                    var packetHeader = Packet(PacketKind.FullSnapshot, 1, 1);
+                    var packetHeader = Packet(PacketKind.SnapshotChunk, 1, 1);
                     packetHeader.ServerTick = 1;
                     packetHeader.SchemaFingerprint = schema.Fingerprint;
                     Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
@@ -902,7 +902,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 {
                     Assert.That(client.Session.Admit(schema.Fingerprint, 1, 1,
                         new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
-                    var packetHeader = Packet(PacketKind.FullSnapshot, 1, 1);
+                    var packetHeader = Packet(PacketKind.SnapshotChunk, 1, 1);
                     packetHeader.ServerTick = 1;
                     packetHeader.SchemaFingerprint = schema.Fingerprint;
                     Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
@@ -947,7 +947,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 {
                     Assert.That(client.Session.Admit(schema.Fingerprint, 1, 1,
                         new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
-                    var packetHeader = Packet(PacketKind.FullSnapshot, 1, 1);
+                    var packetHeader = Packet(PacketKind.SnapshotChunk, 1, 1);
                     packetHeader.ServerTick = 1;
                     packetHeader.SchemaFingerprint = schema.Fingerprint;
                     Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
@@ -1076,7 +1076,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(captured.HistoryTicks, Is.EqualTo(1)); Assert.That(captured.HistoryBytes, Is.GreaterThan(0));
                     var applied = clientObserver.Single(NetworkPhase.SnapshotApply);
                     Assert.That(applied.Entities, Is.EqualTo(1)); Assert.That(applied.Records, Is.EqualTo(1));
-                    var decodedSnapshot = clientObserver.Single(NetworkPhase.Decode, NetworkPacketKind.FullSnapshot);
+                    var decodedSnapshot = clientObserver.Single(NetworkPhase.Decode, NetworkPacketKind.SnapshotChunk);
                     var ack = clientObserver.Single(NetworkPhase.Send, NetworkPacketKind.Ack);
                     Assert.That(decodedSnapshot.Timestamp, Is.LessThanOrEqualTo(applied.Timestamp));
                     Assert.That(applied.Timestamp, Is.LessThanOrEqualTo(ack.Timestamp));
@@ -1181,16 +1181,16 @@ namespace UniGame.StaticEcs.Network.Tests
 
             var classified = new NetworkSession<TestWorld>(new ConnectionId(3), NetworkRole.Server, schema);
             Assert.That(classified.Admit(schema.Fingerprint, 1, 7, default), Is.EqualTo(NetworkAdmissionResult.Accepted));
-            var wrongRoleReplay = Packet(PacketKind.FullSnapshot, 6, 99);
+            var wrongRoleReplay = Packet(PacketKind.SnapshotChunk, 6, 99);
             Assert.That(classified.ValidatePacket(in wrongRoleReplay), Is.EqualTo(PacketValidationResult.WrongRole));
             var first = Packet(PacketKind.Ack, 7, 1);
             Assert.That(classified.ValidatePacket(in first), Is.EqualTo(PacketValidationResult.Success), "wrong-role rejection must not consume the cursor");
 
-            var kinds = new[] { PacketKind.Hello, PacketKind.Ready, PacketKind.CommandBatch, PacketKind.FullSnapshot, PacketKind.Ack, PacketKind.ResyncRequest, PacketKind.Disconnect };
+            var kinds = new[] { PacketKind.Hello, PacketKind.Ready, PacketKind.CommandBatch, PacketKind.SnapshotChunk, PacketKind.Ack, PacketKind.ResyncRequest, PacketKind.Disconnect };
             for (var i = 0; i < kinds.Length; i++)
             {
                 AssertPacketDirection(schema, NetworkRole.Server, kinds[i], kinds[i] == PacketKind.CommandBatch || kinds[i] == PacketKind.Ack || kinds[i] == PacketKind.ResyncRequest || kinds[i] == PacketKind.Disconnect, (uint)(10 + i));
-                AssertPacketDirection(schema, NetworkRole.Client, kinds[i], kinds[i] == PacketKind.FullSnapshot || kinds[i] == PacketKind.ResyncRequest || kinds[i] == PacketKind.Disconnect, (uint)(30 + i));
+                AssertPacketDirection(schema, NetworkRole.Client, kinds[i], kinds[i] == PacketKind.SnapshotChunk || kinds[i] == PacketKind.ResyncRequest || kinds[i] == PacketKind.Disconnect, (uint)(30 + i));
             }
         }
 
@@ -1906,7 +1906,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(session.ValidatePacket(in candidate), Is.EqualTo(PacketValidationResult.Sequence));
             else
             {
-                var fallback = Packet(role == NetworkRole.Server ? PacketKind.Ack : PacketKind.FullSnapshot, 7, 1);
+                var fallback = Packet(role == NetworkRole.Server ? PacketKind.Ack : PacketKind.SnapshotChunk, 7, 1);
                 Assert.That(session.ValidatePacket(in fallback), Is.EqualTo(PacketValidationResult.Success), $"{role} rejected {kind} without consuming sequence");
             }
             Assert.That(session.State, Is.EqualTo(NetworkSessionState.Established));

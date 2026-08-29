@@ -3,9 +3,11 @@ namespace UniGame.StaticEcs.Network.Tests
     using System;
     using System.Collections.Generic;
     using System.Diagnostics;
+    using FFS.Libraries.StaticEcs;
+    using FFS.Libraries.StaticPack;
     using NUnit.Framework;
 
-    /// <summary>Exercises deterministic multi-peer protocol traffic without creating gameplay worlds.</summary>
+    /// <summary>Exercises deterministic multi-peer protocol traffic with real canonical ECS captures.</summary>
     [TestFixture]
     internal sealed class NetworkProtocolLoadTests
     {
@@ -24,12 +26,21 @@ namespace UniGame.StaticEcs.Network.Tests
         private static void RunProfile(string name, int peerCount, int actorCount,
             int ticks, bool adverse)
         {
+            CreateWorld();
+            var schema = Schema();
+            var replicator = new NetworkReplicator<LoadWorld>(schema,
+                static (_, _) => true, new ScopeId(1));
+            var actors = new World<LoadWorld>.Entity[actorCount];
+            for (var index = 0; index < actors.Length; index++)
+            {
+                actors[index] = World<LoadWorld>.NewEntity<LoadEntity>();
+                actors[index].Set(new LoadComponent { Value = index });
+            }
             var allocationStart = GC.GetAllocatedBytesForCurrentThread();
             var peers = CreatePeers(peerCount, adverse);
             var tickSamples = new long[ticks];
             var captureSamples = new long[ticks * peerCount];
             var applySamples = new long[ticks * peerCount];
-            var actorPayload = new byte[4 + actorCount * 12];
             var captureIndex = 0;
             var applyIndex = 0;
             long bytes = 0;
@@ -40,7 +51,10 @@ namespace UniGame.StaticEcs.Network.Tests
                 Handshake(peers, ref bytes);
                 for (uint tick = 1; tick <= ticks; tick++)
                 {
-                    Write32(actorPayload, 0, tick);
+                    actors[(tick - 1) % (uint)actors.Length].Set(
+                        new LoadComponent { Value = checked((int)tick) });
+                    Assert.That(replicator.Capture(tick, out var capture),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
                     var tickStart = Stopwatch.GetTimestamp();
                     for (var peerIndex = 0; peerIndex < peers.Count; peerIndex++)
                     {
@@ -52,13 +66,14 @@ namespace UniGame.StaticEcs.Network.Tests
                         Assert.That(peer.Simulator.Client.TrySend(commandPacket), Is.True);
 
                         var captureStart = Stopwatch.GetTimestamp();
-                        var snapshot = Encode(PacketKind.FullSnapshot,
-                            PacketFlags.ReliableOrdered, tick + 1, tick, actorPayload);
+                        var snapshot = EncodeSnapshot(
+                            ++peer.SnapshotSequence, capture);
                         captureSamples[captureIndex] = ElapsedNanoseconds(captureStart);
                         bytes += snapshot.Length;
                         Assert.That(peer.Simulator.Server.TrySend(snapshot), Is.True);
                         captureIndex++;
                     }
+                    capture.Dispose();
 
                     AdvanceAndDrain(peers, 50, applySamples, ref applyIndex, ref bytes);
                     tickSamples[tick - 1] = ElapsedNanoseconds(tickStart);
@@ -121,6 +136,8 @@ namespace UniGame.StaticEcs.Network.Tests
             {
                 foreach (var peer in peers)
                     peer.Simulator.Dispose();
+                replicator.Dispose();
+                World<LoadWorld>.Destroy();
             }
         }
 
@@ -188,12 +205,28 @@ namespace UniGame.StaticEcs.Network.Tests
                     {
                         var applyStart = Stopwatch.GetTimestamp();
                         if (!NetworkPacket.TryDecode(snapshotPacket, out var header, out var payload) ||
-                            header.Kind != PacketKind.FullSnapshot || payload.Length < 4)
+                            header.Kind != PacketKind.SnapshotChunk ||
+                            payload.Length < SnapshotChunkHeader.Size ||
+                            !SnapshotChunkHeader.TryRead(payload.Span,
+                                out var chunk) ||
+                            chunk.PayloadKind != SnapshotPayloadKind.Keyframe ||
+                            chunk.ChunkIndex != 0 || chunk.ChunkCount != 1 ||
+                            chunk.SnapshotTick != header.ServerTick)
                         {
                             peer.ProtocolErrors++;
                             continue;
                         }
-                        peer.LastSnapshotTick = Read32(payload.Span, 0);
+                        var canonical = payload.Span.Slice(
+                            SnapshotChunkHeader.Size);
+                        if (chunk.TotalLength != (uint)canonical.Length ||
+                            chunk.TotalHash != Hashing.XxHash64(canonical) ||
+                            !SnapshotDeltaCodec.TryInspectCanonical(canonical,
+                                out _, out _))
+                        {
+                            peer.ProtocolErrors++;
+                            continue;
+                        }
+                        peer.LastSnapshotTick = chunk.SnapshotTick;
                         if (applyIndex < applySamples.Length)
                             applySamples[applyIndex++] = ElapsedNanoseconds(applyStart);
                         var ack = Encode(PacketKind.Ack, PacketFlags.ReliableOrdered,
@@ -249,6 +282,36 @@ namespace UniGame.StaticEcs.Network.Tests
             return payload;
         }
 
+        private static NetworkBufferLease EncodeSnapshot(uint sequence,
+            NetworkSnapshot snapshot)
+        {
+            var payload = Buffers.Rent(checked(
+                SnapshotChunkHeader.Size + snapshot.ByteLength));
+            try
+            {
+                var chunk = new SnapshotChunkHeader
+                {
+                    PayloadKind = SnapshotPayloadKind.Keyframe,
+                    SnapshotTick = snapshot.ServerTick,
+                    BaselineTick = 0,
+                    TotalLength = checked((uint)snapshot.ByteLength),
+                    TotalHash = snapshot.PayloadHash,
+                    ChunkIndex = 0,
+                    ChunkCount = 1
+                };
+                Assert.That(chunk.TryWrite(payload.WritableSpan), Is.True);
+                snapshot.Bytes.Span.CopyTo(payload.WritableSpan.Slice(
+                    SnapshotChunkHeader.Size));
+                return Encode(PacketKind.SnapshotChunk,
+                    PacketFlags.ReliableOrdered, sequence,
+                    snapshot.ServerTick, payload.Span);
+            }
+            finally
+            {
+                payload.Dispose();
+            }
+        }
+
         private static NetworkBufferLease Encode(PacketKind kind, PacketFlags flags,
             uint sequence,
             uint tick, ReadOnlySpan<byte> payload)
@@ -291,12 +354,46 @@ namespace UniGame.StaticEcs.Network.Tests
             destination[offset + 3] = (byte)(value >> 24);
         }
 
+        private static void CreateWorld()
+        {
+            World<LoadWorld>.Create(WorldConfig.Default());
+            var types = World<LoadWorld>.Types();
+            types.EntityType<LoadEntity>();
+            types.Component<LoadComponent>();
+            World<LoadWorld>.Initialize();
+        }
+
+        private static NetworkSchema<LoadWorld> Schema()
+        {
+            var factory = NetworkCompilerSupport.Create<LoadWorld>();
+            factory.Entity<LoadEntity>(new NetworkTypeId(1));
+            factory.DisableableComponent<LoadComponent>(new NetworkTypeId(2));
+            return factory.Freeze();
+        }
+
+        private struct LoadWorld : IWorldType { }
+        private struct LoadEntity : IEntityType, INetworkType
+        {
+            public byte Id() => 1;
+        }
+        private struct LoadComponent : IComponent, IDisableable, INetworkType
+        {
+            public int Value;
+            public void Write<TWorld>(ref BinaryPackWriter writer,
+                World<TWorld>.Entity self) where TWorld : struct, IWorldType =>
+                writer.WriteInt(Value);
+            public void Read<TWorld>(ref BinaryPackReader reader,
+                World<TWorld>.Entity self, byte version, bool disabled)
+                where TWorld : struct, IWorldType => Value = reader.ReadInt();
+        }
+
         private sealed class Peer
         {
             internal readonly NetworkSimulator Simulator;
             internal readonly HashSet<uint> ProcessedCommands = new HashSet<uint>();
             internal uint LastSnapshotTick;
             internal uint AckSequence;
+            internal uint SnapshotSequence = 1;
             internal int ProtocolErrors;
 
             internal Peer(NetworkSimulator simulator) => Simulator = simulator;
