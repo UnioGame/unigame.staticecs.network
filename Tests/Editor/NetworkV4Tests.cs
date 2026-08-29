@@ -1732,7 +1732,12 @@ namespace UniGame.StaticEcs.Network.Tests
             CreateReplicationWorld<ClientAWorld>(false);
             var pool = new NetworkBufferPool(4L << 20);
             MemoryNetworkTransport.CreatePair(new ConnectionId(801),
-                out var clientTransport, out var serverTransport);
+                out var clientEndpoint, out var serverEndpoint);
+            var reliableLimit = PacketHeader.Size + SnapshotChunkHeader.Size + 8;
+            var clientTransport = new LimitedNetworkTransport(clientEndpoint,
+                clientEndpoint.MaxUnreliablePayloadBytes, reliableLimit);
+            var serverTransport = new LimitedNetworkTransport(serverEndpoint,
+                serverEndpoint.MaxUnreliablePayloadBytes, reliableLimit);
             var server = new NetworkServer<AuthorityWorld>(Schema<AuthorityWorld>(true),
                 static (_, _) => true, bufferPool: pool);
             var client = new NetworkClient<ClientAWorld>(clientTransport,
@@ -1748,8 +1753,11 @@ namespace UniGame.StaticEcs.Network.Tests
                 server.CompleteTick();
                 client.Process();
 
+                serverTransport.ResetSentPackets();
                 for (uint tick = 2; tick < 130; tick++)
                     RunCoreTick(client, server, tick);
+                Assert.That(serverTransport.SentPacketCount,
+                    Is.GreaterThan(128));
 
                 GC.Collect();
                 GC.WaitForPendingFinalizers();
@@ -1908,12 +1916,9 @@ namespace UniGame.StaticEcs.Network.Tests
                     out var conflictBody);
                 var conflict = conflictBody.ToArray();
                 conflict[conflict.Length - 1] ^= 1;
-                Assert.That(serverTransport.TrySend(first), Is.True);
-                first = null;
+                Assert.That(serverTransport.TrySend(first.Retain()), Is.True);
                 SendSnapshotChunk(serverTransport, clientSchema.Fingerprint,
                     conflictChunk.ChunkIndex + 1, conflictChunk, conflict);
-                second.Dispose();
-                second = null;
                 client.Process();
                 Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(4));
                 Assert.That(ReadReplicaValue(), Is.EqualTo(4));
@@ -1921,16 +1926,22 @@ namespace UniGame.StaticEcs.Network.Tests
                     out var recovery), Is.True);
                 Assert.That(recovery.Phase,
                     Is.EqualTo(NetworkRecoveryPhase.AwaitingKeyframe));
+                Assert.That(serverTransport.TrySend(first), Is.True);
+                first = null;
+                Assert.That(serverTransport.TrySend(second), Is.True);
+                second = null;
+                client.Process();
+                Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(4));
+                Assert.That(ReadReplicaValue(), Is.EqualTo(4));
+                Assert.That(client.TryConsumeRecoveryTransition(out _),
+                    Is.False);
 
                 server.Receive();
                 entity.Set(new TestComponent { Value = 6 });
                 server.Tick(_ => { });
                 Assert.That(clientTransport.TryReceive(out first), Is.True);
                 Assert.That(clientTransport.TryReceive(out second), Is.True);
-                Assert.That(serverTransport.TrySend(first), Is.True);
-                first = null;
-                second.Dispose();
-                second = null;
+                Assert.That(serverTransport.TrySend(first.Retain()), Is.True);
                 client.Process();
                 Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(4));
                 client.Process(long.MaxValue);
@@ -1940,6 +1951,15 @@ namespace UniGame.StaticEcs.Network.Tests
                     Is.True);
                 Assert.That(recovery.Phase,
                     Is.EqualTo(NetworkRecoveryPhase.AwaitingKeyframe));
+                Assert.That(serverTransport.TrySend(first), Is.True);
+                first = null;
+                Assert.That(serverTransport.TrySend(second), Is.True);
+                second = null;
+                client.Process();
+                Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(4));
+                Assert.That(ReadReplicaValue(), Is.EqualTo(4));
+                Assert.That(client.TryConsumeRecoveryTransition(out _),
+                    Is.False);
             }
             finally
             {

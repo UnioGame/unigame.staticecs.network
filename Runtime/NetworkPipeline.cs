@@ -45,6 +45,7 @@ namespace UniGame.StaticEcs.Network
         private int _snapshotAssemblyReceived;
         private int _snapshotAssemblyBytes;
         private long _snapshotAssemblyDeadline;
+        private uint _snapshotDiscardThroughTick;
 
         /// <summary>Creates an isolated client pipeline.</summary>
         public NetworkClient(INetworkTransport transport, NetworkSchema<TWorld> schema,
@@ -138,6 +139,7 @@ namespace UniGame.StaticEcs.Network
         public void Disconnect()
         {
             ClearSnapshotAssembly();
+            _snapshotDiscardThroughTick = 0;
             _session.Close();
             _replicator.ClearReplicas();
             AcknowledgedSnapshotTick = 0;
@@ -297,7 +299,13 @@ namespace UniGame.StaticEcs.Network
                 {
                     if (!awaitingSnapshotChunks)
                     {
-                        if (staged.Snapshot == null) RequestResync(header.ServerTick, NetworkRecoveryReason.SnapshotRejected);
+                        if (staged.Snapshot == null)
+                        {
+                            _snapshotDiscardThroughTick = Math.Max(
+                                _snapshotDiscardThroughTick,
+                                header.ServerTick);
+                            RequestResync(header.ServerTick, NetworkRecoveryReason.SnapshotRejected);
+                        }
                         else if (!ApplySnapshot(staged, header, entities, records, snapshotKind)) return;
                     }
                 }
@@ -569,6 +577,12 @@ namespace UniGame.StaticEcs.Network
                 chunk.TotalLength > ProtocolLimits.MaxDecodedPayloadBytes ||
                 chunk.SnapshotTick != header.ServerTick)
                 return false;
+            if (chunk.SnapshotTick <= Math.Max(AcknowledgedSnapshotTick,
+                    _snapshotDiscardThroughTick))
+            {
+                awaitingChunks = true;
+                return true;
+            }
             var maxBody = Math.Min(
                 reliableLimit - PacketHeader.Size - SnapshotChunkHeader.Size,
                 ProtocolLimits.MaxWirePayloadBytes - SnapshotChunkHeader.Size);
@@ -594,7 +608,12 @@ namespace UniGame.StaticEcs.Network
             }
             if (_snapshotAssemblyReceived != 0 &&
                 chunk.SnapshotTick > _snapshotAssemblyChunk.SnapshotTick)
+            {
+                _snapshotDiscardThroughTick = Math.Max(
+                    _snapshotDiscardThroughTick,
+                    _snapshotAssemblyChunk.SnapshotTick);
                 ClearSnapshotAssembly();
+            }
             if (_snapshotAssemblyReceived == 0)
             {
                 _snapshotAssemblyHeader = header;
@@ -677,6 +696,8 @@ namespace UniGame.StaticEcs.Network
                 timestamp < _snapshotAssemblyDeadline)
                 return;
             var snapshotTick = _snapshotAssemblyChunk.SnapshotTick;
+            _snapshotDiscardThroughTick = Math.Max(
+                _snapshotDiscardThroughTick, snapshotTick);
             ClearSnapshotAssembly();
             RequestResync(snapshotTick,
                 NetworkRecoveryReason.SnapshotRejected);
