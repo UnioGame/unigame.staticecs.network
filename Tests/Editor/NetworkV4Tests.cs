@@ -12,14 +12,14 @@ namespace UniGame.StaticEcs.Network.Tests
         private static readonly NetworkBufferPool Buffers = new NetworkBufferPool(64L << 20);
 
         [Test]
-        public void TypeIdsAndPacketHeaderAreCanonicalV4AndRejectV3()
+        public void TypeIdsAndPacketHeaderAreCanonicalV5AndRejectV4()
         {
             var id = NetworkCompilerSupport.TypeId("SourceGenerator.Tests", "Demo.Position");
             Assert.That(id.Value, Is.EqualTo(4089044646u));
             Assert.That(NetworkCompilerSupport.TypeId("game.shared", "Demo.Position").Value, Is.EqualTo(1933934308u));
             var header = new PacketHeader
             {
-                Kind = PacketKind.FullSnapshot,
+                Kind = PacketKind.SnapshotChunk,
                 Flags = PacketFlags.ReliableOrdered,
                 Compression = NetworkCompression.None,
                 ServerTick = 42,
@@ -32,12 +32,12 @@ namespace UniGame.StaticEcs.Network.Tests
             var bytes = new byte[PacketHeader.Size];
             Assert.That(header.TryWrite(bytes), Is.True);
             Assert.That(PacketHeader.TryRead(bytes, out var decoded), Is.True);
-            Assert.That(PacketHeader.Version, Is.EqualTo(4));
+            Assert.That(ProtocolLimits.Version, Is.EqualTo(5));
             Assert.That(decoded.SchemaFingerprint, Is.EqualTo(header.SchemaFingerprint));
             Assert.That(decoded.SimulationFingerprint,
                 Is.EqualTo(header.SimulationFingerprint));
             Assert.That(decoded.ContentFingerprint, Is.EqualTo(header.ContentFingerprint));
-            bytes[4] = 3;
+            bytes[4] = 4;
             bytes[5] = 0;
             Assert.That(PacketHeader.TryRead(bytes, out _), Is.False);
             Assert.That(header.TryWrite(bytes), Is.True);
@@ -51,6 +51,69 @@ namespace UniGame.StaticEcs.Network.Tests
             packet = Buffers.Copy(corruptBytes);
             Assert.That(NetworkPacket.TryDecode(packet, header.SchemaFingerprint, out _, out _), Is.False);
             packet.Dispose();
+        }
+
+        [Test]
+        public void SnapshotChunkHeaderRoundTrips()
+        {
+            var header = new SnapshotChunkHeader
+            {
+                PayloadKind = SnapshotPayloadKind.Delta,
+                SnapshotTick = 9,
+                BaselineTick = 8,
+                TotalLength = 17,
+                TotalHash = 0x0102030405060708UL,
+                ChunkIndex = 1,
+                ChunkCount = 2
+            };
+            var bytes = new byte[SnapshotChunkHeader.Size];
+            Assert.That(header.TryWrite(bytes), Is.True);
+            Assert.That(SnapshotChunkHeader.TryRead(bytes, out var decoded), Is.True);
+            Assert.That(decoded.PayloadKind, Is.EqualTo(header.PayloadKind));
+            Assert.That(decoded.SnapshotTick, Is.EqualTo(header.SnapshotTick));
+            Assert.That(decoded.BaselineTick, Is.EqualTo(header.BaselineTick));
+            Assert.That(decoded.TotalLength, Is.EqualTo(header.TotalLength));
+            Assert.That(decoded.TotalHash, Is.EqualTo(header.TotalHash));
+            Assert.That(decoded.ChunkIndex, Is.EqualTo(header.ChunkIndex));
+            Assert.That(decoded.ChunkCount, Is.EqualTo(header.ChunkCount));
+        }
+
+        [Test]
+        public void SnapshotChunkHeaderRejectsInvalidValues()
+        {
+            var header = new SnapshotChunkHeader
+            {
+                PayloadKind = SnapshotPayloadKind.Delta,
+                SnapshotTick = 9,
+                BaselineTick = 8,
+                TotalLength = 1,
+                TotalHash = 1,
+                ChunkCount = 1
+            };
+            var bytes = new byte[SnapshotChunkHeader.Size];
+            Assert.That(header.TryWrite(bytes), Is.True);
+            bytes[0] = 0;
+            Assert.That(SnapshotChunkHeader.TryRead(bytes, out _), Is.False);
+
+            header.PayloadKind = (SnapshotPayloadKind)3;
+            Assert.That(header.TryWrite(bytes), Is.False);
+            header.PayloadKind = SnapshotPayloadKind.Keyframe;
+            header.BaselineTick = 1;
+            Assert.That(header.TryWrite(bytes), Is.False);
+            header.PayloadKind = SnapshotPayloadKind.Delta;
+            header.BaselineTick = 0;
+            Assert.That(header.TryWrite(bytes), Is.False);
+            header.BaselineTick = header.SnapshotTick;
+            Assert.That(header.TryWrite(bytes), Is.False);
+            header.BaselineTick = 8;
+            header.TotalLength = 0;
+            Assert.That(header.TryWrite(bytes), Is.False);
+            header.TotalLength = 1;
+            header.ChunkCount = 0;
+            Assert.That(header.TryWrite(bytes), Is.False);
+            header.ChunkCount = 1;
+            header.ChunkIndex = 1;
+            Assert.That(header.TryWrite(bytes), Is.False);
         }
 
         [Test]

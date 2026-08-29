@@ -2,18 +2,18 @@ using System;
 
 namespace UniGame.StaticEcs.Network
 {
-    /// <summary>Declares the only wire compression supported by Network v4.</summary>
+    /// <summary>Declares the only wire compression supported by Network v5.</summary>
     public enum NetworkCompression : byte
     {
         /// <summary>Leaves the canonical payload unchanged.</summary>
         None = 0
     }
 
-    /// <summary>Contains the fixed Network v4 packet framing fields.</summary>
+    /// <summary>Contains the fixed Network v5 packet framing fields.</summary>
     public struct PacketHeader
     {
-        /// <summary>Network v4 protocol number.</summary>
-        public const ushort Version = 4;
+        /// <summary>Network v5 protocol number.</summary>
+        public const ushort Version = ProtocolLimits.Version;
         /// <summary>Fixed encoded header length.</summary>
         public const int Size = 84;
         /// <summary>Sentinel used when no tick exists.</summary>
@@ -137,10 +137,11 @@ namespace UniGame.StaticEcs.Network
             kind == PacketKind.Ready || kind == PacketKind.CommandBatch ||
             kind == PacketKind.FullSnapshot || kind == PacketKind.Ack ||
             kind == PacketKind.ResyncRequest || kind == PacketKind.Disconnect ||
-            kind == PacketKind.Ping || kind == PacketKind.Pong;
+            kind == PacketKind.SnapshotChunk || kind == PacketKind.Ping ||
+            kind == PacketKind.Pong;
     }
 
-    /// <summary>Encodes and validates exact Network v4 packets.</summary>
+    /// <summary>Encodes and validates exact Network v5 packets.</summary>
     public static class NetworkPacket
     {
         /// <summary>Frames one canonical payload with exact length and xxHash64.</summary>
