@@ -2106,6 +2106,9 @@ namespace UniGame.StaticEcs.Network.Tests
                         1, 1, scope), Is.EqualTo(NetworkAdmissionResult.Accepted));
                     var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
                     entity.Set(new TestComponent { Value = 1 });
+                    var unchanged = World<AuthorityWorld>
+                        .NewEntity<SecondEntity>();
+                    unchanged.Set(new TestComponent { Value = 99 });
                     Assert.That(capture.Capture(1, out baseline),
                         Is.EqualTo(SnapshotCaptureResult.Success));
                     entity.Set(new TestComponent { Value = 2 });
@@ -2113,6 +2116,8 @@ namespace UniGame.StaticEcs.Network.Tests
                         Is.EqualTo(SnapshotCaptureResult.Success));
                     Assert.That(SnapshotDeltaCodec.TryEncode(Buffers, baseline,
                         target, out delta), Is.True);
+                    Assert.That(delta.Length,
+                        Is.LessThan(target.ByteLength));
                     SendSnapshotChunk(serverTransport, clientSchema.Fingerprint,
                         1, DeltaHeader(baseline, target), delta.Span);
                     client.Process();
@@ -2141,6 +2146,8 @@ namespace UniGame.StaticEcs.Network.Tests
                         Is.EqualTo(SnapshotCaptureResult.Success));
                     Assert.That(SnapshotDeltaCodec.TryEncode(Buffers, target,
                         next, out delta), Is.True);
+                    Assert.That(delta.Length,
+                        Is.LessThan(next.ByteLength));
                     SendSnapshotChunk(serverTransport, clientSchema.Fingerprint,
                         1, DeltaHeader(target, next), delta.Span);
                     client.Process();
@@ -2156,6 +2163,8 @@ namespace UniGame.StaticEcs.Network.Tests
                         Is.EqualTo(SnapshotCaptureResult.Success));
                     Assert.That(SnapshotDeltaCodec.TryEncode(Buffers, next,
                         rejected, out delta), Is.True);
+                    Assert.That(delta.Length,
+                        Is.LessThan(rejected.ByteLength));
                     var corrupt = delta.Span.ToArray();
                     corrupt[corrupt.Length - 1] ^= 1;
                     SendSnapshotChunk(serverTransport, clientSchema.Fingerprint,
