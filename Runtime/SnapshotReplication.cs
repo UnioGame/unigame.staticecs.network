@@ -596,6 +596,10 @@ namespace UniGame.StaticEcs.Network
             ref int offset, out ulong gid, out uint kind, out byte disabled,
             out ushort recordCount, out ReadOnlySpan<byte> header)
         {
+            gid = 0;
+            kind = 0;
+            disabled = 0;
+            recordCount = 0;
             var start = offset;
             header = default;
             if (!TryReadUlong(bytes, ref offset, out gid) ||
