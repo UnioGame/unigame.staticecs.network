@@ -10,6 +10,8 @@ namespace UniGame.StaticEcs.Network
     public sealed class NetworkClient<TWorld> : IDisposable
         where TWorld : struct, IWorldType
     {
+        private static readonly long SnapshotAssemblyTimeoutTicks =
+            Stopwatch.Frequency * 2L;
         private readonly INetworkTransport _transport;
         private readonly NetworkSchema<TWorld> _schema;
         private readonly NetworkReplicator<TWorld> _replicator;
@@ -22,6 +24,8 @@ namespace UniGame.StaticEcs.Network
         private readonly int _predictionLeadTicks;
         private readonly ulong _simulationFingerprint;
         private readonly ulong _contentFingerprint;
+        private readonly NetworkBufferLease[] _snapshotChunks =
+            new NetworkBufferLease[ProtocolLimits.MaxChunkMappings];
         private uint _packetSequence = 1;
         private uint _commandPacketSequence = 1;
         private uint _lastCommandFlushTick;
@@ -36,6 +40,11 @@ namespace UniGame.StaticEcs.Network
         private bool _handshakeStarted;
         private NetworkRecoveryTransition _recoveryTransition;
         private bool _hasRecoveryTransition;
+        private PacketHeader _snapshotAssemblyHeader;
+        private SnapshotChunkHeader _snapshotAssemblyChunk;
+        private int _snapshotAssemblyReceived;
+        private int _snapshotAssemblyBytes;
+        private long _snapshotAssemblyDeadline;
 
         /// <summary>Creates an isolated client pipeline.</summary>
         public NetworkClient(INetworkTransport transport, NetworkSchema<TWorld> schema,
@@ -128,6 +137,7 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Closes the session and removes all replica-owned entities from the client world.</summary>
         public void Disconnect()
         {
+            ClearSnapshotAssembly();
             _session.Close();
             _replicator.ClearReplicas();
             AcknowledgedSnapshotTick = 0;
@@ -208,6 +218,12 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Processes received packets using authoritative ticks carried by the wire.</summary>
         public void Process()
         {
+            Process(Stopwatch.GetTimestamp());
+        }
+
+        internal void Process(long timestamp)
+        {
+            InspectSnapshotAssemblyTimeout(timestamp);
             while (true)
             {
                 var receiveStarted = Stopwatch.GetTimestamp();
@@ -265,8 +281,9 @@ namespace UniGame.StaticEcs.Network
                 var decodedBytes = packet.Length;
                 var decodeResult = NetworkResultCategory.Success;
                 var snapshotKind = default(SnapshotPayloadKind);
+                var awaitingSnapshotChunks = false;
                 if (header.Kind == PacketKind.Ready) DecodeReady(header, payload);
-                else if (header.Kind == PacketKind.SnapshotChunk) decodeResult = DiagnosticResult(TryStageSnapshot(packet, header, payload, out staged, out entities, out records, out decodedBytes, out snapshotKind));
+                else if (header.Kind == PacketKind.SnapshotChunk) decodeResult = DiagnosticResult(TryStageSnapshot(packet, header, payload, out staged, out entities, out records, out decodedBytes, out snapshotKind, out awaitingSnapshotChunks));
                 else if (header.Kind == PacketKind.Pong) DecodePong(payload);
                 else if (header.Kind == PacketKind.ResyncRequest) RequestResync(header.ServerTick, NetworkRecoveryReason.SnapshotRejected);
                 var disconnected = header.Kind == PacketKind.Disconnect;
@@ -278,8 +295,11 @@ namespace UniGame.StaticEcs.Network
                 }
                 if (header.Kind == PacketKind.SnapshotChunk)
                 {
-                    if (staged.Snapshot == null) RequestResync(header.ServerTick, NetworkRecoveryReason.SnapshotRejected);
-                    else if (!ApplySnapshot(staged, header, entities, records, snapshotKind)) return;
+                    if (!awaitingSnapshotChunks)
+                    {
+                        if (staged.Snapshot == null) RequestResync(header.ServerTick, NetworkRecoveryReason.SnapshotRejected);
+                        else if (!ApplySnapshot(staged, header, entities, records, snapshotKind)) return;
+                    }
                 }
                 _session.ReportSession(ServerTick, AcknowledgedSnapshotTick, ServerProcessedCommandSequence, _packetSequence);
                 }
@@ -467,63 +487,214 @@ namespace UniGame.StaticEcs.Network
         private SnapshotApplyResult TryStageSnapshot(NetworkBufferLease packet,
             PacketHeader header, ReadOnlyMemory<byte> payload,
             out StagedNetworkSnapshot staged, out int entities, out int records,
-            out int decodedBytes, out SnapshotPayloadKind payloadKind)
+            out int decodedBytes, out SnapshotPayloadKind payloadKind,
+            out bool awaitingChunks)
         {
             staged = default;
             entities = 0;
             records = 0;
             decodedBytes = payload.Length;
             payloadKind = default;
-            if (payload.Length < SnapshotChunkHeader.Size ||
-                !SnapshotChunkHeader.TryRead(payload.Span, out var chunk) ||
-                chunk.ChunkIndex != 0 || chunk.ChunkCount != 1 ||
-                chunk.SnapshotTick != header.ServerTick ||
-                chunk.SnapshotTick <= AcknowledgedSnapshotTick)
+            NetworkBufferLease body = null;
+            if (!TryAssembleSnapshot(packet, in header, payload, out var chunk,
+                    out body, out awaitingChunks))
                 return SnapshotApplyResult.Malformed;
+            if (awaitingChunks)
+                return SnapshotApplyResult.Success;
             payloadKind = chunk.PayloadKind;
-            var body = payload.Slice(SnapshotChunkHeader.Size);
-            NetworkSnapshot snapshot;
-            if (chunk.PayloadKind == SnapshotPayloadKind.Keyframe)
+            try
             {
-                if (chunk.TotalLength != (uint)body.Length ||
-                    Hashing.XxHash64(body.Span) != chunk.TotalHash ||
-                    !SnapshotDeltaCodec.TryInspectCanonical(body.Span,
-                        out entities, out records))
-                    return SnapshotApplyResult.Malformed;
-                var exact = packet.RetainSlice(
-                    PacketHeader.Size + SnapshotChunkHeader.Size, body.Length);
-                snapshot = _replicator.CreateSnapshot(chunk.SnapshotTick,
-                    header.SchemaFingerprint, _session.Scope, exact, entities,
-                    records);
-            }
-            else
-            {
-                NetworkBufferLease canonical = null;
-                if (!History.TryGet(chunk.BaselineTick, out var baseline) ||
-                    baseline.SchemaFingerprint != header.SchemaFingerprint ||
-                    baseline.Scope != _session.Scope ||
-                    !SnapshotDeltaCodec.TryReconstruct(_bufferPool, baseline,
-                        body.Span, in chunk, header.SchemaFingerprint,
-                        _session.Scope, out canonical, out entities,
-                        out records))
-                    return SnapshotApplyResult.Malformed;
-                try
+                NetworkSnapshot snapshot;
+                if (chunk.PayloadKind == SnapshotPayloadKind.Keyframe)
                 {
+                    if (chunk.TotalLength != (uint)body.Length ||
+                        Hashing.XxHash64(body.Span) != chunk.TotalHash ||
+                        !SnapshotDeltaCodec.TryInspectCanonical(body.Span,
+                            out entities, out records))
+                        return SnapshotApplyResult.Malformed;
                     snapshot = _replicator.CreateSnapshot(chunk.SnapshotTick,
-                        header.SchemaFingerprint, _session.Scope, canonical,
+                        header.SchemaFingerprint, _session.Scope, body,
                         entities, records);
-                    canonical = null;
+                    body = null;
                 }
-                finally
+                else
                 {
-                    canonical?.Dispose();
+                    NetworkBufferLease canonical = null;
+                    if (!History.TryGet(chunk.BaselineTick, out var baseline) ||
+                        baseline.SchemaFingerprint != header.SchemaFingerprint ||
+                        baseline.Scope != _session.Scope ||
+                        !SnapshotDeltaCodec.TryReconstruct(_bufferPool, baseline,
+                            body.Span, in chunk, header.SchemaFingerprint,
+                            _session.Scope, out canonical, out entities,
+                            out records))
+                        return SnapshotApplyResult.Malformed;
+                    try
+                    {
+                        snapshot = _replicator.CreateSnapshot(chunk.SnapshotTick,
+                            header.SchemaFingerprint, _session.Scope, canonical,
+                            entities, records);
+                        canonical = null;
+                    }
+                    finally
+                    {
+                        canonical?.Dispose();
+                    }
                 }
+                decodedBytes = snapshot.ByteLength;
+                var result = _replicator.Stage(snapshot, out staged);
+                if (result != SnapshotApplyResult.Success)
+                    snapshot.Dispose();
+                return result;
             }
-            decodedBytes = snapshot.ByteLength;
-            var result = _replicator.Stage(snapshot, out staged);
-            if (result != SnapshotApplyResult.Success)
-                snapshot.Dispose();
-            return result;
+            finally
+            {
+                body?.Dispose();
+            }
+        }
+
+        private bool TryAssembleSnapshot(NetworkBufferLease packet,
+            in PacketHeader header, ReadOnlyMemory<byte> payload,
+            out SnapshotChunkHeader completedChunk,
+            out NetworkBufferLease completedBody, out bool awaitingChunks)
+        {
+            completedChunk = default;
+            completedBody = null;
+            awaitingChunks = false;
+            var reliableLimit = _transport.MaxReliablePayloadBytes;
+            if (reliableLimit <= PacketHeader.Size + SnapshotChunkHeader.Size ||
+                packet.Length > reliableLimit ||
+                payload.Length < SnapshotChunkHeader.Size ||
+                !SnapshotChunkHeader.TryRead(payload.Span, out var chunk) ||
+                chunk.ChunkCount > ProtocolLimits.MaxChunkMappings ||
+                chunk.TotalLength > ProtocolLimits.MaxDecodedPayloadBytes ||
+                chunk.SnapshotTick != header.ServerTick)
+                return false;
+            var maxBody = Math.Min(
+                reliableLimit - PacketHeader.Size - SnapshotChunkHeader.Size,
+                ProtocolLimits.MaxWirePayloadBytes - SnapshotChunkHeader.Size);
+            var maximumChunkCount =
+                (chunk.TotalLength + (long)maxBody - 1L) / maxBody;
+            var body = payload.Slice(SnapshotChunkHeader.Size);
+            if (chunk.ChunkCount > maximumChunkCount ||
+                body.Length == 0 || body.Length > maxBody ||
+                chunk.ChunkIndex + 1 < chunk.ChunkCount &&
+                body.Length != maxBody ||
+                header.PacketSequence != chunk.ChunkIndex + 1)
+                return false;
+            if (chunk.SnapshotTick <= AcknowledgedSnapshotTick)
+            {
+                awaitingChunks = true;
+                return true;
+            }
+            if (_snapshotAssemblyReceived != 0 &&
+                chunk.SnapshotTick < _snapshotAssemblyChunk.SnapshotTick)
+            {
+                awaitingChunks = true;
+                return true;
+            }
+            if (_snapshotAssemblyReceived != 0 &&
+                chunk.SnapshotTick > _snapshotAssemblyChunk.SnapshotTick)
+                ClearSnapshotAssembly();
+            if (_snapshotAssemblyReceived == 0)
+            {
+                _snapshotAssemblyHeader = header;
+                _snapshotAssemblyChunk = chunk;
+                _snapshotAssemblyDeadline = Stopwatch.GetTimestamp() +
+                                            SnapshotAssemblyTimeoutTicks;
+            }
+            else if (_snapshotAssemblyHeader.SessionEpoch != header.SessionEpoch ||
+                     _snapshotAssemblyHeader.SchemaFingerprint != header.SchemaFingerprint ||
+                     _snapshotAssemblyHeader.SimulationFingerprint != header.SimulationFingerprint ||
+                     _snapshotAssemblyHeader.ContentFingerprint != header.ContentFingerprint ||
+                     _snapshotAssemblyHeader.ServerProcessedCommandTick != header.ServerProcessedCommandTick ||
+                     _snapshotAssemblyHeader.ServerProcessedCommandSequence != header.ServerProcessedCommandSequence ||
+                     _snapshotAssemblyChunk.PayloadKind != chunk.PayloadKind ||
+                     _snapshotAssemblyChunk.SnapshotTick != chunk.SnapshotTick ||
+                     _snapshotAssemblyChunk.BaselineTick != chunk.BaselineTick ||
+                     _snapshotAssemblyChunk.TotalLength != chunk.TotalLength ||
+                     _snapshotAssemblyChunk.TotalHash != chunk.TotalHash ||
+                     _snapshotAssemblyChunk.ChunkCount != chunk.ChunkCount)
+            {
+                return false;
+            }
+
+            var index = checked((int)chunk.ChunkIndex);
+            var retained = _snapshotChunks[index];
+            if (retained != null)
+            {
+                if (retained.Length != body.Length ||
+                    !retained.Span.SequenceEqual(body.Span))
+                    return false;
+                awaitingChunks = true;
+                return true;
+            }
+            if ((long)_snapshotAssemblyBytes + body.Length >
+                chunk.TotalLength)
+                return false;
+            _snapshotChunks[index] = packet.RetainSlice(
+                PacketHeader.Size + SnapshotChunkHeader.Size, body.Length);
+            _snapshotAssemblyBytes += body.Length;
+            _snapshotAssemblyReceived++;
+            if (_snapshotAssemblyReceived != chunk.ChunkCount)
+            {
+                awaitingChunks = true;
+                return true;
+            }
+
+            var assemblyChunk = _snapshotAssemblyChunk;
+            var assemblyCount = checked((int)assemblyChunk.ChunkCount);
+            NetworkBufferLease assembled = null;
+            try
+            {
+                assembled = _bufferPool.Rent(_snapshotAssemblyBytes);
+                var offset = 0;
+                for (var slotIndex = 0; slotIndex < assemblyCount; slotIndex++)
+                {
+                    var slot = _snapshotChunks[slotIndex];
+                    if (slot == null)
+                        return false;
+                    slot.Span.CopyTo(assembled.WritableSpan.Slice(offset));
+                    offset += slot.Length;
+                }
+                if (offset != _snapshotAssemblyBytes)
+                    return false;
+                ClearSnapshotAssembly();
+                assemblyChunk.ChunkIndex = 0;
+                completedChunk = assemblyChunk;
+                completedBody = assembled;
+                assembled = null;
+                return true;
+            }
+            finally
+            {
+                assembled?.Dispose();
+            }
+        }
+
+        private void InspectSnapshotAssemblyTimeout(long timestamp)
+        {
+            if (_snapshotAssemblyReceived == 0 ||
+                timestamp < _snapshotAssemblyDeadline)
+                return;
+            var snapshotTick = _snapshotAssemblyChunk.SnapshotTick;
+            ClearSnapshotAssembly();
+            RequestResync(snapshotTick,
+                NetworkRecoveryReason.SnapshotRejected);
+        }
+
+        private void ClearSnapshotAssembly()
+        {
+            var count = checked((int)_snapshotAssemblyChunk.ChunkCount);
+            for (var index = 0; index < count; index++)
+            {
+                _snapshotChunks[index]?.Dispose();
+                _snapshotChunks[index] = null;
+            }
+            _snapshotAssemblyHeader = default;
+            _snapshotAssemblyChunk = default;
+            _snapshotAssemblyReceived = 0;
+            _snapshotAssemblyBytes = 0;
+            _snapshotAssemblyDeadline = 0;
         }
 
         private bool ApplySnapshot(StagedNetworkSnapshot staged, PacketHeader header,
@@ -581,6 +752,8 @@ namespace UniGame.StaticEcs.Network
         private void RequestRecovery(NetworkRecoveryPhase phase,
             NetworkRecoveryReason reason, uint requestedAtTick)
         {
+            if (phase != NetworkRecoveryPhase.None)
+                ClearSnapshotAssembly();
             if (phase == NetworkRecoveryPhase.None)
                 _recoveryTransition = new NetworkRecoveryTransition(phase,
                     NetworkRecoveryReason.None, requestedAtTick);
@@ -593,13 +766,18 @@ namespace UniGame.StaticEcs.Network
         private bool Send(PacketKind kind, uint epoch, uint serverTick, uint acknowledgedTick, ReadOnlySpan<byte> payload)
         {
             var started = Stopwatch.GetTimestamp();
-            var header = Header(kind, _packetSequence++, serverTick);
+            var sequence = _packetSequence;
+            var header = Header(kind, sequence, serverTick);
             header.SessionEpoch = epoch;
             header.AcknowledgedSnapshotTick = acknowledgedTick;
-            var encoded = NetworkPacket.TryEncode(_bufferPool, header, payload,
-                out var packet);
+            NetworkBufferLease packet = null;
+            var encoded = sequence != uint.MaxValue &&
+                NetworkPacket.TryEncode(_bufferPool, header, payload,
+                    out packet);
             var packetBytes = packet?.Length ?? 0;
             var sent = encoded && _transport.TrySend(packet);
+            if (sent)
+                _packetSequence = sequence + 1;
             _session.Trace(NetworkPhase.Send, NetworkTraceKind.Point, sent ? NetworkResultCategory.Success : NetworkResultCategory.Transport, DiagnosticKind(kind), serverTick, 0, packetBytes, History.Count, History.Bytes, unchecked((int)(serverTick - AcknowledgedSnapshotTick)), ElapsedNanoseconds(started));
             _session.ReportSession(ServerTick, AcknowledgedSnapshotTick, ServerProcessedCommandSequence, _packetSequence);
             return sent;
@@ -1121,7 +1299,6 @@ namespace UniGame.StaticEcs.Network
         private void SendSnapshot(Peer peer, NetworkSnapshot snapshot)
         {
             NetworkBufferLease delta = null;
-            NetworkBufferLease payload = null;
             try
             {
                 var baselineTick = peer.AcknowledgedSnapshotTick;
@@ -1131,52 +1308,132 @@ namespace UniGame.StaticEcs.Network
                         out baseline) ||
                     baseline.Scope != peer.Scope ||
                     baseline.SchemaFingerprint != _schema.Fingerprint;
-                if (!keyframe && !SnapshotDeltaCodec.TryEncode(_bufferPool,
-                        baseline, snapshot, out delta))
-                    keyframe = true;
+                if (!keyframe)
+                {
+                    if (!SnapshotDeltaCodec.TryEncode(_bufferPool, baseline,
+                            snapshot, out delta) ||
+                        delta.Length >= snapshot.ByteLength)
+                    {
+                        delta?.Dispose();
+                        delta = null;
+                        keyframe = true;
+                    }
+                }
                 if (keyframe)
                     peer.ResyncRequested = true;
 
                 var body = keyframe ? snapshot.Bytes.Span : delta.Span;
-                payload = _bufferPool.Rent(checked(
-                    SnapshotChunkHeader.Size + body.Length));
-                var chunk = new SnapshotChunkHeader
-                {
-                    PayloadKind = keyframe
-                        ? SnapshotPayloadKind.Keyframe
-                        : SnapshotPayloadKind.Delta,
-                    SnapshotTick = snapshot.ServerTick,
-                    BaselineTick = keyframe ? 0 : baselineTick,
-                    TotalLength = checked((uint)snapshot.ByteLength),
-                    TotalHash = snapshot.PayloadHash,
-                    ChunkIndex = 0,
-                    ChunkCount = 1
-                };
-                if (!chunk.TryWrite(payload.WritableSpan))
+                var reliableLimit = peer.Transport.MaxReliablePayloadBytes;
+                if (reliableLimit <= PacketHeader.Size + SnapshotChunkHeader.Size)
                 {
                     peer.ResyncRequested = true;
                     return;
                 }
-                body.CopyTo(payload.WritableSpan.Slice(
-                    SnapshotChunkHeader.Size));
-                if (!Send(peer, PacketKind.SnapshotChunk, snapshot.ServerTick,
-                        PacketHeader.NoneTick, payload.Span))
+                var maxBody = Math.Min(
+                    reliableLimit - PacketHeader.Size - SnapshotChunkHeader.Size,
+                    ProtocolLimits.MaxWirePayloadBytes - SnapshotChunkHeader.Size);
+                if (body.Length > ProtocolLimits.MaxDecodedPayloadBytes)
+                {
                     peer.ResyncRequested = true;
+                    return;
+                }
+                var chunkCountLong = (body.Length + (long)maxBody - 1L) / maxBody;
+                if (chunkCountLong < 1 ||
+                    chunkCountLong > ProtocolLimits.MaxChunkMappings)
+                {
+                    peer.ResyncRequested = true;
+                    return;
+                }
+                var chunkCount = checked((uint)chunkCountLong);
+                for (uint chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++)
+                {
+                    var bodyOffset = checked((int)((long)chunkIndex *
+                                                   maxBody));
+                    var bodyLength = Math.Min(maxBody, body.Length - bodyOffset);
+                    var payload = _bufferPool.Rent(checked(
+                        SnapshotChunkHeader.Size + bodyLength));
+                    try
+                    {
+                        var chunk = new SnapshotChunkHeader
+                        {
+                            PayloadKind = keyframe
+                                ? SnapshotPayloadKind.Keyframe
+                                : SnapshotPayloadKind.Delta,
+                            SnapshotTick = snapshot.ServerTick,
+                            BaselineTick = keyframe ? 0 : baselineTick,
+                            TotalLength = checked((uint)snapshot.ByteLength),
+                            TotalHash = snapshot.PayloadHash,
+                            ChunkIndex = chunkIndex,
+                            ChunkCount = chunkCount
+                        };
+                        if (!chunk.TryWrite(payload.WritableSpan))
+                        {
+                            peer.ResyncRequested = true;
+                            return;
+                        }
+                        body.Slice(bodyOffset, bodyLength).CopyTo(
+                            payload.WritableSpan.Slice(SnapshotChunkHeader.Size));
+                        if (!SendSnapshotChunk(peer, snapshot.ServerTick,
+                                chunkIndex + 1, payload.Span))
+                        {
+                            peer.ResyncRequested = true;
+                            return;
+                        }
+                    }
+                    finally
+                    {
+                        payload.Dispose();
+                    }
+                }
             }
             finally
             {
-                payload?.Dispose();
                 delta?.Dispose();
             }
+        }
+
+        private bool SendSnapshotChunk(Peer peer, uint serverTick,
+            uint sequence, ReadOnlySpan<byte> payload)
+        {
+            var started = Stopwatch.GetTimestamp();
+            var header = new PacketHeader
+            {
+                Kind = PacketKind.SnapshotChunk,
+                Flags = PacketFlags.ReliableOrdered,
+                Compression = NetworkCompression.None,
+                SessionEpoch = peer.Session.Epoch,
+                PacketSequence = sequence,
+                ServerTick = serverTick,
+                AcknowledgedSnapshotTick = PacketHeader.NoneTick,
+                ServerProcessedCommandTick = peer.ServerProcessedCommandTick,
+                ServerProcessedCommandSequence = peer.ServerProcessedCommandSequence,
+                SchemaFingerprint = _schema.Fingerprint,
+                SimulationFingerprint = _simulationFingerprint,
+                ContentFingerprint = _contentFingerprint
+            };
+            var encoded = NetworkPacket.TryEncode(_bufferPool, header, payload,
+                out var packet);
+            var packetBytes = packet?.Length ?? 0;
+            var sent = encoded && peer.Transport.TrySend(packet);
+            peer.Session.Trace(NetworkPhase.Send, NetworkTraceKind.Point,
+                sent ? NetworkResultCategory.Success : NetworkResultCategory.Transport,
+                NetworkPacketKind.SnapshotChunk, serverTick, PacketHeader.NoneTick,
+                packetBytes, _coordinator.HistoryCount(peer.Scope),
+                _coordinator.HistoryByteCount(peer.Scope),
+                unchecked((int)(serverTick - peer.AcknowledgedSnapshotTick)),
+                ElapsedNanoseconds(started), activeConnections: ActiveConnectionCount,
+                activePeers: ActivePeerCount);
+            return sent;
         }
 
         private bool Send(Peer peer, PacketKind kind, uint serverTick, uint acknowledgedTick, ReadOnlySpan<byte> payload)
         {
             var started = Stopwatch.GetTimestamp();
+            var sequence = peer.PacketSequence;
             var header = new PacketHeader
             {
                 Kind = kind, Flags = PacketFlags.ReliableOrdered, Compression = NetworkCompression.None,
-                SessionEpoch = peer.Session.Epoch, PacketSequence = peer.PacketSequence++, ServerTick = serverTick,
+                SessionEpoch = peer.Session.Epoch, PacketSequence = sequence, ServerTick = serverTick,
                 AcknowledgedSnapshotTick = acknowledgedTick,
                 ServerProcessedCommandTick = peer.ServerProcessedCommandTick,
                 ServerProcessedCommandSequence = peer.ServerProcessedCommandSequence,
@@ -1184,10 +1441,14 @@ namespace UniGame.StaticEcs.Network
                 , SimulationFingerprint = _simulationFingerprint
                 , ContentFingerprint = _contentFingerprint
             };
-            var encoded = NetworkPacket.TryEncode(_bufferPool, header, payload,
-                out var packet);
+            NetworkBufferLease packet = null;
+            var encoded = sequence != uint.MaxValue &&
+                NetworkPacket.TryEncode(_bufferPool, header, payload,
+                    out packet);
             var packetBytes = packet?.Length ?? 0;
             var sent = encoded && peer.Transport.TrySend(packet);
+            if (sent)
+                peer.PacketSequence = sequence + 1;
             peer.Session.Trace(NetworkPhase.Send, NetworkTraceKind.Point, sent ? NetworkResultCategory.Success : NetworkResultCategory.Transport, DiagnosticKind(kind), serverTick, PacketHeader.NoneTick, packetBytes, _coordinator.HistoryCount(peer.Scope), _coordinator.HistoryByteCount(peer.Scope), unchecked((int)(serverTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), activeConnections: ActiveConnectionCount, activePeers: ActivePeerCount);
             var reportedTick = serverTick == PacketHeader.NoneTick ? ServerTick : Math.Max(ServerTick, serverTick);
             peer.Session.ReportSession(reportedTick, peer.AcknowledgedSnapshotTick, peer.ServerProcessedCommandSequence, peer.PacketSequence);

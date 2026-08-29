@@ -279,6 +279,13 @@ namespace UniGame.StaticEcs.Network
                 _lastReceiveCommandPacketSequence = header.PacketSequence;
                 return PacketValidationResult.Success;
             }
+            if (header.Kind == PacketKind.SnapshotChunk)
+            {
+                if (header.Flags != PacketFlags.ReliableOrdered ||
+                    header.PacketSequence == 0)
+                    return PacketValidationResult.Sequence;
+                return PacketValidationResult.Success;
+            }
             if (header.Flags != PacketFlags.ReliableOrdered ||
                 header.PacketSequence != _nextReceivePacketSequence)
                 return PacketValidationResult.Sequence;
