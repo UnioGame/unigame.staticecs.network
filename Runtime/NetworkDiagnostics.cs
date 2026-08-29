@@ -15,8 +15,8 @@ namespace UniGame.StaticEcs.Network
         Ready = 2,
         /// <summary>A command batch packet.</summary>
         CommandBatch = 3,
-        /// <summary>A full snapshot packet.</summary>
-        FullSnapshot = 4,
+        /// <summary>A keyframe or delta snapshot chunk.</summary>
+        SnapshotChunk = 8,
         /// <summary>An acknowledgement packet.</summary>
         Ack = 5,
         /// <summary>A resynchronization request packet.</summary>
@@ -343,6 +343,6 @@ namespace UniGame.StaticEcs.Network
 
         private static string PhaseName(NetworkPhase phase) => phase == NetworkPhase.CommandDispatch ? "command_dispatch" :
             phase == NetworkPhase.SnapshotApply ? "snapshot_apply" : phase == NetworkPhase.SnapshotCapture ? "snapshot_capture" : phase.ToString().ToLowerInvariant();
-        private static string PacketName(NetworkPacketKind kind) => kind == NetworkPacketKind.CommandBatch ? "command_batch" : kind == NetworkPacketKind.FullSnapshot ? "full_snapshot" : kind == NetworkPacketKind.ResyncRequest ? "resync_request" : kind.ToString().ToLowerInvariant();
+        private static string PacketName(NetworkPacketKind kind) => kind == NetworkPacketKind.CommandBatch ? "command_batch" : kind == NetworkPacketKind.SnapshotChunk ? "snapshot_chunk" : kind == NetworkPacketKind.ResyncRequest ? "resync_request" : kind.ToString().ToLowerInvariant();
     }
 }

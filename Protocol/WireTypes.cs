@@ -11,8 +11,6 @@ namespace UniGame.StaticEcs.Network
         Ready = 2,
         /// <summary>Carries redundant tick-indexed commands.</summary>
         CommandBatch = 3,
-        /// <summary>Carries a complete independent world snapshot.</summary>
-        FullSnapshot = 4,
         /// <summary>Acknowledges received state without a payload.</summary>
         Ack = 5,
         /// <summary>Requests recovery from a rejected state.</summary>

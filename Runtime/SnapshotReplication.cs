@@ -224,6 +224,35 @@ namespace UniGame.StaticEcs.Network
             return true;
         }
 
+        internal static bool TryInspectCanonical(ReadOnlySpan<byte> bytes,
+            out int entityCount, out int recordCount)
+        {
+            entityCount = 0;
+            recordCount = 0;
+            if (bytes.Length < sizeof(uint) ||
+                bytes.Length > ProtocolLimits.MaxDecodedPayloadBytes)
+                return false;
+            var offset = 0;
+            if (!TryReadUint(bytes, ref offset, out var rawEntityCount) ||
+                rawEntityCount > (uint)ProtocolLimits.MaxEntities)
+                return false;
+            entityCount = checked((int)rawEntityCount);
+            ulong previousGid = 0;
+            var hasPrevious = false;
+            for (var index = 0; index < entityCount; index++)
+            {
+                if (!TryReadCanonicalEntity(bytes, ref offset, out var entity) ||
+                    hasPrevious && CompareGid(previousGid, entity.Gid) >= 0 ||
+                    recordCount > ProtocolLimits.MaxEntities *
+                        ProtocolLimits.MaxRecordsPerEntity - entity.RecordCount)
+                    return false;
+                previousGid = entity.Gid;
+                hasPrevious = true;
+                recordCount += entity.RecordCount;
+            }
+            return offset == bytes.Length;
+        }
+
         private static bool TryEncodeCore(NetworkSnapshot baseline,
             NetworkSnapshot target, ref SnapshotWriter writer,
             out uint operationCount)

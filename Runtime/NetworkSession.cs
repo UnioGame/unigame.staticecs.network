@@ -290,7 +290,7 @@ namespace UniGame.StaticEcs.Network
             ? kind == PacketKind.CommandBatch ||
               kind == PacketKind.Ping || kind == PacketKind.Ack ||
               kind == PacketKind.ResyncRequest || kind == PacketKind.Disconnect
-            : kind == PacketKind.FullSnapshot || kind == PacketKind.Pong ||
+            : kind == PacketKind.SnapshotChunk || kind == PacketKind.Pong ||
               kind == PacketKind.ResyncRequest || kind == PacketKind.Disconnect;
 
         internal void Close() => State = NetworkSessionState.Closed;

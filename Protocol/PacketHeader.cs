@@ -135,7 +135,7 @@ namespace UniGame.StaticEcs.Network
 
         private static bool IsKnownKind(PacketKind kind) => kind == PacketKind.Hello ||
             kind == PacketKind.Ready || kind == PacketKind.CommandBatch ||
-            kind == PacketKind.FullSnapshot || kind == PacketKind.Ack ||
+            kind == PacketKind.Ack ||
             kind == PacketKind.ResyncRequest || kind == PacketKind.Disconnect ||
             kind == PacketKind.SnapshotChunk || kind == PacketKind.Ping ||
             kind == PacketKind.Pong;
