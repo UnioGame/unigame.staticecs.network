@@ -1508,6 +1508,211 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void SnapshotDeltaCodec_ReconstructsNoOpAndCanonicalChanges()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            var pool = new NetworkBufferPool(4L << 20);
+            var schema = Schema<AuthorityWorld>(true);
+            var scope = new ScopeId(17);
+            var replicator = new NetworkReplicator<AuthorityWorld>(schema,
+                static (_, _) => true, scope, bufferPool: pool);
+            NetworkSnapshot baseline = null;
+            NetworkSnapshot unchanged = null;
+            NetworkSnapshot target = null;
+            NetworkSnapshot reconstructed = null;
+            NetworkBufferLease delta = null;
+            try
+            {
+                var patched = World<AuthorityWorld>.NewEntity<TestEntity>();
+                patched.Set(new TestComponent { Value = 1 });
+                patched.Set<TestTag>();
+                var removed = World<AuthorityWorld>.NewEntity<SecondEntity>();
+                removed.Set(new TestComponent { Value = 2 });
+                var metadataOnly = World<AuthorityWorld>.NewEntity<TestEntity>();
+
+                Assert.That(replicator.Capture(1, out baseline),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                var borrowedBytes = baseline.Bytes.ToArray();
+                Assert.That(replicator.Capture(2, out unchanged),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(SnapshotDeltaCodec.TryEncode(pool, baseline,
+                    unchanged, out delta), Is.True);
+                Assert.That(delta.Length, Is.EqualTo(12));
+                Assert.That(Read32(delta.Span, 8), Is.Zero);
+                var header = DeltaHeader(baseline, unchanged);
+                Assert.That(SnapshotDeltaCodec.TryReconstruct(pool, baseline,
+                    delta.Span, in header, schema.Fingerprint, scope,
+                    out reconstructed), Is.True);
+                Assert.That(reconstructed.Bytes.Span.SequenceEqual(
+                    unchanged.Bytes.Span), Is.True);
+                reconstructed.Dispose();
+                reconstructed = null;
+                delta.Dispose();
+                delta = null;
+                unchanged.Dispose();
+                unchanged = null;
+
+                patched.Set(new TestComponent { Value = 3 });
+                patched.Delete<TestTag>();
+                patched.Set(new NetworkOwnerComponent { PeerId = 9 });
+                metadataOnly.Disable();
+                removed.Destroy();
+                var added = World<AuthorityWorld>.NewEntity<SecondEntity>();
+                added.Set(new TestComponent { Value = 4 });
+                Assert.That(replicator.Capture(3, out target),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+
+                Assert.That(SnapshotDeltaCodec.TryEncode(pool, baseline,
+                    target, out delta), Is.True);
+                Assert.That(Read32(delta.Span, 8), Is.GreaterThan(0));
+                header = DeltaHeader(baseline, target);
+                Assert.That(header.TotalLength, Is.EqualTo(target.ByteLength));
+                Assert.That(header.TotalHash, Is.EqualTo(target.PayloadHash));
+                Assert.That(SnapshotDeltaCodec.TryReconstruct(pool, baseline,
+                    delta.Span, in header, schema.Fingerprint, scope,
+                    out reconstructed), Is.True);
+                Assert.That(reconstructed.EntityCount,
+                    Is.EqualTo(target.EntityCount));
+                Assert.That(reconstructed.RecordCount,
+                    Is.EqualTo(target.RecordCount));
+                Assert.That(reconstructed.Bytes.Span.SequenceEqual(
+                    target.Bytes.Span), Is.True);
+                Assert.That(baseline.Bytes.Span.SequenceEqual(borrowedBytes),
+                    Is.True, "borrowed baseline must remain unchanged");
+            }
+            finally
+            {
+                reconstructed?.Dispose();
+                delta?.Dispose();
+                target?.Dispose();
+                unchanged?.Dispose();
+                baseline?.Dispose();
+                replicator.Dispose();
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+                pool.Dispose();
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void SnapshotDeltaCodec_RejectsMalformedAndInvalidOperations()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            var pool = new NetworkBufferPool(4L << 20);
+            var schema = Schema<AuthorityWorld>(true);
+            var scope = new ScopeId(19);
+            var replicator = new NetworkReplicator<AuthorityWorld>(schema,
+                static (_, _) => true, scope, bufferPool: pool);
+            var snapshots = new List<NetworkSnapshot>();
+            var leases = new List<NetworkBufferLease>();
+            try
+            {
+                var first = World<AuthorityWorld>.NewEntity<TestEntity>();
+                first.Set(new TestComponent { Value = 1 });
+                first.Set<TestTag>();
+                var second = World<AuthorityWorld>.NewEntity<SecondEntity>();
+                second.Set(new TestComponent { Value = 2 });
+                Assert.That(replicator.Capture(1, out var baseline),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                snapshots.Add(baseline);
+                first.Set(new TestComponent { Value = 7 });
+                first.Delete<TestTag>();
+                first.Set(new NetworkOwnerComponent { PeerId = 5 });
+                Assert.That(replicator.Capture(2, out var target),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                snapshots.Add(target);
+                Assert.That(SnapshotDeltaCodec.TryEncode(pool, baseline,
+                    target, out var patchDelta), Is.True);
+                leases.Add(patchDelta);
+                var header = DeltaHeader(baseline, target);
+
+                AssertDeltaRejected(pool, baseline,
+                    patchDelta.Span.Slice(0, patchDelta.Length - 1), in header,
+                    schema.Fingerprint, scope);
+                var unknownOperation = patchDelta.Span.ToArray();
+                unknownOperation[12] = 0;
+                AssertDeltaRejected(pool, baseline, unknownOperation, in header,
+                    schema.Fingerprint, scope);
+                var wrongCount = patchDelta.Span.ToArray();
+                Write32(wrongCount, 0, Read32(wrongCount, 0) + 1);
+                AssertDeltaRejected(pool, baseline, wrongCount, in header,
+                    schema.Fingerprint, scope);
+                var wrongLength = header;
+                wrongLength.TotalLength++;
+                AssertDeltaRejected(pool, baseline, patchDelta.Span,
+                    in wrongLength, schema.Fingerprint, scope);
+                var wrongHash = header;
+                wrongHash.TotalHash ^= 1;
+                AssertDeltaRejected(pool, baseline, patchDelta.Span,
+                    in wrongHash, schema.Fingerprint, scope);
+
+                Assert.That(replicator.Capture(10, out var removeBaseline),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                snapshots.Add(removeBaseline);
+                first.Destroy();
+                second.Destroy();
+                Assert.That(replicator.Capture(10, out var emptyBaseline),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                snapshots.Add(emptyBaseline);
+                Assert.That(replicator.Capture(11, out var emptyTarget),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                snapshots.Add(emptyTarget);
+                Assert.That(SnapshotDeltaCodec.TryEncode(pool, removeBaseline,
+                    emptyTarget, out var removeDelta), Is.True);
+                leases.Add(removeDelta);
+                Assert.That(removeDelta.Length, Is.EqualTo(30));
+                Assert.That(Read32(removeDelta.Span, 8), Is.EqualTo(2));
+                var removeHeader = DeltaHeader(removeBaseline, emptyTarget);
+                var reordered = removeDelta.Span.ToArray();
+                Swap(reordered, 12, 21, 9);
+                AssertDeltaRejected(pool, removeBaseline, reordered,
+                    in removeHeader, schema.Fingerprint, scope);
+                var duplicate = removeDelta.Span.ToArray();
+                Array.Copy(duplicate, 12, duplicate, 21, 9);
+                AssertDeltaRejected(pool, removeBaseline, duplicate,
+                    in removeHeader, schema.Fingerprint, scope);
+                AssertDeltaRejected(pool, emptyBaseline, removeDelta.Span,
+                    in removeHeader, schema.Fingerprint, scope);
+
+                var replacement = World<AuthorityWorld>.NewEntity<TestEntity>();
+                Assert.That(replicator.Capture(20,
+                    out var missingRecordBaseline),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                snapshots.Add(missingRecordBaseline);
+                replacement.Set(new TestComponent { Value = 1 });
+                Assert.That(replicator.Capture(20, out var replaceBaseline),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                snapshots.Add(replaceBaseline);
+                replacement.Set(new TestComponent { Value = 2 });
+                Assert.That(replicator.Capture(21, out var replaceTarget),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                snapshots.Add(replaceTarget);
+                Assert.That(SnapshotDeltaCodec.TryEncode(pool, replaceBaseline,
+                    replaceTarget, out var replaceDelta), Is.True);
+                leases.Add(replaceDelta);
+                var replaceHeader = DeltaHeader(replaceBaseline, replaceTarget);
+                AssertDeltaRejected(pool, missingRecordBaseline,
+                    replaceDelta.Span, in replaceHeader, schema.Fingerprint,
+                    scope);
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.EqualTo(snapshots.Count + leases.Count));
+            }
+            finally
+            {
+                for (var i = 0; i < leases.Count; i++)
+                    leases[i].Dispose();
+                for (var i = 0; i < snapshots.Count; i++)
+                    snapshots[i].Dispose();
+                replicator.Dispose();
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+                pool.Dispose();
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
         public void WarmCommandAndSnapshotCoreAllocatesNoManagedMemoryPerTick()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
@@ -1557,6 +1762,41 @@ namespace UniGame.StaticEcs.Network.Tests
                 pool.Dispose();
                 World<AuthorityWorld>.Destroy();
                 World<ClientAWorld>.Destroy();
+            }
+        }
+
+        private static SnapshotChunkHeader DeltaHeader(NetworkSnapshot baseline,
+            NetworkSnapshot target) => new SnapshotChunkHeader
+        {
+            PayloadKind = SnapshotPayloadKind.Delta,
+            SnapshotTick = target.ServerTick,
+            BaselineTick = baseline.ServerTick,
+            TotalLength = checked((uint)target.ByteLength),
+            TotalHash = target.PayloadHash,
+            ChunkIndex = 0,
+            ChunkCount = 1
+        };
+
+        private static void AssertDeltaRejected(NetworkBufferPool pool,
+            NetworkSnapshot baseline, ReadOnlySpan<byte> delta,
+            in SnapshotChunkHeader header, SchemaFingerprint schema,
+            ScopeId scope)
+        {
+            var outstanding = pool.CaptureDiagnostics().OutstandingLeases;
+            Assert.That(SnapshotDeltaCodec.TryReconstruct(pool, baseline, delta,
+                in header, schema, scope, out var snapshot), Is.False);
+            Assert.That(snapshot, Is.Null);
+            Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                Is.EqualTo(outstanding));
+        }
+
+        private static void Swap(byte[] bytes, int first, int second, int count)
+        {
+            for (var index = 0; index < count; index++)
+            {
+                var value = bytes[first + index];
+                bytes[first + index] = bytes[second + index];
+                bytes[second + index] = value;
             }
         }
 
