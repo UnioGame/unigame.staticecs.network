@@ -1524,6 +1524,7 @@ namespace UniGame.StaticEcs.Network.Tests
             NetworkSnapshot target = null;
             NetworkSnapshot reconstructed = null;
             NetworkBufferLease delta = null;
+            NetworkBufferLease canonical = null;
             try
             {
                 var patched = World<AuthorityWorld>.NewEntity<TestEntity>();
@@ -1545,9 +1546,13 @@ namespace UniGame.StaticEcs.Network.Tests
                 var header = DeltaHeader(baseline, unchanged);
                 Assert.That(SnapshotDeltaCodec.TryReconstruct(pool, baseline,
                     delta.Span, in header, schema.Fingerprint, scope,
-                    out reconstructed), Is.True);
+                    out canonical, out var entities, out var records), Is.True);
+                reconstructed = replicator.CreateSnapshot(header.SnapshotTick,
+                    schema.Fingerprint, scope, canonical, entities, records);
+                canonical = null;
                 Assert.That(reconstructed.Bytes.Span.SequenceEqual(
                     unchanged.Bytes.Span), Is.True);
+                var pooledDescriptor = reconstructed;
                 reconstructed.Dispose();
                 reconstructed = null;
                 delta.Dispose();
@@ -1573,7 +1578,11 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(header.TotalHash, Is.EqualTo(target.PayloadHash));
                 Assert.That(SnapshotDeltaCodec.TryReconstruct(pool, baseline,
                     delta.Span, in header, schema.Fingerprint, scope,
-                    out reconstructed), Is.True);
+                    out canonical, out entities, out records), Is.True);
+                reconstructed = replicator.CreateSnapshot(header.SnapshotTick,
+                    schema.Fingerprint, scope, canonical, entities, records);
+                canonical = null;
+                Assert.That(reconstructed, Is.SameAs(pooledDescriptor));
                 Assert.That(reconstructed.EntityCount,
                     Is.EqualTo(target.EntityCount));
                 Assert.That(reconstructed.RecordCount,
@@ -1585,6 +1594,7 @@ namespace UniGame.StaticEcs.Network.Tests
             }
             finally
             {
+                canonical?.Dispose();
                 reconstructed?.Dispose();
                 delta?.Dispose();
                 target?.Dispose();
@@ -2082,8 +2092,11 @@ namespace UniGame.StaticEcs.Network.Tests
         {
             var outstanding = pool.CaptureDiagnostics().OutstandingLeases;
             Assert.That(SnapshotDeltaCodec.TryReconstruct(pool, baseline, delta,
-                in header, schema, scope, out var snapshot), Is.False);
-            Assert.That(snapshot, Is.Null);
+                in header, schema, scope, out var canonical,
+                out var entities, out var records), Is.False);
+            Assert.That(canonical, Is.Null);
+            Assert.That(entities, Is.Zero);
+            Assert.That(records, Is.Zero);
             Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
                 Is.EqualTo(outstanding));
         }

@@ -187,9 +187,12 @@ namespace UniGame.StaticEcs.Network
         internal static bool TryReconstruct(NetworkBufferPool pool,
             NetworkSnapshot baseline, ReadOnlySpan<byte> delta,
             in SnapshotChunkHeader header, SchemaFingerprint schema, ScopeId scope,
-            out NetworkSnapshot snapshot)
+            out NetworkBufferLease canonical, out int entityCount,
+            out int recordCount)
         {
-            snapshot = null;
+            canonical = null;
+            entityCount = 0;
+            recordCount = 0;
             if (pool == null || baseline == null ||
                 header.PayloadKind != SnapshotPayloadKind.Delta ||
                 baseline.ServerTick == 0 || header.BaselineTick != baseline.ServerTick ||
@@ -203,25 +206,32 @@ namespace UniGame.StaticEcs.Network
 
             var measure = new SnapshotWriter(true);
             if (!TryReconstructCore(baseline, delta, ref measure,
-                    out var entityCount, out var recordCount) ||
+                    out var measuredEntities, out var measuredRecords) ||
                 measure.Length != header.TotalLength)
                 return false;
 
             var lease = pool.Rent(checked((int)header.TotalLength));
-            var writer = new SnapshotWriter(lease.WritableSpan);
-            if (!TryReconstructCore(baseline, delta, ref writer,
-                    out var writtenEntities, out var writtenRecords) ||
-                writtenEntities != entityCount || writtenRecords != recordCount ||
-                writer.Length != header.TotalLength ||
-                Hashing.XxHash64(lease.Span) != header.TotalHash)
+            try
             {
-                lease.Dispose();
-                return false;
-            }
+                var writer = new SnapshotWriter(lease.WritableSpan);
+                if (!TryReconstructCore(baseline, delta, ref writer,
+                        out var writtenEntities, out var writtenRecords) ||
+                    writtenEntities != measuredEntities ||
+                    writtenRecords != measuredRecords ||
+                    writer.Length != header.TotalLength ||
+                    Hashing.XxHash64(lease.Span) != header.TotalHash)
+                    return false;
 
-            snapshot = new NetworkSnapshot(header.SnapshotTick, schema, scope,
-                lease, entityCount, recordCount);
-            return true;
+                canonical = lease;
+                entityCount = measuredEntities;
+                recordCount = measuredRecords;
+                lease = null;
+                return true;
+            }
+            finally
+            {
+                lease?.Dispose();
+            }
         }
 
         internal static bool TryInspectCanonical(ReadOnlySpan<byte> bytes,

@@ -169,7 +169,7 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Gets caller-selected replication scope.</summary>
         public ScopeId Scope { get; private set; }
 
-        /// <summary>Completes the v4 handshake after exact shared-manifest fingerprint comparison.</summary>
+        /// <summary>Completes the v5 handshake after exact shared-manifest fingerprint comparison.</summary>
         internal NetworkAdmissionResult Admit(SchemaFingerprint remoteFingerprint, uint peerId, uint epoch, ScopeId scope)
         {
             if (State != NetworkSessionState.Handshaking) return NetworkAdmissionResult.WrongRole;

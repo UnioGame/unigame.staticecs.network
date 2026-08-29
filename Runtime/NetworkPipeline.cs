@@ -498,15 +498,26 @@ namespace UniGame.StaticEcs.Network
             }
             else
             {
+                NetworkBufferLease canonical = null;
                 if (!History.TryGet(chunk.BaselineTick, out var baseline) ||
                     baseline.SchemaFingerprint != header.SchemaFingerprint ||
                     baseline.Scope != _session.Scope ||
                     !SnapshotDeltaCodec.TryReconstruct(_bufferPool, baseline,
                         body.Span, in chunk, header.SchemaFingerprint,
-                        _session.Scope, out snapshot))
+                        _session.Scope, out canonical, out entities,
+                        out records))
                     return SnapshotApplyResult.Malformed;
-                entities = snapshot.EntityCount;
-                records = snapshot.RecordCount;
+                try
+                {
+                    snapshot = _replicator.CreateSnapshot(chunk.SnapshotTick,
+                        header.SchemaFingerprint, _session.Scope, canonical,
+                        entities, records);
+                    canonical = null;
+                }
+                finally
+                {
+                    canonical?.Dispose();
+                }
             }
             decodedBytes = snapshot.ByteLength;
             var result = _replicator.Stage(snapshot, out staged);
