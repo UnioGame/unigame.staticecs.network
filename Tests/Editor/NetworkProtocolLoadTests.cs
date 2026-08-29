@@ -246,7 +246,6 @@ namespace UniGame.StaticEcs.Network.Tests
                         int entities;
                         int records;
                         if (chunk.TotalLength != (uint)canonical.Length ||
-                            chunk.TotalHash != Hashing.XxHash64(canonical) ||
                             !SnapshotDeltaCodec.TryInspectCanonical(canonical,
                                 out entities, out records))
                         {
@@ -258,6 +257,12 @@ namespace UniGame.StaticEcs.Network.Tests
                             canonical.Length);
                         var snapshot = client.CreateSnapshot(chunk.SnapshotTick,
                             fingerprint, new ScopeId(1), exact, entities, records);
+                        if (snapshot.PayloadHash != chunk.TotalHash)
+                        {
+                            snapshot.Dispose();
+                            peer.ProtocolErrors++;
+                            continue;
+                        }
                         var result = client.Stage(snapshot, out var staged);
                         if (result == SnapshotApplyResult.Success)
                         {
@@ -329,32 +334,25 @@ namespace UniGame.StaticEcs.Network.Tests
         private static NetworkBufferLease EncodeSnapshot(uint sequence,
             NetworkSnapshot snapshot)
         {
-            var payload = Buffers.Rent(checked(
-                SnapshotChunkHeader.Size + snapshot.ByteLength));
-            try
+            var payload = new byte[checked(
+                SnapshotChunkHeader.Size + snapshot.ByteLength)];
+            var chunk = new SnapshotChunkHeader
             {
-                var chunk = new SnapshotChunkHeader
-                {
-                    PayloadKind = SnapshotPayloadKind.Keyframe,
-                    SnapshotTick = snapshot.ServerTick,
-                    BaselineTick = 0,
-                    TotalLength = checked((uint)snapshot.ByteLength),
-                    TotalHash = snapshot.PayloadHash,
-                    ChunkIndex = 0,
-                    ChunkCount = 1
-                };
-                Assert.That(chunk.TryWrite(payload.WritableSpan), Is.True);
-                snapshot.Bytes.Span.CopyTo(payload.WritableSpan.Slice(
-                    SnapshotChunkHeader.Size));
-                return Encode(PacketKind.SnapshotChunk,
-                    PacketFlags.ReliableOrdered, sequence,
-                    snapshot.ServerTick, payload.Span,
-                    snapshot.SchemaFingerprint);
-            }
-            finally
-            {
-                payload.Dispose();
-            }
+                PayloadKind = SnapshotPayloadKind.Keyframe,
+                SnapshotTick = snapshot.ServerTick,
+                BaselineTick = 0,
+                TotalLength = checked((uint)snapshot.ByteLength),
+                TotalHash = snapshot.PayloadHash,
+                ChunkIndex = 0,
+                ChunkCount = 1
+            };
+            Assert.That(chunk.TryWrite(payload), Is.True);
+            snapshot.Bytes.Span.CopyTo(payload.AsSpan(
+                SnapshotChunkHeader.Size));
+            return Encode(PacketKind.SnapshotChunk,
+                PacketFlags.ReliableOrdered, sequence,
+                snapshot.ServerTick, payload,
+                snapshot.SchemaFingerprint);
         }
 
         private static NetworkBufferLease Encode(PacketKind kind, PacketFlags flags,

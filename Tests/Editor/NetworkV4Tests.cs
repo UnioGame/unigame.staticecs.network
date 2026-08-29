@@ -2050,24 +2050,16 @@ namespace UniGame.StaticEcs.Network.Tests
             SchemaFingerprint schema, uint sequence,
             SnapshotChunkHeader chunk, ReadOnlySpan<byte> body)
         {
-            var payload = Buffers.Rent(checked(
-                SnapshotChunkHeader.Size + body.Length));
-            try
-            {
-                Assert.That(chunk.TryWrite(payload.WritableSpan), Is.True);
-                body.CopyTo(payload.WritableSpan.Slice(
-                    SnapshotChunkHeader.Size));
-                var header = Packet(PacketKind.SnapshotChunk, 1, sequence);
-                header.ServerTick = chunk.SnapshotTick;
-                header.SchemaFingerprint = schema;
-                Assert.That(NetworkPacket.TryEncode(Buffers, header,
-                    payload.Span, out var packet), Is.True);
-                Assert.That(transport.TrySend(packet), Is.True);
-            }
-            finally
-            {
-                payload.Dispose();
-            }
+            var payload = new byte[checked(
+                SnapshotChunkHeader.Size + body.Length)];
+            Assert.That(chunk.TryWrite(payload), Is.True);
+            body.CopyTo(payload.AsSpan(SnapshotChunkHeader.Size));
+            var header = Packet(PacketKind.SnapshotChunk, 1, sequence);
+            header.ServerTick = chunk.SnapshotTick;
+            header.SchemaFingerprint = schema;
+            Assert.That(NetworkPacket.TryEncode(Buffers, header,
+                payload, out var packet), Is.True);
+            Assert.That(transport.TrySend(packet), Is.True);
         }
 
         private static int ReadReplicaValue()
