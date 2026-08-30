@@ -508,6 +508,95 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void ServerCommandRejectionsTraceEverySemanticResyncReason()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                MemoryNetworkTransport.CreatePair(new ConnectionId(94),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    var observer = new TraceCollector();
+                    var serverSchema = Schema<AuthorityWorld>(true);
+                    var clientSchema = Schema<ClientAWorld>(false);
+                    var server = new NetworkServer<AuthorityWorld>(serverSchema,
+                        static (_, _) => false, observer: observer);
+                    server.AddConnection(serverTransport, 7, 13,
+                        new ScopeId(1), observer);
+                    var client = new NetworkClient<ClientAWorld>(clientTransport,
+                        clientSchema, new ScopeId(1));
+                    Assert.That(client.BeginHandshake(), Is.True);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+                    server.Receive();
+
+                    var command = new TestCommand { Value = 7 };
+                    Assert.That(client.QueueCommand(in command, 2, out _),
+                        Is.EqualTo(NetworkCommandResult.Queued));
+                    Assert.That(client.FlushCommands(2),
+                        Is.EqualTo(NetworkCommandResult.Queued));
+                    Assert.That(serverTransport.TryReceive(out var validPacket), Is.True);
+                    Assert.That(NetworkPacket.TryDecode(validPacket,
+                        clientSchema.Fingerprint, out var header, out var validPayload), Is.True);
+
+                    var invalidEnvelope = new byte[18];
+                    invalidEnvelope[0] = 1;
+                    var trailing = new byte[validPayload.Length + 1];
+                    validPayload.Span.CopyTo(trailing);
+                    var rejected = validPayload.ToArray();
+                    Write32(rejected, 9, uint.MaxValue);
+                    var payloads = new[]
+                    {
+                        Array.Empty<byte>(),
+                        new byte[] { 0 },
+                        new byte[] { 1 },
+                        invalidEnvelope,
+                        trailing,
+                        rejected,
+                    };
+                    var expected = new[]
+                    {
+                        NetworkResyncReason.ServerEmptyPayload,
+                        NetworkResyncReason.ServerInvalidCommandCount,
+                        NetworkResyncReason.ServerTruncatedCommandHeader,
+                        NetworkResyncReason.ServerInvalidCommandEnvelope,
+                        NetworkResyncReason.ServerTrailingPayloadBytes,
+                        NetworkResyncReason.ServerCommandQueueRejected,
+                    };
+                    observer.Events.Clear();
+                    for (var index = 0; index < payloads.Length; index++)
+                    {
+                        header.PacketSequence = checked(header.PacketSequence +
+                            (index == 0 ? 0u : 1u));
+                        Assert.That(NetworkPacket.TryEncode(Buffers, header,
+                            payloads[index], out var packet), Is.True);
+                        Assert.That(clientTransport.TrySend(packet), Is.True);
+                        server.Receive();
+                    }
+
+                    var actual = new List<NetworkResyncReason>();
+                    for (var index = 0; index < observer.Events.Count; index++)
+                    {
+                        var value = observer.Events[index];
+                        if (value.Phase == NetworkPhase.Send &&
+                            value.PacketKind == NetworkPacketKind.ResyncRequest)
+                            actual.Add(value.ResyncReason);
+                    }
+                    CollectionAssert.AreEqual(expected, actual);
+                    validPacket.Dispose();
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+        [Test]
         public void RemoteDisconnectClearsClientReplicasAndHistory()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
@@ -1105,6 +1194,12 @@ namespace UniGame.StaticEcs.Network.Tests
                     client.Process();
                     Assert.That(client.ServerTick, Is.EqualTo(7));
                     Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(1));
+                    Assert.That(clientObserver.Single(NetworkPhase.Decode,
+                        NetworkPacketKind.ResyncRequest).ResyncReason,
+                        Is.EqualTo(NetworkResyncReason.SnapshotRejected));
+                    Assert.That(clientObserver.Single(NetworkPhase.Send,
+                        NetworkPacketKind.ResyncRequest).ResyncReason,
+                        Is.EqualTo(NetworkResyncReason.SnapshotRejected));
                     nonSnapshot.PacketSequence = 3;
                     nonSnapshot.ServerTick = 3;
                     Assert.That(NetworkPacket.TryEncode(Buffers, nonSnapshot, ReadOnlySpan<byte>.Empty, out var olderTickPacket), Is.True);

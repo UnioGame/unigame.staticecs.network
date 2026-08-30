@@ -81,6 +81,33 @@ namespace UniGame.StaticEcs.Network
         World
     }
 
+    /// <summary>Identifies why a resynchronization request was emitted locally.</summary>
+    public enum NetworkResyncReason : byte
+    {
+        /// <summary>No resynchronization reason was recorded.</summary>
+        None,
+        /// <summary>The local prediction history cannot satisfy reconciliation.</summary>
+        PredictionHistoryUnavailable,
+        /// <summary>A received snapshot was rejected before application.</summary>
+        SnapshotRejected,
+        /// <summary>Snapshot application failed after the apply path started.</summary>
+        SnapshotApplyFailed,
+        /// <summary>The remote protocol is incompatible with this endpoint.</summary>
+        ProtocolIncompatible,
+        /// <summary>The server received an empty command payload.</summary>
+        ServerEmptyPayload,
+        /// <summary>The server received an invalid command count.</summary>
+        ServerInvalidCommandCount,
+        /// <summary>The server received a truncated command header.</summary>
+        ServerTruncatedCommandHeader,
+        /// <summary>The server received an invalid command envelope.</summary>
+        ServerInvalidCommandEnvelope,
+        /// <summary>The server received trailing command payload bytes.</summary>
+        ServerTrailingPayloadBytes,
+        /// <summary>The server command queue rejected an envelope.</summary>
+        ServerCommandQueueRejected,
+    }
+
     /// <summary>Reports bounded endpoint memory and queue ownership.</summary>
     public struct NetworkMemoryDiagnostics
     {
@@ -225,7 +252,8 @@ namespace UniGame.StaticEcs.Network
             int activeConnections, int activePeers, long timestamp, NetworkPacketKind packetKind = NetworkPacketKind.None,
             long historyBytes = 0, int clientServerTickGap = 0, long durationNanoseconds = 0, SchemaFingerprint fingerprint = default,
             int acceptedCommands = 0, int rejectedCommands = 0,
-            long? managedAllocatedBytes = null)
+            long? managedAllocatedBytes = null,
+            NetworkResyncReason resyncReason = NetworkResyncReason.None)
         {
             Phase = phase; Kind = kind; Result = result; Role = role; ConnectionId = connectionId; PeerId = peerId;
             Epoch = epoch; ServerTick = serverTick; TargetTick = targetTick; Bytes = bytes; Packets = packets;
@@ -234,6 +262,7 @@ namespace UniGame.StaticEcs.Network
             PacketKind = packetKind; HistoryBytes = historyBytes; ClientServerTickGap = clientServerTickGap; DurationNanoseconds = durationNanoseconds; SchemaFingerprint = fingerprint;
             AcceptedCommands = acceptedCommands; RejectedCommands = rejectedCommands;
             ManagedAllocatedBytes = managedAllocatedBytes;
+            ResyncReason = resyncReason;
         }
         /// <summary>Gets the measured phase.</summary>
         public NetworkPhase Phase { get; }
@@ -287,6 +316,8 @@ namespace UniGame.StaticEcs.Network
         public int ClientServerTickGap { get; }
         /// <summary>Gets managed bytes allocated on the measured thread, when available.</summary>
         public long? ManagedAllocatedBytes { get; }
+        /// <summary>Gets the local trace-only resynchronization reason.</summary>
+        public NetworkResyncReason ResyncReason { get; }
         /// <summary>Gets the active schema fingerprint.</summary>
         public SchemaFingerprint SchemaFingerprint { get; }
     }
