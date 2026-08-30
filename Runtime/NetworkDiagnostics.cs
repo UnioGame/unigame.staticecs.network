@@ -224,7 +224,8 @@ namespace UniGame.StaticEcs.Network
             int bytes, int packets, int entities, int records, int commands, int queueSize, int historyTicks,
             int activeConnections, int activePeers, long timestamp, NetworkPacketKind packetKind = NetworkPacketKind.None,
             long historyBytes = 0, int clientServerTickGap = 0, long durationNanoseconds = 0, SchemaFingerprint fingerprint = default,
-            int acceptedCommands = 0, int rejectedCommands = 0)
+            int acceptedCommands = 0, int rejectedCommands = 0,
+            long? managedAllocatedBytes = null)
         {
             Phase = phase; Kind = kind; Result = result; Role = role; ConnectionId = connectionId; PeerId = peerId;
             Epoch = epoch; ServerTick = serverTick; TargetTick = targetTick; Bytes = bytes; Packets = packets;
@@ -232,6 +233,7 @@ namespace UniGame.StaticEcs.Network
             ActiveConnections = activeConnections; ActivePeers = activePeers; Timestamp = timestamp;
             PacketKind = packetKind; HistoryBytes = historyBytes; ClientServerTickGap = clientServerTickGap; DurationNanoseconds = durationNanoseconds; SchemaFingerprint = fingerprint;
             AcceptedCommands = acceptedCommands; RejectedCommands = rejectedCommands;
+            ManagedAllocatedBytes = managedAllocatedBytes;
         }
         /// <summary>Gets the measured phase.</summary>
         public NetworkPhase Phase { get; }
@@ -283,6 +285,8 @@ namespace UniGame.StaticEcs.Network
         public NetworkPacketKind PacketKind { get; }
         /// <summary>Gets authoritative tick minus the latest client acknowledgement.</summary>
         public int ClientServerTickGap { get; }
+        /// <summary>Gets managed bytes allocated on the measured thread, when available.</summary>
+        public long? ManagedAllocatedBytes { get; }
         /// <summary>Gets the active schema fingerprint.</summary>
         public SchemaFingerprint SchemaFingerprint { get; }
     }
@@ -341,7 +345,9 @@ namespace UniGame.StaticEcs.Network
             ",\"packets\":" + v.Packets + ",\"entities\":" + v.Entities + ",\"records\":" + v.Records +
             ",\"commands\":" + v.Commands + ",\"accepted_commands\":" + v.AcceptedCommands + ",\"rejected_commands\":" + v.RejectedCommands + ",\"queue_size\":" + v.QueueSize + ",\"history_ticks\":" + v.HistoryTicks + ",\"history_bytes\":" + v.HistoryBytes +
             ",\"active_connections\":" + v.ActiveConnections + ",\"active_peers\":" + v.ActivePeers + ",\"timestamp\":" + v.Timestamp +
-            ",\"client_server_tick_gap\":" + v.ClientServerTickGap + ",\"duration_ns\":" + v.DurationNanoseconds + ",\"schema_fingerprint\":\"" + v.SchemaFingerprint + "\"}";
+            ",\"client_server_tick_gap\":" + v.ClientServerTickGap + ",\"duration_ns\":" + v.DurationNanoseconds +
+            (v.ManagedAllocatedBytes.HasValue ? ",\"managed_allocated_bytes\":" + v.ManagedAllocatedBytes.Value.ToString(CultureInfo.InvariantCulture) : string.Empty) +
+            ",\"schema_fingerprint\":\"" + v.SchemaFingerprint + "\"}";
 
         private static string PhaseName(NetworkPhase phase) => phase == NetworkPhase.CommandDispatch ? "command_dispatch" :
             phase == NetworkPhase.SnapshotApply ? "snapshot_apply" :
