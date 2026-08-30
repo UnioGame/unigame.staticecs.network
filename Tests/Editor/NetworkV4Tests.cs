@@ -596,6 +596,51 @@ namespace UniGame.StaticEcs.Network.Tests
                 World<ClientAWorld>.Destroy();
             }
         }
+        [TestCase(NetworkRecoveryReason.PredictionHistoryUnavailable,
+            NetworkResyncReason.PredictionHistoryUnavailable)]
+        [TestCase(NetworkRecoveryReason.SnapshotApplyFailed,
+            NetworkResyncReason.SnapshotApplyFailed)]
+        [TestCase(NetworkRecoveryReason.ProtocolIncompatible,
+            NetworkResyncReason.ProtocolIncompatible)]
+        public void ClientFullResyncTracesRecoveryReason(
+            NetworkRecoveryReason recoveryReason,
+            NetworkResyncReason expectedTraceReason)
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                MemoryNetworkTransport.CreatePair(new ConnectionId(96),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    var observer = new TraceCollector();
+                    var server = new NetworkServer<AuthorityWorld>(
+                        Schema<AuthorityWorld>(true), static (_, _) => false);
+                    server.AddConnection(serverTransport, 7, 15, new ScopeId(1));
+                    var client = new NetworkClient<ClientAWorld>(clientTransport,
+                        Schema<ClientAWorld>(false), new ScopeId(1), observer);
+                    Assert.That(client.BeginHandshake(), Is.True);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+                    server.Receive();
+
+                    observer.Events.Clear();
+                    client.RequestFullResync(recoveryReason);
+
+                    Assert.That(observer.Single(NetworkPhase.Send,
+                        NetworkPacketKind.ResyncRequest).ResyncReason,
+                        Is.EqualTo(expectedTraceReason));
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
         [Test]
         public void RemoteDisconnectClearsClientReplicasAndHistory()
         {
