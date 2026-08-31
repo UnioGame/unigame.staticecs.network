@@ -247,7 +247,8 @@ namespace UniGame.StaticEcs.Network
                             return;
                         }
                         RequestResync(AcknowledgedSnapshotTick,
-                            NetworkRecoveryReason.SnapshotRejected);
+                            NetworkRecoveryReason.SnapshotRejected,
+                            NetworkResyncSource.ClientSnapshotValidation);
                         continue;
                     }
                     if (header.Kind != PacketKind.Disconnect &&
@@ -269,7 +270,8 @@ namespace UniGame.StaticEcs.Network
                             AcknowledgedSnapshotTick, 0, packet.Length, History.Count,
                             History.Bytes, 0, ElapsedNanoseconds(started));
                         RequestResync(AcknowledgedSnapshotTick,
-                            NetworkRecoveryReason.SnapshotRejected);
+                            NetworkRecoveryReason.SnapshotRejected,
+                            NetworkResyncSource.ClientSnapshotValidation);
                         continue;
                     }
                 if (header.ServerTick != PacketHeader.NoneTick && header.ServerTick >= ServerTick)
@@ -283,6 +285,7 @@ namespace UniGame.StaticEcs.Network
                 var decodedBytes = packet.Length;
                 var decodeResult = NetworkResultCategory.Success;
                 var resyncReason = NetworkResyncReason.None;
+                var resyncSource = NetworkResyncSource.None;
                 var snapshotKind = default(SnapshotPayloadKind);
                 var awaitingSnapshotChunks = false;
                 var discardRejectedSnapshot = false;
@@ -292,10 +295,13 @@ namespace UniGame.StaticEcs.Network
                 else if (header.Kind == PacketKind.ResyncRequest)
                 {
                     resyncReason = NetworkResyncReason.SnapshotRejected;
-                    RequestResync(header.ServerTick, NetworkRecoveryReason.SnapshotRejected);
+                    resyncSource = NetworkResyncSource.ClientIncomingResyncEcho;
+                    RequestResync(header.ServerTick,
+                        NetworkRecoveryReason.SnapshotRejected,
+                        NetworkResyncSource.ClientIncomingResyncEcho);
                 }
                 var disconnected = header.Kind == PacketKind.Disconnect;
-                _session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, decodeResult, DiagnosticKind(header.Kind), header.ServerTick, 0, decodedBytes, History.Count, History.Bytes, unchecked((int)(header.ServerTick - AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), entities, records, resyncReason: resyncReason);
+                _session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point, decodeResult, DiagnosticKind(header.Kind), header.ServerTick, 0, decodedBytes, History.Count, History.Bytes, unchecked((int)(header.ServerTick - AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), entities, records, resyncReason: resyncReason, resyncSource: resyncSource);
                 if (disconnected)
                 {
                     Disconnect();
@@ -311,7 +317,9 @@ namespace UniGame.StaticEcs.Network
                                 _snapshotDiscardThroughTick = Math.Max(
                                     _snapshotDiscardThroughTick,
                                     header.ServerTick);
-                            RequestResync(header.ServerTick, NetworkRecoveryReason.SnapshotRejected);
+                            RequestResync(header.ServerTick,
+                                NetworkRecoveryReason.SnapshotRejected,
+                                NetworkResyncSource.ClientSnapshotValidation);
                         }
                         else if (!ApplySnapshot(staged, header, entities, records, snapshotKind)) return;
                     }
@@ -721,7 +729,8 @@ namespace UniGame.StaticEcs.Network
                 _snapshotDiscardThroughTick, snapshotTick);
             ClearSnapshotAssembly();
             RequestResync(snapshotTick,
-                NetworkRecoveryReason.SnapshotRejected);
+                NetworkRecoveryReason.SnapshotRejected,
+                NetworkResyncSource.ClientSnapshotAssemblyTimeout);
         }
 
         private void ClearSnapshotAssembly()
@@ -777,12 +786,16 @@ namespace UniGame.StaticEcs.Network
             return true;
         }
 
-        private void RequestResync(uint serverTick, NetworkRecoveryReason reason)
+        private void RequestResync(uint serverTick, NetworkRecoveryReason reason,
+            NetworkResyncSource source = NetworkResyncSource.None)
         {
             RequestRecovery(NetworkRecoveryPhase.AwaitingKeyframe, reason, serverTick);
             Send(PacketKind.ResyncRequest, _session.Epoch, serverTick,
                 AcknowledgedSnapshotTick, ReadOnlySpan<byte>.Empty,
-                DiagnosticResyncReason(reason));
+                DiagnosticResyncReason(reason),
+                source == NetworkResyncSource.None
+                    ? DiagnosticResyncSource(reason)
+                    : source);
         }
 
         private void RequestDisconnect(NetworkRecoveryReason reason)
@@ -809,7 +822,8 @@ namespace UniGame.StaticEcs.Network
 
         private bool Send(PacketKind kind, uint epoch, uint serverTick,
             uint acknowledgedTick, ReadOnlySpan<byte> payload,
-            NetworkResyncReason resyncReason = NetworkResyncReason.None)
+            NetworkResyncReason resyncReason = NetworkResyncReason.None,
+            NetworkResyncSource resyncSource = NetworkResyncSource.None)
         {
             var started = Stopwatch.GetTimestamp();
             var sequence = _packetSequence;
@@ -824,7 +838,7 @@ namespace UniGame.StaticEcs.Network
             var sent = encoded && _transport.TrySend(packet);
             if (sent)
                 _packetSequence = sequence + 1;
-            _session.Trace(NetworkPhase.Send, NetworkTraceKind.Point, sent ? NetworkResultCategory.Success : NetworkResultCategory.Transport, DiagnosticKind(kind), serverTick, 0, packetBytes, History.Count, History.Bytes, unchecked((int)(serverTick - AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), resyncReason: resyncReason);
+            _session.Trace(NetworkPhase.Send, NetworkTraceKind.Point, sent ? NetworkResultCategory.Success : NetworkResultCategory.Transport, DiagnosticKind(kind), serverTick, 0, packetBytes, History.Count, History.Bytes, unchecked((int)(serverTick - AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), resyncReason: resyncReason, resyncSource: resyncSource);
             _session.ReportSession(ServerTick, AcknowledgedSnapshotTick, ServerProcessedCommandSequence, _packetSequence);
             return sent;
         }
@@ -847,6 +861,13 @@ namespace UniGame.StaticEcs.Network
             NetworkRecoveryReason.SnapshotApplyFailed => NetworkResyncReason.SnapshotApplyFailed,
             NetworkRecoveryReason.ProtocolIncompatible => NetworkResyncReason.ProtocolIncompatible,
             _ => NetworkResyncReason.None,
+        };
+        private static NetworkResyncSource DiagnosticResyncSource(
+            NetworkRecoveryReason reason) => reason switch
+        {
+            NetworkRecoveryReason.PredictionHistoryUnavailable => NetworkResyncSource.ClientPrediction,
+            NetworkRecoveryReason.SnapshotRejected => NetworkResyncSource.ClientSnapshotValidation,
+            _ => NetworkResyncSource.None,
         };
         internal static NetworkResultCategory DiagnosticResult(SnapshotApplyResult result) => result switch
         {
@@ -1228,7 +1249,8 @@ namespace UniGame.StaticEcs.Network
             {
                 Send(peer, PacketKind.ResyncRequest, serverTick,
                     PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty,
-                    NetworkResyncReason.ServerEmptyPayload);
+                    NetworkResyncReason.ServerEmptyPayload,
+                    NetworkResyncSource.ServerCommandDecode);
                 return;
             }
 
@@ -1238,7 +1260,8 @@ namespace UniGame.StaticEcs.Network
             {
                 Send(peer, PacketKind.ResyncRequest, serverTick,
                     PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty,
-                    NetworkResyncReason.ServerInvalidCommandCount);
+                    NetworkResyncReason.ServerInvalidCommandCount,
+                    NetworkResyncSource.ServerCommandDecode);
                 return;
             }
 
@@ -1252,7 +1275,8 @@ namespace UniGame.StaticEcs.Network
                     DisposeCommands(commands, decoded);
                     Send(peer, PacketKind.ResyncRequest, serverTick,
                         PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty,
-                        NetworkResyncReason.ServerTruncatedCommandHeader);
+                        NetworkResyncReason.ServerTruncatedCommandHeader,
+                        NetworkResyncSource.ServerCommandDecode);
                     return;
                 }
 
@@ -1269,7 +1293,8 @@ namespace UniGame.StaticEcs.Network
                     DisposeCommands(commands, decoded);
                     Send(peer, PacketKind.ResyncRequest, serverTick,
                         PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty,
-                        NetworkResyncReason.ServerInvalidCommandEnvelope);
+                        NetworkResyncReason.ServerInvalidCommandEnvelope,
+                        NetworkResyncSource.ServerCommandDecode);
                     return;
                 }
 
@@ -1293,7 +1318,8 @@ namespace UniGame.StaticEcs.Network
                 DisposeCommands(commands, decoded);
                 Send(peer, PacketKind.ResyncRequest, serverTick,
                     PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty,
-                    NetworkResyncReason.ServerTrailingPayloadBytes);
+                    NetworkResyncReason.ServerTrailingPayloadBytes,
+                    NetworkResyncSource.ServerCommandDecode);
                 return;
             }
 
@@ -1312,7 +1338,8 @@ namespace UniGame.StaticEcs.Network
                     }
                     Send(peer, PacketKind.ResyncRequest, serverTick,
                         PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty,
-                        NetworkResyncReason.ServerCommandQueueRejected);
+                        NetworkResyncReason.ServerCommandQueueRejected,
+                        NetworkResyncSource.ServerCommandDecode);
                     return;
                 }
                 if (result == NetworkCommandResult.Duplicate)
@@ -1489,7 +1516,8 @@ namespace UniGame.StaticEcs.Network
 
         private bool Send(Peer peer, PacketKind kind, uint serverTick,
             uint acknowledgedTick, ReadOnlySpan<byte> payload,
-            NetworkResyncReason resyncReason = NetworkResyncReason.None)
+            NetworkResyncReason resyncReason = NetworkResyncReason.None,
+            NetworkResyncSource resyncSource = NetworkResyncSource.None)
         {
             var started = Stopwatch.GetTimestamp();
             var sequence = peer.PacketSequence;
@@ -1512,7 +1540,7 @@ namespace UniGame.StaticEcs.Network
             var sent = encoded && peer.Transport.TrySend(packet);
             if (sent)
                 peer.PacketSequence = sequence + 1;
-            peer.Session.Trace(NetworkPhase.Send, NetworkTraceKind.Point, sent ? NetworkResultCategory.Success : NetworkResultCategory.Transport, DiagnosticKind(kind), serverTick, PacketHeader.NoneTick, packetBytes, _coordinator.HistoryCount(peer.Scope), _coordinator.HistoryByteCount(peer.Scope), unchecked((int)(serverTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), activeConnections: ActiveConnectionCount, activePeers: ActivePeerCount, resyncReason: resyncReason);
+            peer.Session.Trace(NetworkPhase.Send, NetworkTraceKind.Point, sent ? NetworkResultCategory.Success : NetworkResultCategory.Transport, DiagnosticKind(kind), serverTick, PacketHeader.NoneTick, packetBytes, _coordinator.HistoryCount(peer.Scope), _coordinator.HistoryByteCount(peer.Scope), unchecked((int)(serverTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), activeConnections: ActiveConnectionCount, activePeers: ActivePeerCount, resyncReason: resyncReason, resyncSource: resyncSource);
             var reportedTick = serverTick == PacketHeader.NoneTick ? ServerTick : Math.Max(ServerTick, serverTick);
             peer.Session.ReportSession(reportedTick, peer.AcknowledgedSnapshotTick, peer.ServerProcessedCommandSequence, peer.PacketSequence);
             return sent;

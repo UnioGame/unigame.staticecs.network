@@ -579,14 +579,28 @@ namespace UniGame.StaticEcs.Network.Tests
                     }
 
                     var actual = new List<NetworkResyncReason>();
+                    var sources = new List<NetworkResyncSource>();
                     for (var index = 0; index < observer.Events.Count; index++)
                     {
                         var value = observer.Events[index];
                         if (value.Phase == NetworkPhase.Send &&
                             value.PacketKind == NetworkPacketKind.ResyncRequest)
+                        {
                             actual.Add(value.ResyncReason);
+                            sources.Add(value.ResyncSource);
+                        }
                     }
                     CollectionAssert.AreEqual(expected, actual);
+                    CollectionAssert.AreEqual(
+                        new[]
+                        {
+                            NetworkResyncSource.ServerCommandDecode,
+                            NetworkResyncSource.ServerCommandDecode,
+                            NetworkResyncSource.ServerCommandDecode,
+                            NetworkResyncSource.ServerCommandDecode,
+                            NetworkResyncSource.ServerCommandDecode,
+                            NetworkResyncSource.ServerCommandDecode,
+                        }, sources);
                     validPacket.Dispose();
                 }
             }
@@ -597,14 +611,18 @@ namespace UniGame.StaticEcs.Network.Tests
             }
         }
         [TestCase(NetworkRecoveryReason.PredictionHistoryUnavailable,
-            NetworkResyncReason.PredictionHistoryUnavailable)]
+            NetworkResyncReason.PredictionHistoryUnavailable,
+            NetworkResyncSource.ClientPrediction)]
         [TestCase(NetworkRecoveryReason.SnapshotApplyFailed,
-            NetworkResyncReason.SnapshotApplyFailed)]
+            NetworkResyncReason.SnapshotApplyFailed,
+            NetworkResyncSource.None)]
         [TestCase(NetworkRecoveryReason.ProtocolIncompatible,
-            NetworkResyncReason.ProtocolIncompatible)]
+            NetworkResyncReason.ProtocolIncompatible,
+            NetworkResyncSource.None)]
         public void ClientFullResyncTracesRecoveryReason(
             NetworkRecoveryReason recoveryReason,
-            NetworkResyncReason expectedTraceReason)
+            NetworkResyncReason expectedTraceReason,
+            NetworkResyncSource expectedTraceSource)
         {
             CreateReplicationWorld<AuthorityWorld>(true);
             CreateReplicationWorld<ClientAWorld>(false);
@@ -633,6 +651,9 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(observer.Single(NetworkPhase.Send,
                         NetworkPacketKind.ResyncRequest).ResyncReason,
                         Is.EqualTo(expectedTraceReason));
+                    Assert.That(observer.Single(NetworkPhase.Send,
+                        NetworkPacketKind.ResyncRequest).ResyncSource,
+                        Is.EqualTo(expectedTraceSource));
                 }
             }
             finally
@@ -1242,9 +1263,15 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(clientObserver.Single(NetworkPhase.Decode,
                         NetworkPacketKind.ResyncRequest).ResyncReason,
                         Is.EqualTo(NetworkResyncReason.SnapshotRejected));
+                    Assert.That(clientObserver.Single(NetworkPhase.Decode,
+                        NetworkPacketKind.ResyncRequest).ResyncSource,
+                        Is.EqualTo(NetworkResyncSource.ClientIncomingResyncEcho));
                     Assert.That(clientObserver.Single(NetworkPhase.Send,
                         NetworkPacketKind.ResyncRequest).ResyncReason,
                         Is.EqualTo(NetworkResyncReason.SnapshotRejected));
+                    Assert.That(clientObserver.Single(NetworkPhase.Send,
+                        NetworkPacketKind.ResyncRequest).ResyncSource,
+                        Is.EqualTo(NetworkResyncSource.ClientIncomingResyncEcho));
                     nonSnapshot.PacketSequence = 3;
                     nonSnapshot.ServerTick = 3;
                     Assert.That(NetworkPacket.TryEncode(Buffers, nonSnapshot, ReadOnlySpan<byte>.Empty, out var olderTickPacket), Is.True);
@@ -1959,6 +1986,7 @@ namespace UniGame.StaticEcs.Network.Tests
             LimitedNetworkTransport serverTransport = null;
             NetworkServer<AuthorityWorld> server = null;
             NetworkClient<ClientAWorld> client = null;
+            var observer = new TraceCollector();
             try
             {
                 var authoritySchema = Schema<AuthorityWorld>(true);
@@ -1975,7 +2003,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 server = new NetworkServer<AuthorityWorld>(authoritySchema,
                     static (_, _) => true, bufferPool: pool);
                 client = new NetworkClient<ClientAWorld>(clientTransport,
-                    clientSchema, scope, bufferPool: pool);
+                    clientSchema, scope, observer, bufferPool: pool);
                 probe = new NetworkReplicator<AuthorityWorld>(authoritySchema,
                     static (_, _) => true, scope, bufferPool: pool);
                 var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
@@ -2102,9 +2130,13 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(serverTransport.TrySend(first.Retain()), Is.True);
                 client.Process();
                 Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(4));
+                observer.Events.Clear();
                 client.Process(long.MaxValue);
                 Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(4));
                 Assert.That(ReadReplicaValue(), Is.EqualTo(4));
+                Assert.That(observer.Single(NetworkPhase.Send,
+                    NetworkPacketKind.ResyncRequest).ResyncSource,
+                    Is.EqualTo(NetworkResyncSource.ClientSnapshotAssemblyTimeout));
                 Assert.That(client.TryConsumeRecoveryTransition(out recovery),
                     Is.True);
                 Assert.That(recovery.Phase,

@@ -108,6 +108,23 @@ namespace UniGame.StaticEcs.Network
         ServerCommandQueueRejected,
     }
 
+    /// <summary>Identifies the local trace-only origin of a resynchronization request.</summary>
+    public enum NetworkResyncSource : byte
+    {
+        /// <summary>No resynchronization origin was recorded.</summary>
+        None,
+        /// <summary>The client echoed an incoming resynchronization request.</summary>
+        ClientIncomingResyncEcho,
+        /// <summary>The client rejected a snapshot during validation.</summary>
+        ClientSnapshotValidation,
+        /// <summary>The client timed out an incomplete snapshot assembly.</summary>
+        ClientSnapshotAssemblyTimeout,
+        /// <summary>The client could not replay local prediction history.</summary>
+        ClientPrediction,
+        /// <summary>The server rejected a decoded command batch.</summary>
+        ServerCommandDecode,
+    }
+
     /// <summary>Reports bounded endpoint memory and queue ownership.</summary>
     public struct NetworkMemoryDiagnostics
     {
@@ -253,7 +270,8 @@ namespace UniGame.StaticEcs.Network
             long historyBytes = 0, int clientServerTickGap = 0, long durationNanoseconds = 0, SchemaFingerprint fingerprint = default,
             int acceptedCommands = 0, int rejectedCommands = 0,
             long? managedAllocatedBytes = null,
-            NetworkResyncReason resyncReason = NetworkResyncReason.None)
+            NetworkResyncReason resyncReason = NetworkResyncReason.None,
+            NetworkResyncSource resyncSource = NetworkResyncSource.None)
         {
             Phase = phase; Kind = kind; Result = result; Role = role; ConnectionId = connectionId; PeerId = peerId;
             Epoch = epoch; ServerTick = serverTick; TargetTick = targetTick; Bytes = bytes; Packets = packets;
@@ -263,6 +281,7 @@ namespace UniGame.StaticEcs.Network
             AcceptedCommands = acceptedCommands; RejectedCommands = rejectedCommands;
             ManagedAllocatedBytes = managedAllocatedBytes;
             ResyncReason = resyncReason;
+            ResyncSource = resyncSource;
         }
         /// <summary>Gets the measured phase.</summary>
         public NetworkPhase Phase { get; }
@@ -318,6 +337,8 @@ namespace UniGame.StaticEcs.Network
         public long? ManagedAllocatedBytes { get; }
         /// <summary>Gets the local trace-only resynchronization reason.</summary>
         public NetworkResyncReason ResyncReason { get; }
+        /// <summary>Gets the local trace-only resynchronization source.</summary>
+        public NetworkResyncSource ResyncSource { get; }
         /// <summary>Gets the active schema fingerprint.</summary>
         public SchemaFingerprint SchemaFingerprint { get; }
     }
