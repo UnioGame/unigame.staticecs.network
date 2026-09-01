@@ -271,7 +271,15 @@ namespace UniGame.StaticEcs.Network
             int acceptedCommands = 0, int rejectedCommands = 0,
             long? managedAllocatedBytes = null,
             NetworkResyncReason resyncReason = NetworkResyncReason.None,
-            NetworkResyncSource resyncSource = NetworkResyncSource.None)
+            NetworkResyncSource resyncSource = NetworkResyncSource.None,
+            uint resyncCorrelationId = 0,
+            NetworkCommandResult? commandResult = null,
+            SnapshotApplyResult? snapshotResult = null,
+            PacketValidationResult? packetValidationResult = null,
+            uint sequence = 0,
+            uint acknowledgedSnapshotTick = 0,
+            uint oldestHistoryTick = 0,
+            uint newestHistoryTick = 0)
         {
             Phase = phase; Kind = kind; Result = result; Role = role; ConnectionId = connectionId; PeerId = peerId;
             Epoch = epoch; ServerTick = serverTick; TargetTick = targetTick; Bytes = bytes; Packets = packets;
@@ -282,6 +290,14 @@ namespace UniGame.StaticEcs.Network
             ManagedAllocatedBytes = managedAllocatedBytes;
             ResyncReason = resyncReason;
             ResyncSource = resyncSource;
+            ResyncCorrelationId = resyncCorrelationId;
+            CommandResult = commandResult;
+            SnapshotResult = snapshotResult;
+            PacketValidationResult = packetValidationResult;
+            Sequence = sequence;
+            AcknowledgedSnapshotTick = acknowledgedSnapshotTick;
+            OldestHistoryTick = oldestHistoryTick;
+            NewestHistoryTick = newestHistoryTick;
         }
         /// <summary>Gets the measured phase.</summary>
         public NetworkPhase Phase { get; }
@@ -339,6 +355,22 @@ namespace UniGame.StaticEcs.Network
         public NetworkResyncReason ResyncReason { get; }
         /// <summary>Gets the local trace-only resynchronization source.</summary>
         public NetworkResyncSource ResyncSource { get; }
+        /// <summary>Gets the non-zero resynchronization correlation identifier, or zero when unrelated.</summary>
+        public uint ResyncCorrelationId { get; }
+        /// <summary>Gets the exact bounded command result when this event evaluates a command.</summary>
+        public NetworkCommandResult? CommandResult { get; }
+        /// <summary>Gets the exact bounded snapshot result when this event evaluates a snapshot.</summary>
+        public SnapshotApplyResult? SnapshotResult { get; }
+        /// <summary>Gets the exact bounded packet validation result when this event validates a session packet.</summary>
+        public PacketValidationResult? PacketValidationResult { get; }
+        /// <summary>Gets the packet or command sequence associated with the event.</summary>
+        public uint Sequence { get; }
+        /// <summary>Gets the latest acknowledged snapshot tick.</summary>
+        public uint AcknowledgedSnapshotTick { get; }
+        /// <summary>Gets the oldest retained history tick, or zero when empty.</summary>
+        public uint OldestHistoryTick { get; }
+        /// <summary>Gets the newest retained history tick, or zero when empty.</summary>
+        public uint NewestHistoryTick { get; }
         /// <summary>Gets the active schema fingerprint.</summary>
         public SchemaFingerprint SchemaFingerprint { get; }
     }
@@ -399,6 +431,14 @@ namespace UniGame.StaticEcs.Network
             ",\"active_connections\":" + v.ActiveConnections + ",\"active_peers\":" + v.ActivePeers + ",\"timestamp\":" + v.Timestamp +
             ",\"client_server_tick_gap\":" + v.ClientServerTickGap + ",\"duration_ns\":" + v.DurationNanoseconds +
             (v.ManagedAllocatedBytes.HasValue ? ",\"managed_allocated_bytes\":" + v.ManagedAllocatedBytes.Value.ToString(CultureInfo.InvariantCulture) : string.Empty) +
+            (v.ResyncCorrelationId != 0 ? ",\"resync_correlation_id\":" + v.ResyncCorrelationId.ToString(CultureInfo.InvariantCulture) : string.Empty) +
+            (v.CommandResult.HasValue ? ",\"command_result\":\"" + v.CommandResult.Value.ToString().ToLowerInvariant() + "\"" : string.Empty) +
+            (v.SnapshotResult.HasValue ? ",\"snapshot_result\":\"" + v.SnapshotResult.Value.ToString().ToLowerInvariant() + "\"" : string.Empty) +
+            (v.PacketValidationResult.HasValue ? ",\"packet_validation_result\":\"" + v.PacketValidationResult.Value.ToString().ToLowerInvariant() + "\"" : string.Empty) +
+            ",\"sequence\":" + v.Sequence +
+            ",\"acknowledged_snapshot_tick\":" + v.AcknowledgedSnapshotTick +
+            ",\"oldest_history_tick\":" + v.OldestHistoryTick +
+            ",\"newest_history_tick\":" + v.NewestHistoryTick +
             ",\"schema_fingerprint\":\"" + v.SchemaFingerprint + "\"}";
 
         private static string PhaseName(NetworkPhase phase) => phase == NetworkPhase.CommandDispatch ? "command_dispatch" :

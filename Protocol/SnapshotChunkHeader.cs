@@ -15,7 +15,7 @@ namespace UniGame.StaticEcs.Network
     public struct SnapshotChunkHeader
     {
         /// <summary>Fixed encoded header length.</summary>
-        public const int Size = 29;
+        public const int Size = 33;
 
         /// <summary>Gets or sets the snapshot payload encoding.</summary>
         public SnapshotPayloadKind PayloadKind;
@@ -31,6 +31,8 @@ namespace UniGame.StaticEcs.Network
         public uint ChunkIndex;
         /// <summary>Gets or sets the total chunk count.</summary>
         public uint ChunkCount;
+        /// <summary>Gets or sets the recovery correlation identifier, or zero outside recovery.</summary>
+        public uint ResyncCorrelationId;
 
         /// <summary>Writes a complete validated header in little-endian order.</summary>
         public bool TryWrite(Span<byte> destination)
@@ -44,6 +46,7 @@ namespace UniGame.StaticEcs.Network
             Hashing.Write64(bytes, 13, TotalHash);
             Hashing.Write32(bytes, 21, ChunkIndex);
             Hashing.Write32(bytes, 25, ChunkCount);
+            Hashing.Write32(bytes, 29, ResyncCorrelationId);
             return true;
         }
 
@@ -61,7 +64,8 @@ namespace UniGame.StaticEcs.Network
                 TotalLength = Hashing.Read32(source, 9),
                 TotalHash = Hashing.Read64(source, 13),
                 ChunkIndex = Hashing.Read32(source, 21),
-                ChunkCount = Hashing.Read32(source, 25)
+                ChunkCount = Hashing.Read32(source, 25),
+                ResyncCorrelationId = Hashing.Read32(source, 29)
             };
             if (!IsValid(value)) return false;
             header = value;
@@ -73,7 +77,8 @@ namespace UniGame.StaticEcs.Network
             value.ChunkCount > 0 && value.ChunkIndex < value.ChunkCount &&
             (value.PayloadKind == SnapshotPayloadKind.Keyframe
                 ? value.BaselineTick == 0
-                : value.BaselineTick != 0 && value.BaselineTick < value.SnapshotTick);
+                : value.BaselineTick != 0 && value.BaselineTick < value.SnapshotTick &&
+                  value.ResyncCorrelationId == 0);
 
         private static bool IsKnownPayloadKind(SnapshotPayloadKind kind) =>
             kind == SnapshotPayloadKind.Keyframe || kind == SnapshotPayloadKind.Delta;

@@ -2,7 +2,7 @@ using System;
 
 namespace UniGame.StaticEcs.Network
 {
-    /// <summary>Identifies a packet payload on the version-five wire.</summary>
+    /// <summary>Identifies a packet payload on the version-six wire.</summary>
     public enum PacketKind : byte
     {
         /// <summary>Begins protocol negotiation.</summary>
@@ -106,6 +106,43 @@ namespace UniGame.StaticEcs.Network
         UnexpectedEpoch = 5
     }
 
+    /// <summary>Carries the non-zero correlation identifier for one resynchronization exchange.</summary>
+    public readonly struct ResyncRequestPayload
+    {
+        /// <summary>Fixed encoded payload length.</summary>
+        public const int Size = 4;
+
+        /// <summary>Creates a resynchronization payload with a non-zero identifier.</summary>
+        public ResyncRequestPayload(uint correlationId)
+        {
+            if (correlationId == 0) throw new ArgumentOutOfRangeException(nameof(correlationId));
+            CorrelationId = correlationId;
+        }
+
+        /// <summary>Gets the direction-scoped correlation identifier.</summary>
+        public uint CorrelationId { get; }
+
+        /// <summary>Writes the exact little-endian payload.</summary>
+        public bool TryWrite(Span<byte> destination)
+        {
+            if (destination.Length != Size || CorrelationId == 0) return false;
+            Hashing.Write32(destination, 0, CorrelationId);
+            return true;
+        }
+
+        /// <summary>Reads an exact little-endian payload with a non-zero identifier.</summary>
+        public static bool TryRead(ReadOnlySpan<byte> source,
+            out ResyncRequestPayload payload)
+        {
+            payload = default;
+            if (source.Length != Size) return false;
+            var correlationId = Hashing.Read32(source, 0);
+            if (correlationId == 0) return false;
+            payload = new ResyncRequestPayload(correlationId);
+            return true;
+        }
+    }
+
     /// <summary>Explains why a protocol session ended.</summary>
     public enum DisconnectReason : ushort
     {
@@ -127,11 +164,11 @@ namespace UniGame.StaticEcs.Network
         Requested = 8
     }
 
-    /// <summary>Defines immutable version-five protocol limits.</summary>
+    /// <summary>Defines immutable version-six protocol limits.</summary>
     public static class ProtocolLimits
     {
         /// <summary>Current protocol wire version.</summary>
-        public const ushort Version = 5;
+        public const ushort Version = 6;
         /// <summary>Maximum encoded payload length.</summary>
         public const int MaxWirePayloadBytes = 8 * 1024 * 1024;
         /// <summary>Maximum decoded payload length.</summary>

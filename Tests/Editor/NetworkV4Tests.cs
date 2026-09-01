@@ -7,12 +7,12 @@ using NUnit.Framework;
 
 namespace UniGame.StaticEcs.Network.Tests
 {
-    public sealed class NetworkV5Tests
+    public sealed class NetworkV6Tests
     {
         private static readonly NetworkBufferPool Buffers = new NetworkBufferPool(64L << 20);
 
         [Test]
-        public void TypeIdsAndPacketHeaderAreCanonicalV5AndRejectV4()
+        public void TypeIdsAndPacketHeaderAreCanonicalV6AndRejectV5()
         {
             var id = NetworkCompilerSupport.TypeId("SourceGenerator.Tests", "Demo.Position");
             Assert.That(id.Value, Is.EqualTo(4089044646u));
@@ -32,12 +32,12 @@ namespace UniGame.StaticEcs.Network.Tests
             var bytes = new byte[PacketHeader.Size];
             Assert.That(header.TryWrite(bytes), Is.True);
             Assert.That(PacketHeader.TryRead(bytes, out var decoded), Is.True);
-            Assert.That(ProtocolLimits.Version, Is.EqualTo(5));
+            Assert.That(ProtocolLimits.Version, Is.EqualTo(6));
             Assert.That(decoded.SchemaFingerprint, Is.EqualTo(header.SchemaFingerprint));
             Assert.That(decoded.SimulationFingerprint,
                 Is.EqualTo(header.SimulationFingerprint));
             Assert.That(decoded.ContentFingerprint, Is.EqualTo(header.ContentFingerprint));
-            bytes[4] = 4;
+            bytes[4] = 5;
             bytes[5] = 0;
             Assert.That(PacketHeader.TryRead(bytes, out _), Is.False);
             Assert.That(header.TryWrite(bytes), Is.True);
@@ -54,6 +54,20 @@ namespace UniGame.StaticEcs.Network.Tests
             header.Kind = (PacketKind)4;
             header.PayloadLength = 0;
             Assert.That(header.TryWrite(bytes), Is.False);
+        }
+
+        [Test]
+        public void ResyncPayloadRequiresOneNonZeroCorrelationId()
+        {
+            Span<byte> bytes = stackalloc byte[ResyncRequestPayload.Size];
+            Assert.That(new ResyncRequestPayload(42).TryWrite(bytes), Is.True);
+            Assert.That(ResyncRequestPayload.TryRead(bytes, out var decoded),
+                Is.True);
+            Assert.That(decoded.CorrelationId, Is.EqualTo(42));
+            Assert.That(ResyncRequestPayload.TryRead(ReadOnlySpan<byte>.Empty,
+                out _), Is.False);
+            bytes.Clear();
+            Assert.That(ResyncRequestPayload.TryRead(bytes, out _), Is.False);
         }
 
         [Test]
@@ -79,6 +93,13 @@ namespace UniGame.StaticEcs.Network.Tests
             Assert.That(decoded.TotalHash, Is.EqualTo(header.TotalHash));
             Assert.That(decoded.ChunkIndex, Is.EqualTo(header.ChunkIndex));
             Assert.That(decoded.ChunkCount, Is.EqualTo(header.ChunkCount));
+
+            header.PayloadKind = SnapshotPayloadKind.Keyframe;
+            header.BaselineTick = 0;
+            header.ResyncCorrelationId = 42;
+            Assert.That(header.TryWrite(bytes), Is.True);
+            Assert.That(SnapshotChunkHeader.TryRead(bytes, out decoded), Is.True);
+            Assert.That(decoded.ResyncCorrelationId, Is.EqualTo(42));
         }
 
         [Test]
@@ -109,6 +130,9 @@ namespace UniGame.StaticEcs.Network.Tests
             header.BaselineTick = header.SnapshotTick;
             Assert.That(header.TryWrite(bytes), Is.False);
             header.BaselineTick = 8;
+            header.ResyncCorrelationId = 1;
+            Assert.That(header.TryWrite(bytes), Is.False);
+            header.ResyncCorrelationId = 0;
             header.TotalLength = 0;
             Assert.That(header.TryWrite(bytes), Is.False);
             header.TotalLength = 1;
@@ -580,6 +604,7 @@ namespace UniGame.StaticEcs.Network.Tests
 
                     var actual = new List<NetworkResyncReason>();
                     var sources = new List<NetworkResyncSource>();
+                    var commandResults = new List<NetworkCommandResult?>();
                     for (var index = 0; index < observer.Events.Count; index++)
                     {
                         var value = observer.Events[index];
@@ -588,6 +613,7 @@ namespace UniGame.StaticEcs.Network.Tests
                         {
                             actual.Add(value.ResyncReason);
                             sources.Add(value.ResyncSource);
+                            commandResults.Add(value.CommandResult);
                         }
                     }
                     CollectionAssert.AreEqual(expected, actual);
@@ -601,6 +627,16 @@ namespace UniGame.StaticEcs.Network.Tests
                             NetworkResyncSource.ServerCommandDecode,
                             NetworkResyncSource.ServerCommandDecode,
                         }, sources);
+                    CollectionAssert.AreEqual(
+                        new NetworkCommandResult?[]
+                        {
+                            NetworkCommandResult.Malformed,
+                            NetworkCommandResult.Malformed,
+                            NetworkCommandResult.Malformed,
+                            NetworkCommandResult.Malformed,
+                            NetworkCommandResult.Malformed,
+                            NetworkCommandResult.SchemaMismatch,
+                        }, commandResults);
                     validPacket.Dispose();
                 }
             }
@@ -958,7 +994,7 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
-        public void ForeignVersionWithInvalidHeaderCrcRequestsKeyframe()
+        public void ForeignVersionWithInvalidHeaderCrcClosesSession()
         {
             CreateReplicationWorld<ClientAWorld>(false);
             try
@@ -987,20 +1023,20 @@ namespace UniGame.StaticEcs.Network.Tests
                     client.Process();
 
                     Assert.That(client.Session.State,
-                        Is.EqualTo(NetworkSessionState.Established));
+                        Is.EqualTo(NetworkSessionState.Closed));
                     Assert.That(client.TryConsumeRecoveryTransition(out var recovery),
                         Is.True);
                     Assert.That(recovery.Phase,
-                        Is.EqualTo(NetworkRecoveryPhase.AwaitingKeyframe));
+                        Is.EqualTo(NetworkRecoveryPhase.DisconnectRequired));
                     Assert.That(recovery.Reason,
-                        Is.EqualTo(NetworkRecoveryReason.SnapshotRejected));
+                        Is.EqualTo(NetworkRecoveryReason.ProtocolIncompatible));
                 }
             }
             finally { World<ClientAWorld>.Destroy(); }
         }
 
         [Test]
-        public void TruncatedForeignVersionRequestsKeyframe()
+        public void TruncatedForeignVersionClosesSession()
         {
             CreateReplicationWorld<ClientAWorld>(false);
             try
@@ -1032,20 +1068,20 @@ namespace UniGame.StaticEcs.Network.Tests
                     client.Process();
 
                     Assert.That(client.Session.State,
-                        Is.EqualTo(NetworkSessionState.Established));
+                        Is.EqualTo(NetworkSessionState.Closed));
                     Assert.That(client.TryConsumeRecoveryTransition(out var recovery),
                         Is.True);
                     Assert.That(recovery.Phase,
-                        Is.EqualTo(NetworkRecoveryPhase.AwaitingKeyframe));
+                        Is.EqualTo(NetworkRecoveryPhase.DisconnectRequired));
                     Assert.That(recovery.Reason,
-                        Is.EqualTo(NetworkRecoveryReason.SnapshotRejected));
+                        Is.EqualTo(NetworkRecoveryReason.ProtocolIncompatible));
                 }
             }
             finally { World<ClientAWorld>.Destroy(); }
         }
 
         [Test]
-        public void ForeignVersionWithCorruptPayloadHashRequestsKeyframe()
+        public void ForeignVersionWithCorruptPayloadHashClosesSession()
         {
             CreateReplicationWorld<ClientAWorld>(false);
             try
@@ -1077,13 +1113,13 @@ namespace UniGame.StaticEcs.Network.Tests
                     client.Process();
 
                     Assert.That(client.Session.State,
-                        Is.EqualTo(NetworkSessionState.Established));
+                        Is.EqualTo(NetworkSessionState.Closed));
                     Assert.That(client.TryConsumeRecoveryTransition(out var recovery),
                         Is.True);
                     Assert.That(recovery.Phase,
-                        Is.EqualTo(NetworkRecoveryPhase.AwaitingKeyframe));
+                        Is.EqualTo(NetworkRecoveryPhase.DisconnectRequired));
                     Assert.That(recovery.Reason,
-                        Is.EqualTo(NetworkRecoveryReason.SnapshotRejected));
+                        Is.EqualTo(NetworkRecoveryReason.ProtocolIncompatible));
                 }
             }
             finally { World<ClientAWorld>.Destroy(); }
@@ -1192,6 +1228,48 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void ServerIgnoresLateRedundantCommandButRejectsLateNewCommand()
+        {
+            World<RejectWorld>.Create(WorldConfig.Default());
+            World<RejectWorld>.Types().Event<TestCommand>()
+                .Event<NetworkCommandAcceptedEvent<TestCommand>>()
+                .Event<NetworkCommandRejectedEvent<TestCommand>>();
+            World<RejectWorld>.Initialize();
+            try
+            {
+                var factory = NetworkCompilerSupport.Create<RejectWorld>();
+                factory.Command<TestCommand, RejectPolicy>(new NetworkTypeId(10));
+                var schema = factory.Freeze();
+                var client = new NetworkSession<RejectWorld>(new ConnectionId(1),
+                    NetworkRole.Client, schema);
+                client.Admit(schema.Fingerprint, 1, 1, default);
+                var server = new NetworkSession<RejectWorld>(new ConnectionId(1),
+                    NetworkRole.Server, schema);
+                server.Admit(schema.Fingerprint, 1, 1, default);
+
+                client.CreateCommand(new TestCommand { Value = 1 }, 1,
+                    out var first);
+                client.CreateCommand(new TestCommand { Value = 2 }, 1,
+                    out var second);
+                try
+                {
+                    Assert.That(server.Validate(first, 1, 2, 8, out _),
+                        Is.EqualTo(NetworkCommandResult.Queued));
+                    Assert.That(server.Validate(first, 100, 2, 8, out _),
+                        Is.EqualTo(NetworkCommandResult.Duplicate));
+                    Assert.That(server.Validate(second, 100, 2, 8, out _),
+                        Is.EqualTo(NetworkCommandResult.TickWindow));
+                }
+                finally
+                {
+                    first.Dispose();
+                    second.Dispose();
+                }
+            }
+            finally { World<RejectWorld>.Destroy(); }
+        }
+
+        [Test]
         public void ServerOwnsMonotonicTickAndGameplayPrecedesCapture()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
@@ -1255,26 +1333,37 @@ namespace UniGame.StaticEcs.Network.Tests
                         ServerTick = 7,
                         SchemaFingerprint = clientSchema.Fingerprint
                     };
-                    Assert.That(NetworkPacket.TryEncode(Buffers, nonSnapshot, ReadOnlySpan<byte>.Empty, out var nonSnapshotPacket), Is.True);
+                    Span<byte> resyncPayload = stackalloc byte[ResyncRequestPayload.Size];
+                    Assert.That(new ResyncRequestPayload(55).TryWrite(
+                        resyncPayload), Is.True);
+                    Assert.That(NetworkPacket.TryEncode(Buffers, nonSnapshot,
+                        resyncPayload, out var nonSnapshotPacket), Is.True);
                     Assert.That(serverTransport.TrySend(nonSnapshotPacket), Is.True);
                     client.Process();
                     Assert.That(client.ServerTick, Is.EqualTo(7));
                     Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(1));
                     Assert.That(clientObserver.Single(NetworkPhase.Decode,
                         NetworkPacketKind.ResyncRequest).ResyncReason,
-                        Is.EqualTo(NetworkResyncReason.SnapshotRejected));
+                        Is.EqualTo(NetworkResyncReason.None));
                     Assert.That(clientObserver.Single(NetworkPhase.Decode,
                         NetworkPacketKind.ResyncRequest).ResyncSource,
-                        Is.EqualTo(NetworkResyncSource.ClientIncomingResyncEcho));
+                        Is.EqualTo(NetworkResyncSource.None));
+                    Assert.That(clientObserver.Single(NetworkPhase.Decode,
+                        NetworkPacketKind.ResyncRequest).ResyncCorrelationId,
+                        Is.EqualTo(55));
                     Assert.That(clientObserver.Single(NetworkPhase.Send,
                         NetworkPacketKind.ResyncRequest).ResyncReason,
-                        Is.EqualTo(NetworkResyncReason.SnapshotRejected));
+                        Is.EqualTo(NetworkResyncReason.None));
                     Assert.That(clientObserver.Single(NetworkPhase.Send,
                         NetworkPacketKind.ResyncRequest).ResyncSource,
                         Is.EqualTo(NetworkResyncSource.ClientIncomingResyncEcho));
+                    Assert.That(clientObserver.Single(NetworkPhase.Send,
+                        NetworkPacketKind.ResyncRequest).ResyncCorrelationId,
+                        Is.EqualTo(55));
                     nonSnapshot.PacketSequence = 3;
                     nonSnapshot.ServerTick = 3;
-                    Assert.That(NetworkPacket.TryEncode(Buffers, nonSnapshot, ReadOnlySpan<byte>.Empty, out var olderTickPacket), Is.True);
+                    Assert.That(NetworkPacket.TryEncode(Buffers, nonSnapshot,
+                        resyncPayload, out var olderTickPacket), Is.True);
                     Assert.That(serverTransport.TrySend(olderTickPacket), Is.True);
                     client.Process();
                     Assert.That(client.ServerTick, Is.EqualTo(7), "validated non-snapshot ticks must not regress the authoritative cursor");
@@ -2031,8 +2120,12 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(ReadReplicaValue(), Is.EqualTo(1));
 
                 entity.Set(new TestComponent { Value = 2 });
+                observer.Events.Clear();
                 client.RequestFullResync(
                     NetworkRecoveryReason.PredictionHistoryUnavailable);
+                var correlationId = observer.Single(NetworkPhase.Send,
+                    NetworkPacketKind.ResyncRequest).ResyncCorrelationId;
+                Assert.That(correlationId, Is.Not.Zero);
                 server.Receive();
                 clientTransport.MaxReliablePayloadBytes = exactPacketBytes - 1;
                 serverTransport.MaxReliablePayloadBytes = exactPacketBytes - 1;
@@ -2043,10 +2136,14 @@ namespace UniGame.StaticEcs.Network.Tests
                     Is.LessThanOrEqualTo(exactPacketBytes - 1));
                 Assert.That(clientTransport.TryReceive(out first), Is.True);
                 Assert.That(clientTransport.TryReceive(out second), Is.True);
-                Assert.That(InspectSnapshotChunk(first, out _).ChunkIndex,
-                    Is.Zero);
-                Assert.That(InspectSnapshotChunk(second, out _).ChunkIndex,
-                    Is.EqualTo(1));
+                var firstChunk = InspectSnapshotChunk(first, out _);
+                var secondChunk = InspectSnapshotChunk(second, out _);
+                Assert.That(firstChunk.ChunkIndex, Is.Zero);
+                Assert.That(secondChunk.ChunkIndex, Is.EqualTo(1));
+                Assert.That(firstChunk.ResyncCorrelationId,
+                    Is.EqualTo(correlationId));
+                Assert.That(secondChunk.ResyncCorrelationId,
+                    Is.EqualTo(correlationId));
                 Assert.That(serverTransport.TrySend(second.Retain()), Is.True);
                 Assert.That(serverTransport.TrySend(second), Is.True);
                 second = null;
@@ -2056,6 +2153,11 @@ namespace UniGame.StaticEcs.Network.Tests
                 server.Receive();
                 Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(2));
                 Assert.That(ReadReplicaValue(), Is.EqualTo(2));
+                Assert.That(observer.Single(NetworkPhase.SnapshotApply)
+                    .ResyncCorrelationId, Is.EqualTo(correlationId));
+                Assert.That(observer.Single(NetworkPhase.Send,
+                    NetworkPacketKind.Ack).ResyncCorrelationId,
+                    Is.EqualTo(correlationId));
 
                 entity.Set(new TestComponent { Value = 3 });
                 client.RequestFullResync(NetworkRecoveryReason.SnapshotRejected);
@@ -2321,6 +2423,23 @@ namespace UniGame.StaticEcs.Network.Tests
                     delta = null;
 
                     var keyframe = KeyframeHeader(target);
+                    Assert.That(serverTransport.TryReceive(out var request),
+                        Is.True);
+                    try
+                    {
+                        Assert.That(NetworkPacket.TryDecode(request,
+                            out var requestHeader, out var requestBytes), Is.True);
+                        Assert.That(requestHeader.Kind,
+                            Is.EqualTo(PacketKind.ResyncRequest));
+                        Assert.That(ResyncRequestPayload.TryRead(
+                            requestBytes.Span, out var requestPayload), Is.True);
+                        keyframe.ResyncCorrelationId =
+                            requestPayload.CorrelationId;
+                    }
+                    finally
+                    {
+                        request.Dispose();
+                    }
                     SendSnapshotChunk(serverTransport, clientSchema.Fingerprint,
                         1, keyframe, target.Bytes.Span);
                     client.Process();

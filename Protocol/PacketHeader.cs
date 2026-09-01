@@ -2,17 +2,17 @@ using System;
 
 namespace UniGame.StaticEcs.Network
 {
-    /// <summary>Declares the only wire compression supported by Network v5.</summary>
+    /// <summary>Declares the only wire compression supported by Network v6.</summary>
     public enum NetworkCompression : byte
     {
         /// <summary>Leaves the canonical payload unchanged.</summary>
         None = 0
     }
 
-    /// <summary>Contains the fixed Network v5 packet framing fields.</summary>
+    /// <summary>Contains the fixed Network v6 packet framing fields.</summary>
     public struct PacketHeader
     {
-        /// <summary>Network v5 protocol number.</summary>
+        /// <summary>Network v6 protocol number.</summary>
         public const ushort Version = ProtocolLimits.Version;
         /// <summary>Fixed encoded header length.</summary>
         public const int Size = 84;
@@ -84,6 +84,11 @@ namespace UniGame.StaticEcs.Network
                    Hashing.XxHash64(source.Slice(Size, (int)header.PayloadLength)) == header.PayloadHash;
         }
 
+        /// <summary>Checks the fixed magic and version prefix without trusting the remaining frame.</summary>
+        internal static bool HasForeignProtocolVersion(ReadOnlySpan<byte> source) =>
+            source.Length >= 6 && Hashing.Read32(source, 0) == 0x53434553 &&
+            Read16(source, 4) != Version;
+
         /// <summary>Reads and validates a complete fixed header without touching payload bytes.</summary>
         public static bool TryRead(ReadOnlySpan<byte> source, out PacketHeader header)
         {
@@ -141,7 +146,7 @@ namespace UniGame.StaticEcs.Network
             kind == PacketKind.Pong;
     }
 
-    /// <summary>Encodes and validates exact Network v5 packets.</summary>
+    /// <summary>Encodes and validates exact Network v6 packets.</summary>
     public static class NetworkPacket
     {
         /// <summary>Frames one canonical payload with exact length and xxHash64.</summary>

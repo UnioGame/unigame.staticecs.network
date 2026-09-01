@@ -95,12 +95,18 @@ namespace UniGame.StaticEcs.Network
         LimitExceeded
     }
 
-    internal enum PacketValidationResult : byte
+    /// <summary>Reports exact bounded packet session validation outcomes.</summary>
+    public enum PacketValidationResult : byte
     {
+        /// <summary>The packet is valid for the current session.</summary>
         Success,
+        /// <summary>The session state does not accept the packet.</summary>
         WrongState,
+        /// <summary>The packet kind is not valid for the endpoint role.</summary>
         WrongRole,
+        /// <summary>The packet belongs to another session epoch.</summary>
         WrongEpoch,
+        /// <summary>The packet sequence is invalid.</summary>
         Sequence
     }
 
@@ -169,7 +175,7 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Gets caller-selected replication scope.</summary>
         public ScopeId Scope { get; private set; }
 
-        /// <summary>Completes the v5 handshake after exact shared-manifest fingerprint comparison.</summary>
+        /// <summary>Completes the v6 handshake after exact shared-manifest fingerprint comparison.</summary>
         internal NetworkAdmissionResult Admit(SchemaFingerprint remoteFingerprint, uint peerId, uint epoch, ScopeId scope)
         {
             if (State != NetworkSessionState.Handshaking) return NetworkAdmissionResult.WrongRole;
@@ -237,9 +243,9 @@ namespace UniGame.StaticEcs.Network
         {
             entry = null;
             if (Role != NetworkRole.Server || State != NetworkSessionState.Established || envelope.ExactBuffer == null || envelope.Connection != Connection || envelope.PeerId != PeerId || envelope.Epoch != Epoch) return NetworkCommandResult.WrongSession;
-            if (envelope.TargetTick < serverTick - Math.Min(serverTick, pastWindow) || envelope.TargetTick > serverTick + futureWindow) return NetworkCommandResult.TickWindow;
             if (!_schema.TryGet(envelope.TypeId, out entry) || entry.Kind != NetworkSchemaKind.Command || entry.Version != envelope.Version || envelope.ExactLength > entry.MaxBytes || entry.Invoker is not ICommandNetworkInvoker<TWorld> invoker || !invoker.HasPolicy) return NetworkCommandResult.SchemaMismatch;
             if (envelope.Sequence < _nextReceiveSequence) return NetworkCommandResult.Duplicate;
+            if (envelope.TargetTick < serverTick - Math.Min(serverTick, pastWindow) || envelope.TargetTick > serverTick + futureWindow) return NetworkCommandResult.TickWindow;
             if (envelope.Sequence == uint.MaxValue) return NetworkCommandResult.Sequence;
             _nextReceiveSequence = checked(envelope.Sequence + 1);
             return NetworkCommandResult.Queued;
@@ -303,10 +309,10 @@ namespace UniGame.StaticEcs.Network
         internal void Close() => State = NetworkSessionState.Closed;
 
         private NetworkAdmissionResult Reject(NetworkAdmissionResult result) { State = NetworkSessionState.Rejected; return result; }
-        internal void Trace(NetworkPhase phase, NetworkTraceKind kind, NetworkResultCategory result, NetworkPacketKind packetKind, uint serverTick, uint targetTick, int bytes, int historyTicks, long historyBytes, int tickGap, long durationNanoseconds, int entities = 0, int records = 0, int commands = 0, int queueSize = 0, int activeConnections = -1, int activePeers = -1, int acceptedCommands = 0, int rejectedCommands = 0, NetworkResyncReason resyncReason = NetworkResyncReason.None, NetworkResyncSource resyncSource = NetworkResyncSource.None)
+        internal void Trace(NetworkPhase phase, NetworkTraceKind kind, NetworkResultCategory result, NetworkPacketKind packetKind, uint serverTick, uint targetTick, int bytes, int historyTicks, long historyBytes, int tickGap, long durationNanoseconds, int entities = 0, int records = 0, int commands = 0, int queueSize = 0, int activeConnections = -1, int activePeers = -1, int acceptedCommands = 0, int rejectedCommands = 0, NetworkResyncReason resyncReason = NetworkResyncReason.None, NetworkResyncSource resyncSource = NetworkResyncSource.None, uint resyncCorrelationId = 0, NetworkCommandResult? commandResult = null, SnapshotApplyResult? snapshotResult = null, PacketValidationResult? packetValidationResult = null, uint sequence = 0, uint acknowledgedSnapshotTick = 0, uint oldestHistoryTick = 0, uint newestHistoryTick = 0)
         {
             if (_observer == null) return;
-            try { var packets = phase == NetworkPhase.Receive || phase == NetworkPhase.Decode || phase == NetworkPhase.Send ? 1 : 0; var connections = activeConnections < 0 ? State == NetworkSessionState.Closed ? 0 : 1 : activeConnections; var peers = activePeers < 0 ? State == NetworkSessionState.Established ? 1 : 0 : activePeers; var value = new NetworkTraceEvent(phase, kind, result, Role, Connection.Value, PeerId, Epoch, serverTick, targetTick, bytes, packets, entities, records, commands, queueSize, historyTicks, connections, peers, Stopwatch.GetTimestamp(), packetKind, historyBytes, tickGap, durationNanoseconds, _schema.Fingerprint, acceptedCommands, rejectedCommands, resyncReason: resyncReason, resyncSource: resyncSource); _observer.Observe(in value); }
+            try { var packets = phase == NetworkPhase.Receive || phase == NetworkPhase.Decode || phase == NetworkPhase.Send ? 1 : 0; var connections = activeConnections < 0 ? State == NetworkSessionState.Closed ? 0 : 1 : activeConnections; var peers = activePeers < 0 ? State == NetworkSessionState.Established ? 1 : 0 : activePeers; var value = new NetworkTraceEvent(phase, kind, result, Role, Connection.Value, PeerId, Epoch, serverTick, targetTick, bytes, packets, entities, records, commands, queueSize, historyTicks, connections, peers, Stopwatch.GetTimestamp(), packetKind, historyBytes, tickGap, durationNanoseconds, _schema.Fingerprint, acceptedCommands, rejectedCommands, resyncReason: resyncReason, resyncSource: resyncSource, resyncCorrelationId: resyncCorrelationId, commandResult: commandResult, snapshotResult: snapshotResult, packetValidationResult: packetValidationResult, sequence: sequence, acknowledgedSnapshotTick: acknowledgedSnapshotTick, oldestHistoryTick: oldestHistoryTick, newestHistoryTick: newestHistoryTick); _observer.Observe(in value); }
             catch { }
         }
 
@@ -491,6 +497,8 @@ namespace UniGame.StaticEcs.Network
 
         internal int HistoryCount(ScopeId scope) => _history.TryGetValue(scope, out var history) ? history.Count : 0;
         internal long HistoryByteCount(ScopeId scope) => _history.TryGetValue(scope, out var history) ? history.Bytes : 0;
+        internal uint OldestHistoryTick(ScopeId scope) => _history.TryGetValue(scope, out var history) ? history.OldestTick : 0;
+        internal uint NewestHistoryTick(ScopeId scope) => _history.TryGetValue(scope, out var history) ? history.NewestTick : 0;
         internal NetworkHistory<NetworkSnapshot> History(ScopeId scope) => _history.TryGetValue(scope, out var history) ? history : null;
 
         internal void Clear()
