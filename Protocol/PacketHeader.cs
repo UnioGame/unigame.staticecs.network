@@ -2,17 +2,17 @@ using System;
 
 namespace UniGame.StaticEcs.Network
 {
-    /// <summary>Declares the only wire compression supported by Network v6.</summary>
+    /// <summary>Declares the only wire compression supported by Network v7.</summary>
     public enum NetworkCompression : byte
     {
         /// <summary>Leaves the canonical payload unchanged.</summary>
         None = 0
     }
 
-    /// <summary>Contains the fixed Network v6 packet framing fields.</summary>
+    /// <summary>Contains the fixed Network v7 packet framing fields.</summary>
     public struct PacketHeader
     {
-        /// <summary>Network v6 protocol number.</summary>
+        /// <summary>Network v7 protocol number.</summary>
         public const ushort Version = ProtocolLimits.Version;
         /// <summary>Fixed encoded header length.</summary>
         public const int Size = 84;
@@ -143,10 +143,11 @@ namespace UniGame.StaticEcs.Network
             kind == PacketKind.Ack ||
             kind == PacketKind.ResyncRequest || kind == PacketKind.Disconnect ||
             kind == PacketKind.SnapshotChunk || kind == PacketKind.Ping ||
-            kind == PacketKind.Pong;
+            kind == PacketKind.Pong || kind == PacketKind.TransactionCommand ||
+            kind == PacketKind.TransactionReceipt;
     }
 
-    /// <summary>Encodes and validates exact Network v6 packets.</summary>
+    /// <summary>Encodes and validates exact Network v7 packets.</summary>
     public static class NetworkPacket
     {
         /// <summary>Frames one canonical payload with exact length and xxHash64.</summary>

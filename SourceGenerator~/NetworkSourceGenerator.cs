@@ -15,6 +15,7 @@ namespace UniGame.StaticEcs.Network.Generator
         private const string NetworkCommand = "UniGame.StaticEcs.Network.INetworkCommand";
         private const string EndpointAttribute = "UniGame.StaticEcs.Network.NetworkEndpointAttribute";
         private const string ManifestRecordAttribute = "UniGame.StaticEcs.Network.NetworkManifestRecordAttribute";
+        private const string PolicyManifestRecordAttribute = "UniGame.StaticEcs.Network.NetworkCommandPolicyManifestRecordAttribute";
         private static readonly DiagnosticDescriptor InvalidWireType = Error("NETV2001", "Invalid network wire type", "Network wire type '{0}' must be a concrete non-generic struct");
         private static readonly DiagnosticDescriptor Collision = Error("NETV2002", "Network type id collision", "Network type id 0x{0:x8} collides between '{1}' and '{2}'");
         private static readonly DiagnosticDescriptor InvalidShape = Error("NETV2003", "Ambiguous Static ECS shape", "Network wire type '{0}' must implement exactly one supported Static ECS shape");
@@ -43,20 +44,23 @@ namespace UniGame.StaticEcs.Network.Generator
                 compilation.GetTypeByMetadataName("UniGame.StaticEcs.Network.NetworkCompilerSupport") == null) return;
             var records = new List<Record>();
             CollectTypes(compilation.Assembly.GlobalNamespace, compilation.AssemblyName ?? string.Empty, records, context);
+            var localPolicies = CollectPolicies(compilation.Assembly.GlobalNamespace);
             var hasEndpoints = compilation.Assembly.GetAttributes().Any(a => a.AttributeClass?.ToDisplayString() == EndpointAttribute);
-            if (records.Count == 0 && !hasEndpoints) return;
+            if (records.Count == 0 && localPolicies.Count == 0 && !hasEndpoints) return;
             var referenced = CollectReferenced(compilation, context);
+            var referencedPolicies = CollectReferencedPolicies(compilation);
             if (hasEndpoints)
             {
                 foreach (var record in records)
                     context.ReportDiagnostic(Diagnostic.Create(SharedOnly,
                         record.Symbol.Locations.FirstOrDefault(), record.Symbol.ToDisplayString()));
-                EmitEndpoints(compilation, referenced, context);
+                EmitEndpoints(compilation, referenced,
+                    referencedPolicies.Concat(localPolicies).ToList(), context);
                 return;
             }
 
             ValidateCollisions(records, context);
-            EmitManifest(records, context);
+            EmitManifest(records, localPolicies, context);
         }
 
         private static void CollectTypes(INamespaceSymbol ns, string assemblyName, List<Record> records, SourceProductionContext context)
@@ -68,6 +72,7 @@ namespace UniGame.StaticEcs.Network.Generator
         private static void CollectType(INamedTypeSymbol type, string assemblyName, List<Record> records, SourceProductionContext context)
         {
             foreach (var nested in type.GetTypeMembers()) CollectType(nested, assemblyName, records, context);
+            if (type.TypeKind == TypeKind.Interface) return;
             var isType = Implements(type, NetworkType);
             var isCommand = Implements(type, NetworkCommand);
             if (!isType && !isCommand) return;
@@ -118,20 +123,18 @@ namespace UniGame.StaticEcs.Network.Generator
 
         private static List<Record> SelectReferenced(List<Record> referenced, AttributeData endpoint)
         {
+            if (endpoint.ConstructorArguments.Length <= 3)
+                return new List<Record>(referenced);
+            var roots = endpoint.ConstructorArguments[3];
+            if (roots.Kind != TypedConstantKind.Array || roots.Values.Length == 0)
+                return new List<Record>(referenced);
             var assemblies = new List<IAssemblySymbol>();
-            if (endpoint.ConstructorArguments.Length > 3)
-            {
-                var roots = endpoint.ConstructorArguments[3];
-                if (roots.Kind == TypedConstantKind.Array)
-                    foreach (var root in roots.Values)
-                        if (root.Value is INamedTypeSymbol symbol) AddRootAssembly(assemblies, symbol);
-                else if (roots.Value is INamedTypeSymbol singleRoot) AddRootAssembly(assemblies, singleRoot);
-            }
-            var records = new List<Record>();
-            foreach (var record in referenced)
-                if (record.OriginAssembly != null && assemblies.Any(assembly => SymbolEqualityComparer.Default.Equals(assembly, record.OriginAssembly)))
-                    records.Add(record);
-            return records;
+            foreach (var root in roots.Values)
+                if (root.Value is INamedTypeSymbol symbol)
+                    AddRootAssembly(assemblies, symbol);
+            return referenced.Where(record => record.OriginAssembly != null &&
+                assemblies.Any(assembly => SymbolEqualityComparer.Default.Equals(
+                    assembly, record.OriginAssembly))).ToList();
         }
 
         private static void AddRootAssembly(List<IAssemblySymbol> assemblies, INamedTypeSymbol root)
@@ -158,11 +161,39 @@ namespace UniGame.StaticEcs.Network.Generator
             }
         }
 
-        private static void EmitManifest(List<Record> records, SourceProductionContext context)
+        private static List<Policy> CollectReferencedPolicies(Compilation compilation)
+        {
+            var policies = new List<Policy>();
+            foreach (var reference in compilation.SourceModule.ReferencedAssemblySymbols)
+            foreach (var attribute in reference.GetAttributes())
+            {
+                if (attribute.AttributeClass?.ToDisplayString() !=
+                        PolicyManifestRecordAttribute ||
+                    attribute.ConstructorArguments.Length < 3)
+                    continue;
+                if (attribute.ConstructorArguments[0].Value is not INamedTypeSymbol world ||
+                    attribute.ConstructorArguments[1].Value is not INamedTypeSymbol command ||
+                    attribute.ConstructorArguments[2].Value is not INamedTypeSymbol policy)
+                    continue;
+                policies.Add(new Policy(policy,
+                    world.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                    command.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)));
+            }
+            return policies;
+        }
+
+        private static void EmitManifest(List<Record> records,
+            List<Policy> policies, SourceProductionContext context)
         {
             var source = new StringBuilder("// <auto-generated/>\n");
             foreach (var record in records.OrderBy(r => r.Kind).ThenBy(r => r.Id))
                 source.Append("[assembly: global::UniGame.StaticEcs.Network.NetworkManifestRecordAttribute(").Append(record.Id).Append("u, global::UniGame.StaticEcs.Network.NetworkSchemaKind.").Append(record.Kind).Append(", typeof(").Append(record.TypeName).Append("), ").Append(record.Version).Append(")]\n");
+            foreach (var policy in policies.OrderBy(p => p.WorldName)
+                         .ThenBy(p => p.CommandName).ThenBy(p => p.TypeName))
+                source.Append("[assembly: global::UniGame.StaticEcs.Network.NetworkCommandPolicyManifestRecordAttribute(typeof(")
+                    .Append(policy.WorldName).Append("), typeof(")
+                    .Append(policy.CommandName).Append("), typeof(")
+                    .Append(policy.TypeName).Append("))]\n");
             source.Append("[global::UniGame.StaticEcs.Network.NetworkManifestAttribute]\npublic static class __GeneratedNetworkManifest\n{\n")
                 .Append("    [global::System.ComponentModel.EditorBrowsable(global::System.ComponentModel.EditorBrowsableState.Never)]\n")
                 .Append("    public static void Append<TWorld>(global::UniGame.StaticEcs.Network.NetworkCompilerSchemaFactory<TWorld> factory) where TWorld : struct, global::FFS.Libraries.StaticEcs.IWorldType\n    {\n");
@@ -171,7 +202,9 @@ namespace UniGame.StaticEcs.Network.Generator
             context.AddSource("NetworkManifest.g.cs", SourceText.From(source.ToString(), Encoding.UTF8));
         }
 
-        private static void EmitEndpoints(Compilation compilation, List<Record> referenced, SourceProductionContext context)
+        private static void EmitEndpoints(Compilation compilation,
+            List<Record> referenced, List<Policy> availablePolicies,
+            SourceProductionContext context)
         {
             var endpoints = compilation.Assembly.GetAttributes().Where(a => a.AttributeClass?.ToDisplayString() == EndpointAttribute).ToArray();
             var names = new HashSet<string>(StringComparer.Ordinal);
@@ -195,7 +228,8 @@ namespace UniGame.StaticEcs.Network.Generator
                 if (role == 2)
                 {
                     var commands = selected.Where(r => r.Kind == Kind.Command).GroupBy(r => r.TypeName).Select(g => g.First()).ToArray();
-                    var policies = CollectPolicies(compilation.Assembly.GlobalNamespace, world);
+                    var policies = availablePolicies.Where(p =>
+                        p.WorldName == worldName).ToList();
                     foreach (var command in commands)
                     {
                         var matches = policies.Where(p => p.CommandName == command.TypeName).ToArray();
@@ -210,7 +244,8 @@ namespace UniGame.StaticEcs.Network.Generator
                 if (role == 2)
                 {
                     var commands = selected.Where(record => record.Kind == Kind.Command).Select(record => record.TypeName).ToArray();
-                    AppendPolicyEvents(CollectPolicies(compilation.Assembly.GlobalNamespace, world)
+                    AppendPolicyEvents(availablePolicies.Where(p =>
+                            p.WorldName == worldName)
                         .Where(policy => commands.Contains(policy.CommandName)), source);
                 }
                 source.Append("    }\n}\n");
@@ -218,20 +253,22 @@ namespace UniGame.StaticEcs.Network.Generator
             }
         }
 
-        private static List<Policy> CollectPolicies(INamespaceSymbol ns, INamedTypeSymbol world)
+        private static List<Policy> CollectPolicies(INamespaceSymbol ns)
         {
             var policies = new List<Policy>();
-            CollectPolicies(ns, world, policies);
+            CollectPolicies(ns, policies);
             return policies;
         }
 
-        private static void CollectPolicies(INamespaceSymbol ns, INamedTypeSymbol world, List<Policy> policies)
+        private static void CollectPolicies(INamespaceSymbol ns, List<Policy> policies)
         {
-            foreach (var child in ns.GetNamespaceMembers()) CollectPolicies(child, world, policies);
+            foreach (var child in ns.GetNamespaceMembers()) CollectPolicies(child, policies);
             foreach (var type in ns.GetTypeMembers())
             foreach (var iface in type.AllInterfaces)
-                if (iface.OriginalDefinition.ToDisplayString() == "UniGame.StaticEcs.Network.INetworkCommandPolicy<TWorld, TCommand>" && SymbolEqualityComparer.Default.Equals(iface.TypeArguments[0], world))
-                    policies.Add(new Policy(type, iface.TypeArguments[1].ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)));
+                if (iface.OriginalDefinition.ToDisplayString() == "UniGame.StaticEcs.Network.INetworkCommandPolicy<TWorld, TCommand>")
+                    policies.Add(new Policy(type,
+                        iface.TypeArguments[0].ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                        iface.TypeArguments[1].ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)));
         }
 
         private static void AppendPolicies(IEnumerable<Policy> policies, StringBuilder source)
@@ -315,6 +352,15 @@ namespace UniGame.StaticEcs.Network.Generator
             internal Record(uint id, Kind kind, string typeName, string metadataName, byte version, INamedTypeSymbol symbol, IAssemblySymbol originAssembly) { Id = id; Kind = kind; TypeName = typeName; MetadataName = metadataName; Version = version; Symbol = symbol; OriginAssembly = originAssembly; }
             internal uint Id { get; } internal Kind Kind { get; } internal string TypeName { get; } internal string MetadataName { get; } internal byte Version { get; } internal INamedTypeSymbol Symbol { get; } internal IAssemblySymbol OriginAssembly { get; }
         }
-        private readonly struct Policy { internal Policy(INamedTypeSymbol type, string commandName) { Type = type; CommandName = commandName; } internal INamedTypeSymbol Type { get; } internal string CommandName { get; } }
+        private readonly struct Policy
+        {
+            internal Policy(INamedTypeSymbol type, string worldName,
+                string commandName)
+            { Type = type; WorldName = worldName; CommandName = commandName; }
+            internal INamedTypeSymbol Type { get; }
+            internal string TypeName => Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+            internal string WorldName { get; }
+            internal string CommandName { get; }
+        }
     }
 }

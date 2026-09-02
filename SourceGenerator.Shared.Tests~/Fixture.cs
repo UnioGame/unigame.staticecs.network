@@ -33,6 +33,7 @@ namespace UniGame.StaticEcs.Network
     [System.AttributeUsage(System.AttributeTargets.Assembly, AllowMultiple = true)] public sealed class NetworkEndpointAttribute : System.Attribute { public NetworkEndpointAttribute(string name, System.Type world, NetworkRole role, params System.Type[] rootTypes) { } }
     [System.AttributeUsage(System.AttributeTargets.Class)] public sealed class NetworkManifestAttribute : System.Attribute { }
     [System.AttributeUsage(System.AttributeTargets.Assembly, AllowMultiple = true)] public sealed class NetworkManifestRecordAttribute : System.Attribute { public NetworkManifestRecordAttribute(uint id, NetworkSchemaKind kind, System.Type type, byte version = 1) { } }
+    [System.AttributeUsage(System.AttributeTargets.Assembly, AllowMultiple = true)] public sealed class NetworkCommandPolicyManifestRecordAttribute : System.Attribute { public NetworkCommandPolicyManifestRecordAttribute(System.Type world, System.Type command, System.Type policy) { } }
     public readonly struct NetworkTypeId { public NetworkTypeId(uint value) { Value = value; } public uint Value { get; } }
     public sealed class NetworkSchema<T> where T : struct, FFS.Libraries.StaticEcs.IWorldType { public NetworkSchema(string fingerprint, byte[] versions) { Fingerprint = fingerprint; Versions = versions; } public string Fingerprint { get; } public byte[] Versions { get; } }
     public sealed class NetworkCompilerSchemaFactory<T> where T : struct, FFS.Libraries.StaticEcs.IWorldType
@@ -53,6 +54,8 @@ namespace UniGame.StaticEcs.Network
 
 namespace Shared
 {
+    public struct ClientWorld : FFS.Libraries.StaticEcs.IWorldType { }
+    public struct ServerWorld : FFS.Libraries.StaticEcs.IWorldType { }
     public struct PlayerEntity : FFS.Libraries.StaticEcs.IEntityType, UniGame.StaticEcs.Network.INetworkType { }
     public struct NpcEntity : FFS.Libraries.StaticEcs.IEntityType, UniGame.StaticEcs.Network.INetworkType { }
     public struct Position : FFS.Libraries.StaticEcs.IComponent, FFS.Libraries.StaticEcs.IDisableable, FFS.Libraries.StaticEcs.IComponentConfig<Position>, UniGame.StaticEcs.Network.INetworkType
@@ -82,4 +85,6 @@ namespace Shared
         public void Write(ref FFS.Libraries.StaticPack.BinaryPackWriter writer) { }
         public void Read(ref FFS.Libraries.StaticPack.BinaryPackReader reader, byte version) { }
     }
+    public struct MovePolicy : UniGame.StaticEcs.Network.INetworkCommandPolicy<ServerWorld, Move> { }
+    public struct PingPolicy : UniGame.StaticEcs.Network.INetworkCommandPolicy<ServerWorld, Ping> { }
 }

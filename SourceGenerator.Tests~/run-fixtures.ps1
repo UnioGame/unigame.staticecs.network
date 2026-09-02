@@ -56,8 +56,8 @@ foreach ($required in @('factory.Entity<global::Shared.PlayerEntity>', 'factory.
     'factory.Component<global::Shared.Health>', 'factory.Command<global::Shared.Ping>',
     'factory.Component<global::UniGame.StaticEcs.Network.NetworkOwnerComponent>',
     'ComponentVersion<global::Shared.Position>()', 'EventVersion<global::Shared.Move>()',
-    'factory.Policy<global::Shared.Move, global::Demo.MovePolicy>()',
-    'factory.Policy<global::Shared.Ping, global::Demo.PingPolicy>()')) {
+    'factory.Policy<global::Shared.Move, global::Shared.MovePolicy>()',
+    'factory.Policy<global::Shared.Ping, global::Shared.PingPolicy>()')) {
     if (-not $generated.Contains($required)) { throw "Missing generated AOT/version assertion: $required" }
 }
 foreach ($defaulted in @('Shared.Health', 'Shared.Ping', 'UniGame.StaticEcs.Network.NetworkOwnerComponent')) {
@@ -79,6 +79,6 @@ Assert-Pass 'SourceGenerator.BadManifest.Tests~/SourceGenerator.BadManifest.Test
 Assert-Pass 'SourceGenerator.Shared.Tests~/SourceGenerator.Shared.Tests.csproj'
 Assert-Pass 'SourceGenerator.InvalidManifest.Tests~/SourceGenerator.InvalidManifest.Tests.csproj'
 $unlistedFingerprint = Invoke-BoundedRun 'SourceGenerator.InvalidManifest.Tests~/SourceGenerator.InvalidManifest.Tests.csproj'
-if ($unlistedFingerprint -ne $declaredVersionFingerprint) { throw 'Unlisted manifest changed the endpoint fingerprint.' }
+if ($unlistedFingerprint -ne $declaredVersionFingerprint) { throw 'Explicit test roots did not isolate the fixture manifest.' }
 
-Write-Host 'PASS: explicit-root endpoint schemas ignore unlisted manifests and preserve exact diagnostics NETV2006-NETV2010.'
+Write-Host 'PASS: root-free referenced manifests, cross-assembly policies, and isolated legacy test roots preserve diagnostics.'

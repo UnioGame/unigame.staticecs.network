@@ -19,6 +19,10 @@ namespace UniGame.StaticEcs.Network
         private readonly NetworkBufferPool _bufferPool;
         private readonly bool _ownsBufferPool;
         private readonly List<NetworkCommandEnvelope> _recentCommands = new List<NetworkCommandEnvelope>();
+        private readonly Dictionary<NetworkTransactionId, NetworkClientTransaction> _transactions =
+            new Dictionary<NetworkTransactionId, NetworkClientTransaction>();
+        private readonly Queue<NetworkClientTransactionResult> _transactionResults =
+            new Queue<NetworkClientTransactionResult>();
         private readonly int _commandRedundancy;
         private readonly int _ticksPerSecond;
         private readonly int _predictionLeadTicks;
@@ -28,6 +32,7 @@ namespace UniGame.StaticEcs.Network
             new NetworkBufferLease[ProtocolLimits.MaxChunkMappings];
         private uint _packetSequence = 1;
         private uint _commandPacketSequence = 1;
+        private ulong _nextTransactionId = 1;
         private uint _lastCommandFlushTick;
         private bool _commandsDirty;
         private bool _disposed;
@@ -136,11 +141,78 @@ namespace UniGame.StaticEcs.Network
             PendingCommandBytesHighWater = _recentCommandBytesHighWater,
         };
 
+        /// <summary>Gets the number of reliable transactions awaiting a receipt.</summary>
+        public int PendingTransactionCount => _transactions.Count;
+
+        /// <summary>Gets terminal reliable transaction results awaiting projection.</summary>
+        public int PendingTransactionResultCount => _transactionResults.Count;
+
+        /// <summary>Gets trusted submission context while a transaction is pending.</summary>
+        public bool TryGetTransactionContext(NetworkTransactionId transactionId,
+            out NetworkCommandContext context)
+        {
+            if (_transactions.TryGetValue(transactionId, out var transaction))
+            {
+                context = transaction.Context;
+                return true;
+            }
+            context = default;
+            return false;
+        }
+
+        /// <summary>Dequeues the next terminal transaction result.</summary>
+        public bool TryDequeueTransactionResult(out NetworkTransactionResult result)
+        {
+            if (_transactionResults.Count == 0)
+            {
+                result = default;
+                return false;
+            }
+            var item = _transactionResults.Dequeue();
+            result = new NetworkTransactionResult(item.TransactionId,
+                item.Status, item.ApplicationTick, item.TypeId);
+            return true;
+        }
+
+        /// <summary>Dequeues the next terminal result when it belongs to the requested command type.</summary>
+        public bool TryDequeueTransactionResult<TCommand>(
+            out NetworkTransactionResultEvent<TCommand> result)
+            where TCommand : struct, IEvent, INetworkTransactionCommand
+        {
+            if (_transactionResults.Count == 0)
+            {
+                result = default;
+                return false;
+            }
+            // Results can contain several command types. Rotate the queue instead
+            // of requiring every ECS projector to share one type order.
+            var count = _transactionResults.Count;
+            for (var i = 0; i < count; i++)
+            {
+                var item = _transactionResults.Dequeue();
+                if (item.Command is TCommand command)
+                {
+                    result = new NetworkTransactionResultEvent<TCommand>
+                    {
+                        Command = command,
+                        TransactionId = item.TransactionId,
+                        Status = item.Status,
+                        Context = item.Context
+                    };
+                    return true;
+                }
+                _transactionResults.Enqueue(item);
+            }
+            result = default;
+            return false;
+        }
+
         /// <summary>Closes the session and removes all replica-owned entities from the client world.</summary>
         public void Disconnect()
         {
             ClearSnapshotAssembly();
             _snapshotDiscardThroughTick = 0;
+            CompletePendingTransactions(NetworkTransactionStatus.SessionLost);
             _session.Close();
             _replicator.ClearReplicas();
             AcknowledgedSnapshotTick = 0;
@@ -159,6 +231,7 @@ namespace UniGame.StaticEcs.Network
             _recentCommandBytes = 0;
             _lastCommandFlushTick = 0;
             _commandsDirty = false;
+            _nextTransactionId = 1;
             _handshakeStarted = false;
             _recoveryTransition = default;
             _hasRecoveryTransition = false;
@@ -178,7 +251,7 @@ namespace UniGame.StaticEcs.Network
                 _bufferPool.Dispose();
         }
 
-        /// <summary>Sends the protocol-five Hello packet.</summary>
+        /// <summary>Sends the protocol-seven Hello packet.</summary>
         public bool BeginHandshake()
         {
             if (_handshakeStarted || _session.State != NetworkSessionState.Handshaking)
@@ -266,7 +339,9 @@ namespace UniGame.StaticEcs.Network
                         return;
                     }
                     var packetValidation = _session.ValidatePacket(in header);
-                    if (packetValidation != PacketValidationResult.Success)
+                    if (packetValidation != PacketValidationResult.Success &&
+                        !(header.Kind == PacketKind.TransactionReceipt &&
+                          packetValidation == PacketValidationResult.Duplicate))
                     {
                         _session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point,
                             NetworkResultCategory.Protocol, NetworkPacketKind.None,
@@ -318,6 +393,14 @@ namespace UniGame.StaticEcs.Network
                         out snapshotKind, out awaitingSnapshotChunks,
                         out discardRejectedSnapshot);
                     decodeResult = DiagnosticResult(snapshotResult.Value);
+                }
+                else if (header.Kind == PacketKind.TransactionReceipt)
+                {
+                    if (!DecodeTransactionReceipt(payload))
+                    {
+                        RequestDisconnect(NetworkRecoveryReason.ProtocolIncompatible);
+                        return;
+                    }
                 }
                 else if (header.Kind == PacketKind.Pong) DecodePong(payload);
                 else if (header.Kind == PacketKind.ResyncRequest)
@@ -396,6 +479,87 @@ namespace UniGame.StaticEcs.Network
             var result = QueueCommand(in command, targetTick, out sequence);
             if (result != NetworkCommandResult.Queued) return result;
             return FlushCommands(targetTick);
+        }
+
+        /// <summary>Submits one reliable transaction and returns its epoch-scoped id.</summary>
+        public NetworkCommandResult SubmitTransaction<TCommand>(in TCommand command,
+            out NetworkTransactionId transactionId)
+            where TCommand : struct, IEvent, INetworkTransactionCommand =>
+            SubmitTransaction(in command, ServerTick, out transactionId);
+
+        /// <summary>Attempts one reliable transaction submission without throwing on transport failure.</summary>
+        public bool TrySubmitTransaction<TCommand>(in TCommand command,
+            out NetworkTransactionId transactionId)
+            where TCommand : struct, IEvent, INetworkTransactionCommand =>
+            SubmitTransaction(in command, out transactionId) == NetworkCommandResult.Queued;
+
+        /// <summary>Submits one reliable transaction; the server chooses its application tick.</summary>
+        public NetworkCommandResult SubmitTransaction<TCommand>(in TCommand command,
+            uint targetTick, out NetworkTransactionId transactionId)
+            where TCommand : struct, IEvent, INetworkTransactionCommand
+        {
+            transactionId = default;
+            if (_session.State != NetworkSessionState.Established)
+                return NetworkCommandResult.WrongSession;
+            if (_transactions.Count >= NetworkTransactionWire.MaxPendingTransactions)
+                return NetworkCommandResult.LimitExceeded;
+            if (_nextTransactionId == 0)
+                return NetworkCommandResult.Sequence;
+
+            var idValue = _nextTransactionId;
+            _nextTransactionId = idValue == ulong.MaxValue ? 0 : idValue + 1;
+            transactionId = new NetworkTransactionId(idValue);
+            NetworkCommandEnvelope envelope;
+            NetworkCommandResult result;
+            try
+            {
+                result = _session.CreateTransaction(in command, out envelope);
+            }
+            catch (InvalidOperationException)
+            {
+                return NetworkCommandResult.LimitExceeded;
+            }
+            if (result != NetworkCommandResult.Queued)
+                return result;
+            var length = checked(NetworkTransactionWire.CommandHeaderSize +
+                                 envelope.ExactLength);
+            if (length > ProtocolLimits.MaxWirePayloadBytes ||
+                PacketHeader.Size + length > _transport.MaxReliablePayloadBytes)
+            {
+                envelope.Dispose();
+                return NetworkCommandResult.LimitExceeded;
+            }
+
+            var payload = _bufferPool.Rent(length);
+            try
+            {
+                if (!NetworkTransactionWire.TryWriteCommand(payload.WritableSpan,
+                        transactionId, envelope.TypeId, envelope.Version,
+                        envelope.Payload.Span))
+                    return NetworkCommandResult.LimitExceeded;
+                var packetSequence = _packetSequence;
+                var sent = Send(PacketKind.TransactionCommand, _session.Epoch,
+                    ServerTick, PacketHeader.NoneTick, payload.Span);
+                var context = new NetworkCommandContext(_session.PeerId,
+                    _session.Epoch, packetSequence, targetTick,
+                    NetworkCommandDelivery.Transaction, envelope.TypeId,
+                    transactionId);
+                if (!sent)
+                {
+                    QueueTransactionResult(new NetworkClientTransaction(
+                        transactionId, command, envelope.TypeId, in context),
+                        NetworkTransactionStatus.SubmissionFailed, ServerTick);
+                    return NetworkCommandResult.SubmissionFailed;
+                }
+                _transactions.Add(transactionId, new NetworkClientTransaction(
+                    transactionId, command, envelope.TypeId, in context));
+                return NetworkCommandResult.Queued;
+            }
+            finally
+            {
+                payload.Dispose();
+                envelope.Dispose();
+            }
         }
 
         /// <summary>Serializes one command into the current redundant tick batch.</summary>
@@ -532,6 +696,35 @@ namespace UniGame.StaticEcs.Network
                     command.Dispose();
                     _recentCommands.RemoveAt(i);
                 }
+        }
+
+        private bool DecodeTransactionReceipt(ReadOnlyMemory<byte> payload)
+        {
+            if (!NetworkTransactionWire.TryReadReceipt(payload.Span,
+                    out var transactionId, out var status,
+                    out var applicationTick))
+                return false;
+            if (!_transactions.TryGetValue(transactionId, out var transaction))
+                return true;
+            _transactions.Remove(transactionId);
+            QueueTransactionResult(transaction, status, applicationTick);
+            return true;
+        }
+
+        private void QueueTransactionResult(NetworkClientTransaction transaction,
+            NetworkTransactionStatus status, uint applicationTick)
+        {
+            _transactionResults.Enqueue(new NetworkClientTransactionResult(
+                transaction, status, applicationTick));
+        }
+
+        private void CompletePendingTransactions(NetworkTransactionStatus status)
+        {
+            if (_transactions.Count == 0)
+                return;
+            foreach (var transaction in _transactions.Values)
+                QueueTransactionResult(transaction, status, ServerTick);
+            _transactions.Clear();
         }
 
         private void DecodePong(ReadOnlyMemory<byte> payload)
@@ -878,6 +1071,7 @@ namespace UniGame.StaticEcs.Network
         private void RequestDisconnect(NetworkRecoveryReason reason)
         {
             RequestRecovery(NetworkRecoveryPhase.DisconnectRequired, reason, ServerTick);
+            CompletePendingTransactions(NetworkTransactionStatus.SessionLost);
             Send(PacketKind.Disconnect, _session.Epoch, ServerTick,
                 AcknowledgedSnapshotTick, ReadOnlySpan<byte>.Empty);
             _session.Close();
@@ -1116,6 +1310,7 @@ namespace UniGame.StaticEcs.Network
             for (var i = 0; i < _peers.Count; i++)
             {
                 var peer = _peers[i];
+                DispatchTransactions(peer);
                 if (_coordinator.TryGetProcessedCommand(peer.Transport.Connection, out var cursor))
                 {
                     peer.ServerProcessedCommandTick = cursor.Tick;
@@ -1134,11 +1329,21 @@ namespace UniGame.StaticEcs.Network
             var serverTick = _activeTick;
             try
             {
+                for (var i = 0; i < _peers.Count; i++)
+                {
+                    CompleteTransactions(_peers[i], serverTick);
+                    FlushTransactionReceipts(_peers[i]);
+                }
                 _captures.Clear();
                 for (var i = 0; i < _peers.Count; i++)
                 {
                     var peer = _peers[i];
                     if (peer.Session.State != NetworkSessionState.Established) continue;
+                    // A stalled reliable channel must not let snapshots overtake
+                    // terminal transaction receipts. Completed transactions stay
+                    // counted until their receipt is actually accepted by transport.
+                    if (peer.HasPendingReceiptWork)
+                        continue;
                     if (!_captures.TryGetValue(peer.Scope, out var capture))
                     {
                         var started = Stopwatch.GetTimestamp();
@@ -1195,6 +1400,73 @@ namespace UniGame.StaticEcs.Network
         public bool TryGetCapture(ScopeId scope, uint serverTick, out NetworkSnapshot snapshot)
             => _coordinator.TryGetCapture(scope, serverTick, out snapshot);
 
+        /// <summary>Gets the number of transactions waiting for gameplay completion.</summary>
+        public int PendingTransactionCount
+        {
+            get
+            {
+                var count = 0;
+                for (var i = 0; i < _peers.Count; i++)
+                    count += _peers[i].PendingTransactionCount;
+                return count;
+            }
+        }
+
+        /// <summary>Completes one pending transaction for the matching peer.</summary>
+        public bool CompleteTransaction(NetworkTransactionId transactionId,
+            NetworkTransactionStatus status = NetworkTransactionStatus.Applied)
+        {
+            if (status != NetworkTransactionStatus.Applied &&
+                status != NetworkTransactionStatus.GameplayRejected)
+                return false;
+            NetworkServerTransaction match = null;
+            for (var i = 0; i < _peers.Count; i++)
+            {
+                var peer = _peers[i];
+                if (!peer.Transactions.TryGetValue(transactionId, out var transaction) ||
+                    transaction.ReceiptSent || transaction.CompletionStatus.HasValue)
+                    continue;
+                if (match != null)
+                    return false;
+                match = transaction;
+            }
+            if (match == null)
+                return false;
+            match.CompletionStatus = status;
+            return true;
+        }
+
+        /// <summary>Completes one transaction using its full connection-epoch key.</summary>
+        public bool CompleteTransaction(uint peerId, uint epoch,
+            NetworkTransactionId transactionId,
+            NetworkTransactionStatus status = NetworkTransactionStatus.Applied)
+        {
+            if (status != NetworkTransactionStatus.Applied &&
+                status != NetworkTransactionStatus.GameplayRejected)
+                return false;
+            for (var i = 0; i < _peers.Count; i++)
+            {
+                var peer = _peers[i];
+                if (peer.PeerId != peerId || peer.Epoch != epoch ||
+                    !peer.Transactions.TryGetValue(transactionId, out var transaction) ||
+                    transaction.ReceiptSent || transaction.CompletionStatus.HasValue)
+                    continue;
+                transaction.CompletionStatus = status;
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>Completes one pending transaction from its ECS request payload.</summary>
+        public bool CompleteTransaction(in CompleteNetworkTransactionRequest request) =>
+            CompleteTransaction(request.PeerId, request.Epoch,
+                request.TransactionId, request.Status);
+
+        /// <summary>Compatibility alias for ECS-facing transaction completion code.</summary>
+        public bool CompleteNetworkTransaction(NetworkTransactionId transactionId,
+            NetworkTransactionStatus status = NetworkTransactionStatus.Applied) =>
+            CompleteTransaction(transactionId, status);
+
         private bool DecodePacket(Peer peer, NetworkBufferLease packet)
         {
             var started = Stopwatch.GetTimestamp();
@@ -1212,11 +1484,15 @@ namespace UniGame.StaticEcs.Network
                 return true;
             }
             var packetValidation = peer.Session.ValidatePacket(in header);
+            var duplicateTransactionPacket =
+                header.Kind == PacketKind.TransactionCommand &&
+                packetValidation == PacketValidationResult.Duplicate;
             if ((header.Kind != PacketKind.Hello &&
                  (header.SchemaFingerprint != _schema.Fingerprint ||
                   header.SimulationFingerprint != _simulationFingerprint ||
                   header.ContentFingerprint != _contentFingerprint)) ||
-                packetValidation != PacketValidationResult.Success)
+                packetValidation != PacketValidationResult.Success &&
+                !duplicateTransactionPacket)
             {
                 peer.Session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point,
                     NetworkResultCategory.Protocol, DiagnosticKind(header.Kind),
@@ -1241,6 +1517,22 @@ namespace UniGame.StaticEcs.Network
                     checked(ServerTick + 1));
                 if (commandResult != NetworkCommandResult.Queued &&
                     commandResult != NetworkCommandResult.Duplicate)
+                    decodeResult = NetworkResultCategory.Malformed;
+            }
+            else if (header.Kind == PacketKind.TransactionCommand)
+            {
+                commandResult = DecodeTransaction(peer, packet, payload,
+                    checked(ServerTick + 1), duplicateTransactionPacket);
+                if (duplicateTransactionPacket &&
+                    commandResult != NetworkCommandResult.Duplicate)
+                {
+                    CleanupPeer(peer);
+                    return true;
+                }
+                if (commandResult == NetworkCommandResult.PolicyRejected)
+                    decodeResult = NetworkResultCategory.Policy;
+                else if (commandResult != NetworkCommandResult.Queued &&
+                         commandResult != NetworkCommandResult.Duplicate)
                     decodeResult = NetworkResultCategory.Malformed;
             }
             else if (header.Kind == PacketKind.Ping)
@@ -1677,6 +1969,163 @@ namespace UniGame.StaticEcs.Network
             return sent;
         }
 
+        private NetworkCommandResult DecodeTransaction(Peer peer,
+            NetworkBufferLease packet, ReadOnlyMemory<byte> payload,
+            uint applicationTick, bool duplicatePacket = false)
+        {
+            if (packet.Length > peer.Transport.MaxReliablePayloadBytes)
+                return NetworkCommandResult.LimitExceeded;
+            if (!NetworkTransactionWire.TryReadCommand(payload.Span,
+                    out var transactionId, out var typeId, out var version,
+                    out var payloadOffset))
+                return NetworkCommandResult.Malformed;
+            if (peer.Transactions.ContainsKey(transactionId))
+                return NetworkCommandResult.Duplicate;
+            if (peer.ReceiptLedger.TryGetValue(transactionId, out var cached))
+            {
+                peer.QueueReceipt(in cached);
+                return NetworkCommandResult.Duplicate;
+            }
+            if (transactionId.Value <= peer.HighestTransactionId)
+            {
+                // Evicted ids are never re-applied. Keep this fallback bounded while
+                // preserving the monotonic high-water mark for exact-once safety.
+                var evicted = new NetworkServerTransactionReceipt(transactionId,
+                    NetworkTransactionStatus.Unhandled, applicationTick);
+                return peer.QueueReceipt(in evicted)
+                    ? NetworkCommandResult.Duplicate
+                    : NetworkCommandResult.LimitExceeded;
+            }
+            if (duplicatePacket)
+                return NetworkCommandResult.Sequence;
+            if (peer.PendingTransactionCount >=
+                NetworkTransactionWire.MaxPendingTransactions)
+            {
+                var rejected = new NetworkServerTransactionReceipt(transactionId,
+                    NetworkTransactionStatus.PolicyRejected, applicationTick);
+                peer.HighestTransactionId = transactionId.Value;
+                return peer.QueueReceipt(in rejected)
+                    ? NetworkCommandResult.PolicyRejected
+                    : NetworkCommandResult.LimitExceeded;
+            }
+            peer.HighestTransactionId = transactionId.Value;
+
+            var exactLength = payload.Length - payloadOffset;
+            var exact = packet.RetainSlice(PacketHeader.Size + payloadOffset,
+                exactLength);
+            var envelope = new NetworkCommandEnvelope(peer.Transport.Connection,
+                peer.PeerId, peer.Epoch, peer.LastReceivedPacketSequence,
+                applicationTick, typeId, version, exact);
+            var validation = peer.Session.ValidateTransaction(envelope,
+                out var entry);
+            if (validation != NetworkCommandResult.Queued)
+            {
+                envelope.Dispose();
+                // Keep the policy result in the same bounded transaction ledger
+                // as accepted commands. It cannot be lost when reliable send is
+                // stalled, and it still consumes one of the 256 pending slots.
+                peer.Transactions.Add(transactionId,
+                    new NetworkServerTransaction(transactionId, default,
+                        default, applicationTick)
+                    {
+                        Dispatched = true,
+                        CompletionStatus = NetworkTransactionStatus.PolicyRejected
+                    });
+                return NetworkCommandResult.PolicyRejected;
+            }
+            peer.Transactions.Add(transactionId,
+                new NetworkServerTransaction(transactionId, envelope, entry,
+                    applicationTick));
+            return NetworkCommandResult.Queued;
+        }
+
+        private static void DispatchTransactions(Peer peer)
+        {
+            foreach (var transaction in peer.Transactions.Values)
+            {
+                if (transaction.Dispatched || transaction.ReceiptSent)
+                    continue;
+                transaction.Dispatched = true;
+                try
+                {
+                    var result = peer.Session.Dispatch(transaction.Envelope,
+                        transaction.Entry, NetworkCommandDelivery.Transaction,
+                        transaction.TransactionId);
+                    if (result == NetworkCommandResult.PolicyRejected)
+                        transaction.CompletionStatus =
+                            NetworkTransactionStatus.PolicyRejected;
+                    else if (result != NetworkCommandResult.Dispatched)
+                        transaction.CompletionStatus =
+                            NetworkTransactionStatus.Unhandled;
+                }
+                catch
+                {
+                    transaction.CompletionStatus =
+                        NetworkTransactionStatus.PolicyRejected;
+                }
+                finally
+                {
+                    transaction.Dispose();
+                }
+            }
+        }
+
+        private void CompleteTransactions(Peer peer, uint serverTick)
+        {
+            foreach (var transaction in peer.Transactions.Values)
+            {
+                if (!transaction.Dispatched || transaction.ReceiptSent)
+                    continue;
+                transaction.CompletionStatus ??=
+                    NetworkTransactionStatus.Unhandled;
+                var receipt = new NetworkServerTransactionReceipt(
+                    transaction.TransactionId, transaction.CompletionStatus.Value,
+                    transaction.ApplicationTick);
+                peer.QueueReceipt(in receipt);
+            }
+        }
+
+        private void FlushTransactionReceipts(Peer peer)
+        {
+            QueueCompletedTransactionReceipts(peer);
+            while (peer.PendingReceipts.Count > 0)
+            {
+                var receipt = peer.PendingReceipts.Peek();
+                Span<byte> payload = stackalloc byte[NetworkTransactionWire.ReceiptSize];
+                if (!NetworkTransactionWire.TryWriteReceipt(payload,
+                        receipt.TransactionId, receipt.Status,
+                        receipt.ApplicationTick) ||
+                    !Send(peer, PacketKind.TransactionReceipt,
+                        receipt.ApplicationTick, PacketHeader.NoneTick, payload))
+                    return;
+                peer.PendingReceipts.Dequeue();
+                peer.QueuedReceiptIds.Remove(receipt.TransactionId);
+                if (peer.Transactions.TryGetValue(receipt.TransactionId,
+                        out var transaction) &&
+                    transaction.CompletionStatus.HasValue)
+                {
+                    transaction.ReceiptSent = true;
+                    peer.Transactions.Remove(receipt.TransactionId);
+                }
+                QueueCompletedTransactionReceipts(peer);
+            }
+        }
+
+        private static void QueueCompletedTransactionReceipts(Peer peer)
+        {
+            foreach (var transaction in peer.Transactions.Values)
+            {
+                if (!transaction.Dispatched || transaction.ReceiptSent ||
+                    !transaction.CompletionStatus.HasValue)
+                    continue;
+                var receipt = new NetworkServerTransactionReceipt(
+                    transaction.TransactionId,
+                    transaction.CompletionStatus.Value,
+                    transaction.ApplicationTick);
+                peer.QueueReceipt(in receipt);
+            }
+        }
+
         private bool SendResync(Peer peer, uint serverTick,
             NetworkResyncReason resyncReason,
             NetworkResyncSource resyncSource,
@@ -1766,6 +2215,14 @@ namespace UniGame.StaticEcs.Network
             }
             finally
             {
+                foreach (var transaction in peer.Transactions.Values)
+                    transaction.Dispose();
+                peer.Transactions.Clear();
+                peer.ReceiptLedger.Clear();
+                peer.PendingReceipts.Clear();
+                peer.QueuedReceiptIds.Clear();
+                peer.ReceiptOrder.Clear();
+                peer.CompletedTransactionIds.Clear();
                 _coordinator.Remove(peer.Transport.Connection);
             }
         }
@@ -1822,6 +2279,74 @@ namespace UniGame.StaticEcs.Network
             internal uint ResyncSnapshotTick;
             internal bool AdmissionNotified;
             internal bool DisconnectNotified;
+            internal uint LastReceivedPacketSequence =>
+                Session.LastReceivedPacketSequence;
+            internal readonly Dictionary<NetworkTransactionId,
+                NetworkServerTransaction> Transactions =
+                new Dictionary<NetworkTransactionId, NetworkServerTransaction>();
+            internal readonly Dictionary<NetworkTransactionId,
+                NetworkServerTransactionReceipt> ReceiptLedger =
+                new Dictionary<NetworkTransactionId, NetworkServerTransactionReceipt>();
+            internal readonly Queue<NetworkServerTransactionReceipt> PendingReceipts =
+                new Queue<NetworkServerTransactionReceipt>();
+            internal readonly HashSet<NetworkTransactionId> QueuedReceiptIds =
+                new HashSet<NetworkTransactionId>();
+            internal readonly Queue<NetworkTransactionId> ReceiptOrder =
+                new Queue<NetworkTransactionId>();
+            internal readonly List<NetworkTransactionId> CompletedTransactionIds =
+                new List<NetworkTransactionId>();
+            internal ulong HighestTransactionId;
+            internal int PendingTransactionCount
+            {
+                get
+                {
+                    return Transactions.Count;
+                }
+            }
+
+            internal bool HasPendingReceiptWork
+            {
+                get
+                {
+                    if (PendingReceipts.Count != 0)
+                        return true;
+                    foreach (var transaction in Transactions.Values)
+                    {
+                        if (transaction.CompletionStatus.HasValue &&
+                            !transaction.ReceiptSent)
+                            return true;
+                    }
+                    return false;
+                }
+            }
+
+            internal void CacheReceipt(in NetworkServerTransactionReceipt receipt)
+            {
+                if (ReceiptLedger.ContainsKey(receipt.TransactionId))
+                    return;
+                ReceiptLedger.Add(receipt.TransactionId, receipt);
+                ReceiptOrder.Enqueue(receipt.TransactionId);
+                while (ReceiptOrder.Count > NetworkTransactionWire.ReceiptLedgerCapacity)
+                {
+                    var evicted = ReceiptOrder.Dequeue();
+                    ReceiptLedger.Remove(evicted);
+                }
+            }
+
+            internal bool QueueReceipt(in NetworkServerTransactionReceipt receipt)
+            {
+                CacheReceipt(in receipt);
+                if (!QueuedReceiptIds.Add(receipt.TransactionId))
+                    return true;
+                if (PendingReceipts.Count >=
+                    NetworkTransactionWire.MaxPendingTransactions)
+                {
+                    QueuedReceiptIds.Remove(receipt.TransactionId);
+                    return false;
+                }
+                PendingReceipts.Enqueue(receipt);
+                return true;
+            }
             internal readonly NetworkCommandEnvelope[] DecodedCommands =
                 new NetworkCommandEnvelope[ProtocolLimits.MaxCommandsPerBatch];
             internal NetworkPeerData Data() => new NetworkPeerData

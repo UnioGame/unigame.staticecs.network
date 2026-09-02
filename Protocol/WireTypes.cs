@@ -2,7 +2,7 @@ using System;
 
 namespace UniGame.StaticEcs.Network
 {
-    /// <summary>Identifies a packet payload on the version-six wire.</summary>
+    /// <summary>Identifies a packet payload on the version-seven wire.</summary>
     public enum PacketKind : byte
     {
         /// <summary>Begins protocol negotiation.</summary>
@@ -22,7 +22,11 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Measures clock offset and round-trip time.</summary>
         Ping = 9,
         /// <summary>Returns a clock synchronization sample.</summary>
-        Pong = 10
+        Pong = 10,
+        /// <summary>Carries one reliable client transaction command.</summary>
+        TransactionCommand = 11,
+        /// <summary>Returns one reliable transaction receipt.</summary>
+        TransactionReceipt = 12
     }
 
     /// <summary>Declares packet delivery requirements.</summary>
@@ -70,7 +74,7 @@ namespace UniGame.StaticEcs.Network
     [Flags]
     public enum CommandFlags : ushort
     {
-        /// <summary>Version five defines no command options.</summary>
+        /// <summary>Version seven defines no command options.</summary>
         None = 0
     }
 
@@ -164,11 +168,11 @@ namespace UniGame.StaticEcs.Network
         Requested = 8
     }
 
-    /// <summary>Defines immutable version-six protocol limits.</summary>
+    /// <summary>Defines immutable version-seven protocol limits.</summary>
     public static class ProtocolLimits
     {
         /// <summary>Current protocol wire version.</summary>
-        public const ushort Version = 6;
+        public const ushort Version = 7;
         /// <summary>Maximum encoded payload length.</summary>
         public const int MaxWirePayloadBytes = 8 * 1024 * 1024;
         /// <summary>Maximum decoded payload length.</summary>

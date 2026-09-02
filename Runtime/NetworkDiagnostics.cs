@@ -26,7 +26,9 @@ namespace UniGame.StaticEcs.Network
         /// <summary>A clock synchronization request.</summary>
         Ping = 9,
         /// <summary>A clock synchronization response.</summary>
-        Pong = 10
+        Pong = 10,
+        TransactionCommand = 11,
+        TransactionReceipt = 12
     }
     /// <summary>Identifies a measured networking phase.</summary>
     public enum NetworkPhase : byte
@@ -445,6 +447,6 @@ namespace UniGame.StaticEcs.Network
             phase == NetworkPhase.SnapshotApply ? "snapshot_apply" :
             phase == NetworkPhase.SnapshotCapture ? "snapshot_capture" :
             phase == NetworkPhase.ServerTick ? "server_tick" : phase.ToString().ToLowerInvariant();
-        private static string PacketName(NetworkPacketKind kind) => kind == NetworkPacketKind.CommandBatch ? "command_batch" : kind == NetworkPacketKind.SnapshotChunk ? "snapshot_chunk" : kind == NetworkPacketKind.ResyncRequest ? "resync_request" : kind.ToString().ToLowerInvariant();
+        private static string PacketName(NetworkPacketKind kind) => kind == NetworkPacketKind.CommandBatch ? "command_batch" : kind == NetworkPacketKind.SnapshotChunk ? "snapshot_chunk" : kind == NetworkPacketKind.ResyncRequest ? "resync_request" : kind == NetworkPacketKind.TransactionCommand ? "transaction_command" : kind == NetworkPacketKind.TransactionReceipt ? "transaction_receipt" : kind.ToString().ToLowerInvariant();
     }
 }

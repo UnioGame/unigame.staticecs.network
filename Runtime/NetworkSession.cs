@@ -92,7 +92,9 @@ namespace UniGame.StaticEcs.Network
         /// <summary>The redundant command was already observed.</summary>
         Duplicate,
         /// <summary>The command batch exceeded a negotiated bound.</summary>
-        LimitExceeded
+        LimitExceeded,
+        /// <summary>The transaction could not be submitted to transport.</summary>
+        SubmissionFailed
     }
 
     /// <summary>Reports exact bounded packet session validation outcomes.</summary>
@@ -107,7 +109,9 @@ namespace UniGame.StaticEcs.Network
         /// <summary>The packet belongs to another session epoch.</summary>
         WrongEpoch,
         /// <summary>The packet sequence is invalid.</summary>
-        Sequence
+        Sequence,
+        /// <summary>The reliable transaction packet was already received.</summary>
+        Duplicate
     }
 
     /// <summary>Owns one immutable validated command payload.</summary>
@@ -175,7 +179,7 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Gets caller-selected replication scope.</summary>
         public ScopeId Scope { get; private set; }
 
-        /// <summary>Completes the v6 handshake after exact shared-manifest fingerprint comparison.</summary>
+        /// <summary>Completes the v7 handshake after exact shared-manifest fingerprint comparison.</summary>
         internal NetworkAdmissionResult Admit(SchemaFingerprint remoteFingerprint, uint peerId, uint epoch, ScopeId scope)
         {
             if (State != NetworkSessionState.Handshaking) return NetworkAdmissionResult.WrongRole;
@@ -192,8 +196,23 @@ namespace UniGame.StaticEcs.Network
         {
             envelope = default;
             if (Role != NetworkRole.Client || State != NetworkSessionState.Established) return NetworkCommandResult.WrongSession;
+            if (typeof(INetworkTransactionCommand).IsAssignableFrom(typeof(TCommand)))
+                return NetworkCommandResult.SchemaMismatch;
             if (_nextSendSequence == uint.MaxValue) return NetworkCommandResult.Sequence;
             return CreateEnvelope(command, targetTick, _nextSendSequence++, out envelope);
+        }
+
+        /// <summary>Serializes one reliable transaction without consuming the input sequence.</summary>
+        internal NetworkCommandResult CreateTransaction<TCommand>(in TCommand command,
+            out NetworkCommandEnvelope envelope)
+            where TCommand : struct, IEvent, INetworkCommand
+        {
+            envelope = default;
+            if (Role != NetworkRole.Client || State != NetworkSessionState.Established)
+                return NetworkCommandResult.WrongSession;
+            if (!typeof(INetworkTransactionCommand).IsAssignableFrom(typeof(TCommand)))
+                return NetworkCommandResult.SchemaMismatch;
+            return CreateEnvelope(command, PacketHeader.NoneTick, 0, out envelope);
         }
 
         private NetworkCommandResult CreateEnvelope<TCommand>(TCommand command, uint targetTick,
@@ -244,6 +263,7 @@ namespace UniGame.StaticEcs.Network
             entry = null;
             if (Role != NetworkRole.Server || State != NetworkSessionState.Established || envelope.ExactBuffer == null || envelope.Connection != Connection || envelope.PeerId != PeerId || envelope.Epoch != Epoch) return NetworkCommandResult.WrongSession;
             if (!_schema.TryGet(envelope.TypeId, out entry) || entry.Kind != NetworkSchemaKind.Command || entry.Version != envelope.Version || envelope.ExactLength > entry.MaxBytes || entry.Invoker is not ICommandNetworkInvoker<TWorld> invoker || !invoker.HasPolicy) return NetworkCommandResult.SchemaMismatch;
+            if (typeof(INetworkTransactionCommand).IsAssignableFrom(entry.RuntimeType)) return NetworkCommandResult.SchemaMismatch;
             if (envelope.Sequence < _nextReceiveSequence) return NetworkCommandResult.Duplicate;
             if (envelope.TargetTick < serverTick - Math.Min(serverTick, pastWindow) || envelope.TargetTick > serverTick + futureWindow) return NetworkCommandResult.TickWindow;
             if (envelope.Sequence == uint.MaxValue) return NetworkCommandResult.Sequence;
@@ -251,9 +271,38 @@ namespace UniGame.StaticEcs.Network
             return NetworkCommandResult.Queued;
         }
 
+        internal NetworkCommandResult ValidateTransaction(
+            NetworkCommandEnvelope envelope, out NetworkSchemaEntry entry)
+        {
+            entry = null;
+            if (Role != NetworkRole.Server ||
+                State != NetworkSessionState.Established ||
+                envelope.ExactBuffer == null ||
+                envelope.Connection != Connection || envelope.PeerId != PeerId ||
+                envelope.Epoch != Epoch)
+                return NetworkCommandResult.WrongSession;
+            if (!_schema.TryGet(envelope.TypeId, out entry) ||
+                entry.Kind != NetworkSchemaKind.Command ||
+                !typeof(INetworkTransactionCommand).IsAssignableFrom(entry.RuntimeType) ||
+                entry.Version != envelope.Version ||
+                envelope.ExactLength > entry.MaxBytes ||
+                entry.Invoker is not ICommandNetworkInvoker<TWorld> invoker ||
+                !invoker.HasPolicy)
+                return NetworkCommandResult.SchemaMismatch;
+            return NetworkCommandResult.Queued;
+        }
+
         internal NetworkCommandResult Dispatch(NetworkCommandEnvelope envelope, NetworkSchemaEntry entry)
         {
-            var context = new NetworkCommandContext(PeerId, Epoch, envelope.Sequence, envelope.TargetTick);
+            return Dispatch(envelope, entry, NetworkCommandDelivery.Input, default);
+        }
+
+        internal NetworkCommandResult Dispatch(NetworkCommandEnvelope envelope,
+            NetworkSchemaEntry entry, NetworkCommandDelivery delivery,
+            NetworkTransactionId transactionId)
+        {
+            var context = new NetworkCommandContext(PeerId, Epoch, envelope.Sequence,
+                envelope.TargetTick, delivery, entry.TypeId, transactionId);
             return ((ICommandNetworkInvoker<TWorld>)entry.Invoker).Dispatch(
                 envelope.ExactBuffer, envelope.ExactOffset, envelope.ExactLength,
                 entry.Version, in context);
@@ -285,6 +334,36 @@ namespace UniGame.StaticEcs.Network
                 _lastReceiveCommandPacketSequence = header.PacketSequence;
                 return PacketValidationResult.Success;
             }
+            if (header.Kind == PacketKind.TransactionCommand)
+            {
+                if (Role != NetworkRole.Server || header.Flags != PacketFlags.ReliableOrdered)
+                    return PacketValidationResult.WrongRole;
+                if (header.PacketSequence == 0)
+                    return PacketValidationResult.Sequence;
+                if (header.PacketSequence == _nextReceivePacketSequence)
+                {
+                    _nextReceivePacketSequence++;
+                    return PacketValidationResult.Success;
+                }
+                // A transport duplicate may repeat a reliable transaction packet. The
+                // transaction id cache performs exact-once filtering after framing.
+                if (header.PacketSequence < _nextReceivePacketSequence)
+                    return PacketValidationResult.Duplicate;
+                return PacketValidationResult.Sequence;
+            }
+            if (header.Kind == PacketKind.TransactionReceipt)
+            {
+                if (Role != NetworkRole.Client || header.Flags != PacketFlags.ReliableOrdered)
+                    return PacketValidationResult.WrongRole;
+                if (header.PacketSequence == 0)
+                    return PacketValidationResult.Sequence;
+                if (header.PacketSequence != _nextReceivePacketSequence)
+                    return header.PacketSequence < _nextReceivePacketSequence
+                        ? PacketValidationResult.Duplicate
+                        : PacketValidationResult.Sequence;
+                _nextReceivePacketSequence++;
+                return PacketValidationResult.Success;
+            }
             if (header.Kind == PacketKind.SnapshotChunk)
             {
                 if (header.Flags != PacketFlags.ReliableOrdered ||
@@ -301,12 +380,18 @@ namespace UniGame.StaticEcs.Network
 
         private bool IsAllowedEstablishedPacket(PacketKind kind) => Role == NetworkRole.Server
             ? kind == PacketKind.CommandBatch ||
+              kind == PacketKind.TransactionCommand ||
               kind == PacketKind.Ping || kind == PacketKind.Ack ||
               kind == PacketKind.ResyncRequest || kind == PacketKind.Disconnect
             : kind == PacketKind.SnapshotChunk || kind == PacketKind.Pong ||
+              kind == PacketKind.TransactionReceipt ||
               kind == PacketKind.ResyncRequest || kind == PacketKind.Disconnect;
 
         internal void Close() => State = NetworkSessionState.Closed;
+
+        internal uint LastReceivedPacketSequence =>
+            _nextReceivePacketSequence == 0 ? uint.MaxValue :
+            _nextReceivePacketSequence - 1;
 
         private NetworkAdmissionResult Reject(NetworkAdmissionResult result) { State = NetworkSessionState.Rejected; return result; }
         internal void Trace(NetworkPhase phase, NetworkTraceKind kind, NetworkResultCategory result, NetworkPacketKind packetKind, uint serverTick, uint targetTick, int bytes, int historyTicks, long historyBytes, int tickGap, long durationNanoseconds, int entities = 0, int records = 0, int commands = 0, int queueSize = 0, int activeConnections = -1, int activePeers = -1, int acceptedCommands = 0, int rejectedCommands = 0, NetworkResyncReason resyncReason = NetworkResyncReason.None, NetworkResyncSource resyncSource = NetworkResyncSource.None, uint resyncCorrelationId = 0, NetworkCommandResult? commandResult = null, SnapshotApplyResult? snapshotResult = null, PacketValidationResult? packetValidationResult = null, uint sequence = 0, uint acknowledgedSnapshotTick = 0, uint oldestHistoryTick = 0, uint newestHistoryTick = 0)

@@ -7,12 +7,12 @@ using NUnit.Framework;
 
 namespace UniGame.StaticEcs.Network.Tests
 {
-    public sealed class NetworkV6Tests
+    public sealed class NetworkV7Tests
     {
         private static readonly NetworkBufferPool Buffers = new NetworkBufferPool(64L << 20);
 
         [Test]
-        public void TypeIdsAndPacketHeaderAreCanonicalV6AndRejectV5()
+        public void TypeIdsAndPacketHeaderAreCanonicalV7AndRejectV6()
         {
             var id = NetworkCompilerSupport.TypeId("SourceGenerator.Tests", "Demo.Position");
             Assert.That(id.Value, Is.EqualTo(4089044646u));
@@ -32,12 +32,12 @@ namespace UniGame.StaticEcs.Network.Tests
             var bytes = new byte[PacketHeader.Size];
             Assert.That(header.TryWrite(bytes), Is.True);
             Assert.That(PacketHeader.TryRead(bytes, out var decoded), Is.True);
-            Assert.That(ProtocolLimits.Version, Is.EqualTo(6));
+            Assert.That(ProtocolLimits.Version, Is.EqualTo(7));
             Assert.That(decoded.SchemaFingerprint, Is.EqualTo(header.SchemaFingerprint));
             Assert.That(decoded.SimulationFingerprint,
                 Is.EqualTo(header.SimulationFingerprint));
             Assert.That(decoded.ContentFingerprint, Is.EqualTo(header.ContentFingerprint));
-            bytes[4] = 5;
+            bytes[4] = 6;
             bytes[5] = 0;
             Assert.That(PacketHeader.TryRead(bytes, out _), Is.False);
             Assert.That(header.TryWrite(bytes), Is.True);
@@ -1445,11 +1445,11 @@ namespace UniGame.StaticEcs.Network.Tests
             var first = Packet(PacketKind.Ack, 7, 1);
             Assert.That(classified.ValidatePacket(in first), Is.EqualTo(PacketValidationResult.Success), "wrong-role rejection must not consume the cursor");
 
-            var kinds = new[] { PacketKind.Hello, PacketKind.Ready, PacketKind.CommandBatch, PacketKind.SnapshotChunk, PacketKind.Ack, PacketKind.ResyncRequest, PacketKind.Disconnect };
+            var kinds = new[] { PacketKind.Hello, PacketKind.Ready, PacketKind.CommandBatch, PacketKind.SnapshotChunk, PacketKind.Ack, PacketKind.ResyncRequest, PacketKind.Disconnect, PacketKind.TransactionCommand, PacketKind.TransactionReceipt };
             for (var i = 0; i < kinds.Length; i++)
             {
-                AssertPacketDirection(schema, NetworkRole.Server, kinds[i], kinds[i] == PacketKind.CommandBatch || kinds[i] == PacketKind.Ack || kinds[i] == PacketKind.ResyncRequest || kinds[i] == PacketKind.Disconnect, (uint)(10 + i));
-                AssertPacketDirection(schema, NetworkRole.Client, kinds[i], kinds[i] == PacketKind.SnapshotChunk || kinds[i] == PacketKind.ResyncRequest || kinds[i] == PacketKind.Disconnect, (uint)(30 + i));
+                AssertPacketDirection(schema, NetworkRole.Server, kinds[i], kinds[i] == PacketKind.CommandBatch || kinds[i] == PacketKind.Ack || kinds[i] == PacketKind.ResyncRequest || kinds[i] == PacketKind.Disconnect || kinds[i] == PacketKind.TransactionCommand, (uint)(10 + i));
+                AssertPacketDirection(schema, NetworkRole.Client, kinds[i], kinds[i] == PacketKind.SnapshotChunk || kinds[i] == PacketKind.ResyncRequest || kinds[i] == PacketKind.Disconnect || kinds[i] == PacketKind.TransactionReceipt, (uint)(30 + i));
             }
         }
 
@@ -2744,7 +2744,11 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(session.ValidatePacket(in candidate),
                     Is.EqualTo(PacketValidationResult.Success));
             else if (allowed && kind != PacketKind.CommandBatch)
-                Assert.That(session.ValidatePacket(in candidate), Is.EqualTo(PacketValidationResult.Sequence));
+                Assert.That(session.ValidatePacket(in candidate), Is.EqualTo(
+                    kind == PacketKind.TransactionCommand ||
+                    kind == PacketKind.TransactionReceipt
+                        ? PacketValidationResult.Duplicate
+                        : PacketValidationResult.Sequence));
             else
             {
                 var fallback = Packet(role == NetworkRole.Server ? PacketKind.Ack : PacketKind.SnapshotChunk, 7, 1);
