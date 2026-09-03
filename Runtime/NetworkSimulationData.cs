@@ -63,6 +63,7 @@ namespace UniGame.StaticEcs.Network
 
         public float ReorderProbability;
 
+        /// <summary>Per-direction bandwidth in bytes per second, or zero for unlimited.</summary>
         public long BandwidthBytesPerSecond;
 
         public int MaxQueuedPackets;
@@ -99,6 +100,7 @@ namespace UniGame.StaticEcs.Network
 
         public ulong Cycle;
 
+        /// <summary>Monotonic link connection generation.</summary>
         public ulong ConnectionGeneration;
 
         public bool Connected;
