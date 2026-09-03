@@ -329,8 +329,10 @@ namespace UniGame.StaticEcs.Network
             if (header.Kind == PacketKind.CommandBatch)
             {
                 if (header.Flags != PacketFlags.UnreliableSequenced ||
-                    header.PacketSequence <= _lastReceiveCommandPacketSequence)
+                    header.PacketSequence == 0)
                     return PacketValidationResult.Sequence;
+                if (header.PacketSequence <= _lastReceiveCommandPacketSequence)
+                    return PacketValidationResult.Duplicate;
                 _lastReceiveCommandPacketSequence = header.PacketSequence;
                 return PacketValidationResult.Success;
             }

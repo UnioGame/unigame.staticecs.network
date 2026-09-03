@@ -377,9 +377,13 @@ namespace UniGame.StaticEcs.Network
                         var stale = preview.SnapshotTick <= Math.Max(
                             AcknowledgedSnapshotTick,
                             _snapshotDiscardThroughTick);
+                        if (!stale &&
+                            preview.PayloadKind == SnapshotPayloadKind.Keyframe &&
+                            resyncCorrelationId != 0 &&
+                            _resyncCorrelationId == 0)
+                            _resyncCorrelationId = resyncCorrelationId;
                         if (!stale && ((resyncCorrelationId != 0 &&
-                             (preview.PayloadKind != SnapshotPayloadKind.Keyframe ||
-                              _resyncCorrelationId == 0)) ||
+                             preview.PayloadKind != SnapshotPayloadKind.Keyframe) ||
                             (preview.PayloadKind == SnapshotPayloadKind.Keyframe &&
                              _resyncCorrelationId != 0 &&
                              resyncCorrelationId != _resyncCorrelationId)))
@@ -1044,7 +1048,10 @@ namespace UniGame.StaticEcs.Network
             uint correlationId = 0)
         {
             RequestRecovery(NetworkRecoveryPhase.AwaitingKeyframe, reason, serverTick);
-            correlationId = correlationId == 0 ? _packetSequence : correlationId;
+            if (correlationId == 0)
+                correlationId = _resyncCorrelationId == 0
+                    ? _packetSequence
+                    : _resyncCorrelationId;
             if (correlationId == 0 || correlationId == uint.MaxValue)
             {
                 RequestDisconnect(NetworkRecoveryReason.ProtocolIncompatible);
@@ -1484,6 +1491,9 @@ namespace UniGame.StaticEcs.Network
                 return true;
             }
             var packetValidation = peer.Session.ValidatePacket(in header);
+            var duplicateCommandPacket =
+                header.Kind == PacketKind.CommandBatch &&
+                packetValidation == PacketValidationResult.Duplicate;
             var duplicateTransactionPacket =
                 header.Kind == PacketKind.TransactionCommand &&
                 packetValidation == PacketValidationResult.Duplicate;
@@ -1492,6 +1502,7 @@ namespace UniGame.StaticEcs.Network
                   header.SimulationFingerprint != _simulationFingerprint ||
                   header.ContentFingerprint != _contentFingerprint)) ||
                 packetValidation != PacketValidationResult.Success &&
+                !duplicateCommandPacket &&
                 !duplicateTransactionPacket)
             {
                 peer.Session.Trace(NetworkPhase.Decode, NetworkTraceKind.Point,
@@ -1513,8 +1524,10 @@ namespace UniGame.StaticEcs.Network
             var resyncCorrelationId = 0u;
             if (header.Kind == PacketKind.CommandBatch)
             {
-                commandResult = DecodeCommands(peer, packet, payload,
-                    checked(ServerTick + 1));
+                commandResult = duplicateCommandPacket
+                    ? NetworkCommandResult.Duplicate
+                    : DecodeCommands(peer, packet, payload,
+                        checked(ServerTick + 1));
                 if (commandResult != NetworkCommandResult.Queued &&
                     commandResult != NetworkCommandResult.Duplicate)
                     decodeResult = NetworkResultCategory.Malformed;
@@ -1563,7 +1576,7 @@ namespace UniGame.StaticEcs.Network
                 }
                 resyncCorrelationId = request.CorrelationId;
                 peer.ResyncRequested = true;
-                if (peer.ResyncCorrelationId != request.CorrelationId)
+                if (peer.ResyncCorrelationId == 0)
                 {
                     peer.ResyncCorrelationId = request.CorrelationId;
                     peer.ResyncSnapshotTick = 0;
@@ -2131,11 +2144,15 @@ namespace UniGame.StaticEcs.Network
             NetworkResyncSource resyncSource,
             NetworkCommandResult? commandResult = null)
         {
-            var correlationId = peer.PacketSequence;
-            if (correlationId == 0) return false;
+            var correlationId = peer.ResyncCorrelationId;
+            if (correlationId == 0)
+            {
+                correlationId = peer.PacketSequence;
+                if (correlationId == 0) return false;
+                peer.ResyncCorrelationId = correlationId;
+                peer.ResyncSnapshotTick = 0;
+            }
             peer.ResyncRequested = true;
-            peer.ResyncCorrelationId = correlationId;
-            peer.ResyncSnapshotTick = 0;
             Span<byte> payload = stackalloc byte[ResyncRequestPayload.Size];
             if (!new ResyncRequestPayload(correlationId).TryWrite(payload))
                 return false;

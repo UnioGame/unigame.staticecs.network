@@ -2061,6 +2061,104 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void RepeatedLocalResyncKeepsCorrelationUntilKeyframeAck()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            var pool = new NetworkBufferPool(4L << 20);
+            NetworkSimulator simulator = null;
+            NetworkServer<AuthorityWorld> server = null;
+            NetworkClient<ClientAWorld> client = null;
+            var observer = new TraceCollector();
+            try
+            {
+                var immediate = NetworkSimulationPresets.Create(
+                    NetworkSimulationPreset.Immediate);
+                simulator = new NetworkSimulator(new ConnectionId(840),
+                    in immediate);
+                server = new NetworkServer<AuthorityWorld>(
+                    Schema<AuthorityWorld>(true), static (_, _) => true,
+                    bufferPool: pool);
+                client = new NetworkClient<ClientAWorld>(simulator.Client,
+                    Schema<ClientAWorld>(false), new ScopeId(1), observer,
+                    bufferPool: pool);
+                var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                entity.Set(new TestComponent { Value = 1 });
+                server.AddConnection(simulator.Server, 1, 1, new ScopeId(1));
+
+                Assert.That(client.BeginHandshake(), Is.True);
+                simulator.Advance(0);
+                server.Receive();
+                server.Tick(_ => { });
+                simulator.Advance(0);
+                client.Process();
+                simulator.Advance(0);
+                server.Receive();
+                Assert.That(client.Session.State,
+                    Is.EqualTo(NetworkSessionState.Established));
+
+                observer.Events.Clear();
+                client.RequestFullResync(
+                    NetworkRecoveryReason.PredictionHistoryUnavailable);
+                simulator.Advance(0);
+                server.Receive();
+                client.RequestFullResync(NetworkRecoveryReason.SnapshotRejected);
+
+                uint firstCorrelation = 0;
+                uint secondCorrelation = 0;
+                var requestCount = 0;
+                for (var index = 0; index < observer.Events.Count; index++)
+                {
+                    var value = observer.Events[index];
+                    if (value.Phase != NetworkPhase.Send ||
+                        value.PacketKind != NetworkPacketKind.ResyncRequest)
+                        continue;
+                    if (requestCount++ == 0)
+                        firstCorrelation = value.ResyncCorrelationId;
+                    else
+                        secondCorrelation = value.ResyncCorrelationId;
+                }
+                Assert.That(requestCount, Is.EqualTo(2));
+                Assert.That(firstCorrelation, Is.Not.Zero);
+                Assert.That(secondCorrelation, Is.EqualTo(firstCorrelation));
+
+                entity.Set(new TestComponent { Value = 2 });
+                server.Tick(_ => { });
+                var keyframeTick = server.ServerTick;
+                simulator.Advance(0);
+                client.Process();
+                simulator.Advance(0);
+                server.Receive();
+
+                Assert.That(client.AcknowledgedSnapshotTick,
+                    Is.EqualTo(keyframeTick));
+                Assert.That(client.Session.State,
+                    Is.EqualTo(NetworkSessionState.Established));
+                Assert.That(server.ConnectionCount, Is.EqualTo(1));
+                Assert.That(observer.Single(NetworkPhase.Send,
+                        NetworkPacketKind.Ack).ResyncCorrelationId,
+                    Is.EqualTo(firstCorrelation));
+                var stats = simulator.CaptureStats();
+                Assert.That(stats.ClientToServer.QueuedPackets, Is.Zero);
+                Assert.That(stats.ServerToClient.QueuedPackets, Is.Zero);
+                Assert.That(stats.ReplayErrors, Is.Zero);
+            }
+            finally
+            {
+                client?.Dispose();
+                server?.Dispose();
+                simulator?.Dispose();
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+                pool.Dispose();
+                if (World<AuthorityWorld>.Status == WorldStatus.Initialized)
+                    World<AuthorityWorld>.Destroy();
+                if (World<ClientAWorld>.Status == WorldStatus.Initialized)
+                    World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
         public void SnapshotChunksRespectBoundariesReorderRecoveryAndOwnership()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
@@ -2737,7 +2835,7 @@ namespace UniGame.StaticEcs.Network.Tests
             Assert.That(session.ValidatePacket(in outOfOrder), Is.EqualTo(outOfOrderResult));
             var candidate = Packet(kind, 7, 1);
             var candidateResult = allowed && kind == PacketKind.CommandBatch
-                ? PacketValidationResult.Sequence
+                ? PacketValidationResult.Duplicate
                 : allowed ? PacketValidationResult.Success : PacketValidationResult.WrongRole;
             Assert.That(session.ValidatePacket(in candidate), Is.EqualTo(candidateResult));
             if (allowed && kind == PacketKind.SnapshotChunk)
