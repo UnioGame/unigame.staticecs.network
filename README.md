@@ -5,7 +5,7 @@ Transport-neutral protocol and replication infrastructure for Static ECS.
 ## Capabilities
 
 - Generates explicit AOT-safe Client and Server endpoint schemas without runtime reflection.
-- Implements protocol v6 sessions, commands, canonical keyframes, baseline deltas, snapshot chunk assembly, and correlated recovery.
+- Implements protocol v7 sessions, unreliable tick commands, reliable transaction commands/receipts, canonical keyframes, baseline deltas, snapshot chunk assembly, and correlated recovery.
 - Reconstructs keyframes and deltas into one canonical snapshot before the single transactional `Stage -> Apply` path.
 - Owns bounded snapshot/command histories, deterministic adverse-link simulation, pooled packet leases, and complete-packet transport capabilities.
 - Exposes queryable session, ownership, replica identity, tick, clock, and recovery contracts without game-specific policy.
@@ -30,7 +30,8 @@ instead of calling low-level packet APIs from gameplay.
 
 ## Configuration
 
-- Both endpoints must agree on protocol v6 schema, simulation, and content fingerprints.
+- Both endpoints must agree on protocol v7 schema, simulation, and content fingerprints.
+- Transaction commands and receipts use the reliable per-command path; tick input keeps its independent unreliable sequence.
 - `ScopeId` is currently fixed/global; spatial relevance is not modeled here.
 - Command batches obey `MaxUnreliablePayloadBytes` and never fragment.
 - Snapshot chunks obey `MaxReliablePayloadBytes`; canonical decoded state is bounded separately.
