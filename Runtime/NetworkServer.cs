@@ -29,10 +29,8 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Gets the latest authoritative tick completed by this server.</summary>
         public uint ServerTick { get; private set; }
 
-        /// <summary>Gets the number of transport connections represented by this endpoint.</summary>
         public int ConnectionCount => _peers.Count;
 
-        /// <summary>Captures current packet-buffer ownership diagnostics.</summary>
         public NetworkBufferPoolDiagnostics CaptureBufferDiagnostics() =>
             _bufferPool.CaptureDiagnostics();
 
@@ -47,7 +45,6 @@ namespace UniGame.StaticEcs.Network
             PendingCommandBytesHighWater = _coordinator.PendingCommandBytesHighWater,
         };
 
-        /// <summary>Creates a multi-connection authoritative server pipeline.</summary>
         public NetworkServer(NetworkSchema<TWorld> schema, NetworkScopeSelector<TWorld> scopeSelector, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024, INetworkObserver observer = null, INetworkPeerObserver peerObserver = null, INetworkPeerAdmissionPolicy admissionPolicy = null, ulong simulationFingerprint = 0, ulong contentFingerprint = 0, NetworkBufferPool bufferPool = null)
         {
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
@@ -65,7 +62,6 @@ namespace UniGame.StaticEcs.Network
             _contentFingerprint = contentFingerprint;
         }
 
-        /// <inheritdoc />
         public void Dispose()
         {
             if (_disposed)
@@ -253,7 +249,6 @@ namespace UniGame.StaticEcs.Network
         public bool TryGetCapture(ScopeId scope, uint serverTick, out NetworkSnapshot snapshot)
             => _coordinator.TryGetCapture(scope, serverTick, out snapshot);
 
-        /// <summary>Gets the number of transactions waiting for gameplay completion.</summary>
         public int PendingTransactionCount
         {
             get

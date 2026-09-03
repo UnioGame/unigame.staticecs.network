@@ -53,7 +53,6 @@ namespace UniGame.StaticEcs.Network
         private uint _snapshotDiscardThroughTick;
         private uint _resyncCorrelationId;
 
-        /// <summary>Creates an isolated client pipeline.</summary>
         public NetworkClient(INetworkTransport transport, NetworkSchema<TWorld> schema,
             ScopeId scope = default, INetworkObserver observer = null,
             int ticksPerSecond = 20, int predictionLeadTicks = 1,
@@ -83,7 +82,6 @@ namespace UniGame.StaticEcs.Network
             _session.ReportSession(0, 0, 0, _packetSequence);
         }
 
-        /// <summary>Gets the per-connection session.</summary>
         public NetworkSession<TWorld> Session => _session;
         /// <summary>Gets bounded successfully applied snapshot history.</summary>
         public NetworkHistory<NetworkSnapshot> History => _replicator.History;
@@ -126,7 +124,6 @@ namespace UniGame.StaticEcs.Network
             return true;
         }
 
-        /// <summary>Captures current packet-buffer ownership diagnostics.</summary>
         public NetworkBufferPoolDiagnostics CaptureBufferDiagnostics() =>
             _bufferPool.CaptureDiagnostics();
 
@@ -141,10 +138,8 @@ namespace UniGame.StaticEcs.Network
             PendingCommandBytesHighWater = _recentCommandBytesHighWater,
         };
 
-        /// <summary>Gets the number of reliable transactions awaiting a receipt.</summary>
         public int PendingTransactionCount => _transactions.Count;
 
-        /// <summary>Gets terminal reliable transaction results awaiting projection.</summary>
         public int PendingTransactionResultCount => _transactionResults.Count;
 
         /// <summary>Gets trusted submission context while a transaction is pending.</summary>
@@ -160,7 +155,6 @@ namespace UniGame.StaticEcs.Network
             return false;
         }
 
-        /// <summary>Dequeues the next terminal transaction result.</summary>
         public bool TryDequeueTransactionResult(out NetworkTransactionResult result)
         {
             if (_transactionResults.Count == 0)
@@ -239,7 +233,6 @@ namespace UniGame.StaticEcs.Network
             _session.ReportSession(0, 0, 0, _packetSequence);
         }
 
-        /// <inheritdoc />
         public void Dispose()
         {
             if (_disposed)
