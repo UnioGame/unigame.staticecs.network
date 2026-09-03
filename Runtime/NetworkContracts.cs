@@ -25,22 +25,14 @@ namespace UniGame.StaticEcs.Network
             _value = value;
         }
 
-        /// <summary>Gets the identifier value.</summary>
         public ulong Value => _value;
 
-        /// <inheritdoc />
         public bool Equals(NetworkTransactionId other) => _value == other._value;
-        /// <inheritdoc />
         public override bool Equals(object obj) => obj is NetworkTransactionId other && Equals(other);
-        /// <inheritdoc />
         public override int GetHashCode() => _value.GetHashCode();
-        /// <inheritdoc />
         public int CompareTo(NetworkTransactionId other) => _value.CompareTo(other._value);
-        /// <inheritdoc />
         public override string ToString() => _value.ToString();
-        /// <summary>Tests identifier equality.</summary>
         public static bool operator ==(NetworkTransactionId left, NetworkTransactionId right) => left.Equals(right);
-        /// <summary>Tests identifier inequality.</summary>
         public static bool operator !=(NetworkTransactionId left, NetworkTransactionId right) => !left.Equals(right);
     }
 
@@ -75,7 +67,6 @@ namespace UniGame.StaticEcs.Network
     [AttributeUsage(AttributeTargets.Assembly, AllowMultiple = true)]
     public sealed class NetworkEndpointAttribute : Attribute
     {
-        /// <summary>Creates an endpoint declaration.</summary>
         public NetworkEndpointAttribute(string name, Type worldType, NetworkRole role,
             params Type[] rootTypes)
         {
@@ -85,11 +76,8 @@ namespace UniGame.StaticEcs.Network
             RootTypes = rootTypes ?? Array.Empty<Type>();
         }
 
-        /// <summary>Gets the generated endpoint identifier.</summary>
         public string Name { get; }
-        /// <summary>Gets the closed Static ECS world type.</summary>
         public Type WorldType { get; }
-        /// <summary>Gets the endpoint role.</summary>
         public NetworkRole Role { get; }
         /// <summary>Gets the explicit root types whose assemblies contribute wire contracts.</summary>
         public Type[] RootTypes { get; }
@@ -105,16 +93,11 @@ namespace UniGame.StaticEcs.Network
     [System.ComponentModel.EditorBrowsable(System.ComponentModel.EditorBrowsableState.Never)]
     public sealed class NetworkManifestRecordAttribute : Attribute
     {
-        /// <summary>Creates compiler-readable manifest metadata.</summary>
         public NetworkManifestRecordAttribute(uint typeId, NetworkSchemaKind kind, Type runtimeType, byte version = 0)
         { Id = typeId; Kind = kind; RuntimeType = runtimeType; Version = version; }
-        /// <summary>Gets generated id.</summary>
         public uint Id { get; }
-        /// <summary>Gets wire shape.</summary>
         public NetworkSchemaKind Kind { get; }
-        /// <summary>Gets concrete Shared type.</summary>
         public Type RuntimeType { get; }
-        /// <summary>Gets hook version.</summary>
         public byte Version { get; }
     }
 
@@ -123,7 +106,6 @@ namespace UniGame.StaticEcs.Network
     [System.ComponentModel.EditorBrowsable(System.ComponentModel.EditorBrowsableState.Never)]
     public sealed class NetworkCommandPolicyManifestRecordAttribute : Attribute
     {
-        /// <summary>Creates compiler-readable policy metadata.</summary>
         public NetworkCommandPolicyManifestRecordAttribute(Type worldType,
             Type commandType, Type policyType)
         {
@@ -140,22 +122,17 @@ namespace UniGame.StaticEcs.Network
     /// <summary>Identifies an endpoint role.</summary>
     public enum NetworkRole : byte
     {
-        /// <summary>Produces commands and applies authoritative snapshots.</summary>
         Client = 1,
-        /// <summary>Authorizes commands and produces authoritative snapshots.</summary>
         Server = 2
     }
 
     /// <summary>Stores server-assigned ownership. Client commands never write this value.</summary>
     public struct NetworkOwnerComponent : IComponent, INetworkType
     {
-        /// <summary>Gets or sets the trusted peer identifier.</summary>
         public uint PeerId;
 
-        /// <summary>Writes trusted ownership through the normal Static ECS hook.</summary>
         public void Write<TWorld>(ref BinaryPackWriter writer, World<TWorld>.Entity self) where TWorld : struct, IWorldType => writer.WriteUint(PeerId);
 
-        /// <summary>Reads trusted ownership through the normal Static ECS hook.</summary>
         public void Read<TWorld>(ref BinaryPackReader reader, World<TWorld>.Entity self, byte version, bool disabled) where TWorld : struct, IWorldType
         {
             PeerId = reader.ReadUint();
@@ -165,41 +142,30 @@ namespace UniGame.StaticEcs.Network
     /// <summary>Links one local replica to its authoritative entity identity.</summary>
     public struct NetworkReplicaIdentityComponent : IComponent
     {
-        /// <summary>Authoritative source entity identifier.</summary>
         public EntityGID AuthorityGid;
 
-        /// <summary>Generated network entity-kind identifier.</summary>
         public NetworkTypeId KindId;
     }
 
     /// <summary>Contains trusted command ordering and authorization data.</summary>
     public readonly struct NetworkCommandContext
     {
-        /// <summary>Creates a trusted command context.</summary>
         public NetworkCommandContext(uint peerId, uint epoch, uint sequence, uint targetTick)
             : this(peerId, epoch, sequence, targetTick, NetworkCommandDelivery.Input, default) { }
 
-        /// <summary>Creates a command context with its delivery channel and generated type.</summary>
         public NetworkCommandContext(uint peerId, uint epoch, uint sequence, uint targetTick,
             NetworkCommandDelivery delivery, NetworkTypeId typeId)
             : this(peerId, epoch, sequence, targetTick, delivery, typeId, default) { }
 
-        /// <summary>Creates a command context including a reliable transaction identity.</summary>
         public NetworkCommandContext(uint peerId, uint epoch, uint sequence, uint targetTick,
             NetworkCommandDelivery delivery, NetworkTypeId typeId,
             NetworkTransactionId transactionId)
         { PeerId = peerId; Epoch = epoch; Sequence = sequence; TargetTick = targetTick; Delivery = delivery; TypeId = typeId; TransactionId = transactionId; }
-        /// <summary>Gets the admitted peer.</summary>
         public uint PeerId { get; }
-        /// <summary>Gets the admitted session epoch.</summary>
         public uint Epoch { get; }
-        /// <summary>Gets the per-peer sequence.</summary>
         public uint Sequence { get; }
-        /// <summary>Gets the authoritative target tick.</summary>
         public uint TargetTick { get; }
-        /// <summary>Gets the command delivery channel.</summary>
         public NetworkCommandDelivery Delivery { get; }
-        /// <summary>Gets the generated command type identifier.</summary>
         public NetworkTypeId TypeId { get; }
         /// <summary>Gets the transaction identity, or the default value for input commands.</summary>
         public NetworkTransactionId TransactionId { get; }
@@ -208,18 +174,14 @@ namespace UniGame.StaticEcs.Network
     /// <summary>Reports an accepted typed command to server systems.</summary>
     public struct NetworkCommandAcceptedEvent<TCommand> : IEvent where TCommand : struct, IEvent, INetworkCommand
     {
-        /// <summary>Gets or sets the decoded command.</summary>
         public TCommand Command;
-        /// <summary>Gets or sets trusted context.</summary>
         public NetworkCommandContext Context;
     }
 
     /// <summary>Reports a policy-rejected typed command to server systems.</summary>
     public struct NetworkCommandRejectedEvent<TCommand> : IEvent where TCommand : struct, IEvent, INetworkCommand
     {
-        /// <summary>Gets or sets the decoded command.</summary>
         public TCommand Command;
-        /// <summary>Gets or sets trusted context.</summary>
         public NetworkCommandContext Context;
     }
 
@@ -227,11 +189,8 @@ namespace UniGame.StaticEcs.Network
     public struct NetworkTransactionSubmittedEvent<TCommand> : IEvent
         where TCommand : struct, IEvent, INetworkTransactionCommand
     {
-        /// <summary>Gets or sets the submitted command.</summary>
         public TCommand Command;
-        /// <summary>Gets or sets the transaction identifier.</summary>
         public NetworkTransactionId TransactionId;
-        /// <summary>Gets or sets the trusted command context.</summary>
         public NetworkCommandContext Context;
     }
 
@@ -239,26 +198,18 @@ namespace UniGame.StaticEcs.Network
     public struct NetworkTransactionResultEvent<TCommand> : IEvent
         where TCommand : struct, IEvent, INetworkTransactionCommand
     {
-        /// <summary>Gets or sets the submitted command.</summary>
         public TCommand Command;
-        /// <summary>Gets or sets the transaction identifier.</summary>
         public NetworkTransactionId TransactionId;
-        /// <summary>Gets or sets the terminal status.</summary>
         public NetworkTransactionStatus Status;
-        /// <summary>Gets or sets the trusted command context.</summary>
         public NetworkCommandContext Context;
     }
 
     /// <summary>Requests completion of a dispatched transaction by gameplay.</summary>
     public struct CompleteNetworkTransactionRequest : IEvent
     {
-        /// <summary>Gets or sets the admitted peer that owns the transaction.</summary>
         public uint PeerId;
-        /// <summary>Gets or sets the connection epoch that owns the transaction.</summary>
         public uint Epoch;
-        /// <summary>Gets or sets the transaction identifier.</summary>
         public NetworkTransactionId TransactionId;
-        /// <summary>Gets or sets the gameplay outcome.</summary>
         public NetworkTransactionStatus Status;
     }
 }
