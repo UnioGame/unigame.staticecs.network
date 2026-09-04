@@ -185,15 +185,6 @@ namespace UniGame.StaticEcs.Network
         public NetworkCommandContext Context;
     }
 
-    /// <summary>Reports a transaction submitted to the reliable command channel.</summary>
-    public struct NetworkTransactionSubmittedEvent<TCommand> : IEvent
-        where TCommand : struct, IEvent, INetworkTransactionCommand
-    {
-        public TCommand Command;
-        public NetworkTransactionId TransactionId;
-        public NetworkCommandContext Context;
-    }
-
     /// <summary>Reports a terminal transaction receipt.</summary>
     public struct NetworkTransactionResultEvent<TCommand> : IEvent
         where TCommand : struct, IEvent, INetworkTransactionCommand
