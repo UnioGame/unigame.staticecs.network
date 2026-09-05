@@ -7,6 +7,8 @@ Transport-neutral protocol and replication infrastructure for Static ECS.
 - Generates explicit AOT-safe Client and Server endpoint schemas without runtime reflection.
 - Implements protocol v7 sessions, unreliable tick commands, reliable transaction commands/receipts, canonical keyframes, baseline deltas, snapshot chunk assembly, and correlated recovery.
 - Reconstructs keyframes and deltas into one canonical snapshot before the single transactional `Stage -> Apply` path.
+- Advances the ACK cursor only after a snapshot is applied; recovery keeps one episode boundary and clears only on an available acknowledged baseline at or above it.
+- Caches each `(scope, baseline tick, target tick)` delta decision only within `CompleteTick`; temporary delta leases are released on success, failure, and disposal.
 - Owns bounded snapshot/command histories, deterministic adverse-link simulation, pooled packet leases, and complete-packet transport capabilities.
 - Exposes queryable session, ownership, replica identity, tick, clock, and recovery contracts without game-specific policy.
 

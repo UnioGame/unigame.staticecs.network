@@ -17,7 +17,7 @@ namespace UniGame.StaticEcs.Network
     {
         /// <summary>Gets transport-owned identity.</summary>
         ConnectionId Connection { get; }
-        /// <summary>Sends an exact immutable packet copy.</summary>
+        /// <summary>Consumes the packet lease on every result; <c>true</c> means accepted locally, not delivered remotely.</summary>
         bool TrySend(NetworkBufferLease packet);
         /// <summary>Receives the next exact packet.</summary>
         bool TryReceive(out NetworkBufferLease packet);
