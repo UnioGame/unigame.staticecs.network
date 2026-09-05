@@ -1123,7 +1123,7 @@ namespace UniGame.StaticEcs.Network.Tests
             {
                 var schema = Schema<AuthorityWorld>(true);
                 var scope = new ScopeId(42);
-                using (var pool = new NetworkBufferPool(0))
+                using var pool = new NetworkBufferPool(0);
                 using (var mock = new TwoClientNetworkMock())
                 using (var server = new NetworkServer<AuthorityWorld>(schema,
                            static (_, _) => true, bufferPool: pool))
@@ -1231,6 +1231,100 @@ namespace UniGame.StaticEcs.Network.Tests
             {
                 World<AuthorityWorld>.Destroy();
             }
+        }
+
+        [Test]
+        public void ServerDeltaCacheReleasesLeaseWhenSendThrowsAndRetrySucceeds()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var scope = new ScopeId(43);
+                using var pool = new NetworkBufferPool(0);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(43),
+                    out var clientTransport, out var serverEndpoint);
+                using (clientTransport)
+                using (var throwingTransport = new ThrowingSendTransport(
+                           serverEndpoint))
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true, bufferPool: pool))
+                {
+                    server.AddConnection(throwingTransport, 1, 31, scope);
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready), Is.True);
+                    ready.Dispose();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 2, 1);
+                    server.Receive();
+                    entity.Set(new TestComponent { Value = 2 });
+
+                    throwingTransport.ThrowOnSend = true;
+                    Assert.Throws<InvalidOperationException>(() =>
+                        server.Tick(_ => { }));
+                    Assert.That(server.ServerTick, Is.EqualTo(1));
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                        Is.EqualTo(2),
+                        "cached delta lease must be released when send throws");
+
+                    throwingTransport.ThrowOnSend = false;
+                    Assert.DoesNotThrow(() => server.Tick(_ => { }));
+                    Assert.That(server.ServerTick, Is.EqualTo(2));
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                }
+
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        private sealed class ThrowingSendTransport : INetworkTransport
+        {
+            private readonly INetworkTransport _inner;
+
+            internal ThrowingSendTransport(INetworkTransport inner)
+            {
+                _inner = inner;
+            }
+
+            internal bool ThrowOnSend { get; set; }
+
+            public ConnectionId Connection => _inner.Connection;
+            public int MaxReliablePayloadBytes =>
+                _inner.MaxReliablePayloadBytes;
+            public int MaxUnreliablePayloadBytes =>
+                _inner.MaxUnreliablePayloadBytes;
+
+            public bool TrySend(NetworkBufferLease packet)
+            {
+                if (ThrowOnSend)
+                {
+                    packet?.Dispose();
+                    throw new InvalidOperationException(
+                        "test transport send failure");
+                }
+
+                return _inner.TrySend(packet);
+            }
+
+            public bool TryReceive(out NetworkBufferLease packet) =>
+                _inner.TryReceive(out packet);
+
+            public void Dispose() => _inner.Dispose();
         }
 
         private static SnapshotChunkHeader ReceiveSnapshotChunk(
