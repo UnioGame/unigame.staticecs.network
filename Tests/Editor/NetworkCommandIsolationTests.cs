@@ -156,7 +156,7 @@ namespace UniGame.StaticEcs.Network.Tests
         {
         }
 
-        private struct IsolationCommand : IEvent, INetworkCommand
+        internal struct IsolationCommand : IEvent, INetworkCommand
         {
             public int Value;
 
