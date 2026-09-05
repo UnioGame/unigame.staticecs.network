@@ -328,13 +328,16 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
-        public void ServerCommandRejectionsTraceEverySemanticResyncReason()
+        public void MixedCommandBatchSkipsStaleInputAndDispatchesFreshTail()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
             CreateReplicationWorld<ClientAWorld>(false);
+            var receiver = World<AuthorityWorld>
+                .RegisterEventReceiver<NetworkCommandAcceptedEvent<TestCommand>>();
             try
             {
-                MemoryNetworkTransport.CreatePair(new ConnectionId(94),
+                using var pool = new NetworkBufferPool(1 << 20);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(96),
                     out var clientTransport, out var serverTransport);
                 using (clientTransport)
                 using (serverTransport)
@@ -342,105 +345,265 @@ namespace UniGame.StaticEcs.Network.Tests
                     var observer = new TraceCollector();
                     var serverSchema = Schema<AuthorityWorld>(true);
                     var clientSchema = Schema<ClientAWorld>(false);
-                    var server = new NetworkServer<AuthorityWorld>(serverSchema,
-                        static (_, _) => false, observer: observer);
-                    server.AddConnection(serverTransport, 7, 13,
+                    using var server = new NetworkServer<AuthorityWorld>(
+                        serverSchema, static (_, _) => false,
+                        observer: observer, bufferPool: pool);
+                    var serverSession = server.AddConnection(serverTransport, 7, 1,
                         new ScopeId(1), observer);
-                    var client = new NetworkClient<ClientAWorld>(clientTransport,
-                        clientSchema, new ScopeId(1));
-                    Assert.That(client.BeginHandshake(), Is.True);
+                    SendHello(clientTransport, pool, clientSchema.Fingerprint);
+                    server.Receive();
+                    Assert.That(serverSession.State,
+                        Is.EqualTo(NetworkSessionState.Established));
+
+                    for (var tick = 0; tick < 4; tick++)
+                        server.Tick(_ => { });
+
+                    var clientSession = new NetworkSession<ClientAWorld>(
+                        clientTransport.Connection, NetworkRole.Client,
+                        clientSchema, pool);
+                    Assert.That(clientSession.Admit(serverSchema.Fingerprint, 7, 1,
+                        new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
+                    Assert.That(clientSession.CreateCommand(
+                        new TestCommand { Value = 1 }, 1, out var stale),
+                        Is.EqualTo(NetworkCommandResult.Queued));
+                    Assert.That(clientSession.CreateCommand(
+                        new TestCommand { Value = 2 }, 5, out var fresh),
+                        Is.EqualTo(NetworkCommandResult.Queued));
+                    var payload = EncodeCommandBatch(stale, fresh);
+                    stale.Dispose();
+                    fresh.Dispose();
+                    SendCommandBatch(clientTransport, pool,
+                        serverSchema.Fingerprint, 1, 1, payload);
+
                     server.Receive();
                     server.Tick(_ => { });
-                    client.Process();
-                    server.Receive();
 
-                    var command = new TestCommand { Value = 7 };
-                    Assert.That(client.QueueCommand(in command, 2, out _),
-                        Is.EqualTo(NetworkCommandResult.Queued));
-                    Assert.That(client.FlushCommands(2),
-                        Is.EqualTo(NetworkCommandResult.Queued));
-                    Assert.That(serverTransport.TryReceive(out var validPacket), Is.True);
-                    Assert.That(NetworkPacket.TryDecode(validPacket,
-                        clientSchema.Fingerprint, out var header, out var validPayload), Is.True);
-
-                    var invalidEnvelope = new byte[18];
-                    invalidEnvelope[0] = 1;
-                    var trailing = new byte[validPayload.Length + 1];
-                    validPayload.Span.CopyTo(trailing);
-                    var rejected = validPayload.ToArray();
-                    Write32(rejected, 9, uint.MaxValue);
-                    var payloads = new[]
-                    {
-                        Array.Empty<byte>(),
-                        new byte[] { 0 },
-                        new byte[] { 1 },
-                        invalidEnvelope,
-                        trailing,
-                        rejected,
-                    };
-                    var expected = new[]
-                    {
-                        NetworkResyncReason.ServerEmptyPayload,
-                        NetworkResyncReason.ServerInvalidCommandCount,
-                        NetworkResyncReason.ServerTruncatedCommandHeader,
-                        NetworkResyncReason.ServerInvalidCommandEnvelope,
-                        NetworkResyncReason.ServerTrailingPayloadBytes,
-                        NetworkResyncReason.ServerCommandQueueRejected,
-                    };
-                    observer.Events.Clear();
-                    for (var index = 0; index < payloads.Length; index++)
-                    {
-                        header.PacketSequence = checked(header.PacketSequence +
-                            (index == 0 ? 0u : 1u));
-                        Assert.That(NetworkPacket.TryEncode(Buffers, header,
-                            payloads[index], out var packet), Is.True);
-                        Assert.That(clientTransport.TrySend(packet), Is.True);
-                        server.Receive();
-                    }
-
-                    var actual = new List<NetworkResyncReason>();
-                    var sources = new List<NetworkResyncSource>();
-                    var commandResults = new List<NetworkCommandResult?>();
-                    for (var index = 0; index < observer.Events.Count; index++)
-                    {
-                        var value = observer.Events[index];
-                        if (value.Phase == NetworkPhase.Send &&
-                            value.PacketKind == NetworkPacketKind.ResyncRequest)
-                        {
-                            actual.Add(value.ResyncReason);
-                            sources.Add(value.ResyncSource);
-                            commandResults.Add(value.CommandResult);
-                        }
-                    }
-                    CollectionAssert.AreEqual(expected, actual);
-                    CollectionAssert.AreEqual(
-                        new[]
-                        {
-                            NetworkResyncSource.ServerCommandDecode,
-                            NetworkResyncSource.ServerCommandDecode,
-                            NetworkResyncSource.ServerCommandDecode,
-                            NetworkResyncSource.ServerCommandDecode,
-                            NetworkResyncSource.ServerCommandDecode,
-                            NetworkResyncSource.ServerCommandDecode,
-                        }, sources);
-                    CollectionAssert.AreEqual(
-                        new NetworkCommandResult?[]
-                        {
-                            NetworkCommandResult.Malformed,
-                            NetworkCommandResult.Malformed,
-                            NetworkCommandResult.Malformed,
-                            NetworkCommandResult.Malformed,
-                            NetworkCommandResult.Malformed,
-                            NetworkCommandResult.SchemaMismatch,
-                        }, commandResults);
-                    validPacket.Dispose();
+                    var values = new List<int>();
+                    foreach (World<AuthorityWorld>
+                                 .Event<NetworkCommandAcceptedEvent<TestCommand>> item in receiver)
+                        values.Add(item.Value.Command.Value);
+                    CollectionAssert.AreEqual(new[] { 2 }, values);
+                    Assert.That(observer.Count(NetworkPhase.Send,
+                        NetworkPacketKind.ResyncRequest), Is.Zero);
+                    Assert.That(server.ConnectionCount, Is.EqualTo(1));
                 }
             }
             finally
             {
+                World<AuthorityWorld>.DeleteEventReceiver(ref receiver);
                 World<AuthorityWorld>.Destroy();
                 World<ClientAWorld>.Destroy();
             }
+        }
+
+        [Test]
+        public void CommandBatchLimitStopsWithoutResyncAndPreservesAdmittedCommands()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            var receiver = World<AuthorityWorld>
+                .RegisterEventReceiver<NetworkCommandAcceptedEvent<TestCommand>>();
+            try
+            {
+                using var pool = new NetworkBufferPool(1 << 20);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(97),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    var observer = new TraceCollector();
+                    var serverSchema = Schema<AuthorityWorld>(true);
+                    var clientSchema = Schema<ClientAWorld>(false);
+                    using var server = new NetworkServer<AuthorityWorld>(
+                        serverSchema, static (_, _) => false,
+                        observer: observer, bufferPool: pool);
+                    var serverSession = server.AddConnection(serverTransport, 7, 1,
+                        new ScopeId(1), observer);
+                    SendHello(clientTransport, pool, clientSchema.Fingerprint);
+                    server.Receive();
+                    Assert.That(serverSession.State,
+                        Is.EqualTo(NetworkSessionState.Established));
+                    var clientSession = new NetworkSession<ClientAWorld>(
+                        clientTransport.Connection, NetworkRole.Client,
+                        clientSchema, pool);
+                    Assert.That(clientSession.Admit(serverSchema.Fingerprint, 7, 1,
+                        new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
+
+                    const int batchSize = ProtocolLimits.MaxCommandsPerBatch;
+                    for (var batch = 0; batch < 4; batch++)
+                    {
+                        var commands = new NetworkCommandEnvelope[batchSize];
+                        try
+                        {
+                            for (var index = 0; index < commands.Length; index++)
+                            {
+                                Assert.That(clientSession.CreateCommand(
+                                    new TestCommand { Value = batch * batchSize + index },
+                                    1, out var command),
+                                    Is.EqualTo(NetworkCommandResult.Queued));
+                                commands[index] = command;
+                            }
+                            var payload = EncodeCommandBatch(commands);
+                            SendCommandBatch(clientTransport, pool,
+                                serverSchema.Fingerprint, 1,
+                                checked((uint)(batch + 1)), payload);
+                        }
+                        finally
+                        {
+                            for (var index = 0; index < commands.Length; index++)
+                                commands[index].Dispose();
+                        }
+                        server.Receive();
+                    }
+
+                    Assert.That(server.ConnectionCount, Is.EqualTo(1));
+                    Assert.That(serverSession.State,
+                        Is.EqualTo(NetworkSessionState.Established));
+                    Assert.That(observer.Count(NetworkPhase.Send,
+                        NetworkPacketKind.ResyncRequest), Is.Zero);
+                    server.Tick(_ => { });
+
+                    var count = 0;
+                    foreach (World<AuthorityWorld>
+                                 .Event<NetworkCommandAcceptedEvent<TestCommand>> _ in receiver)
+                        count++;
+                    Assert.That(count, Is.EqualTo(batchSize * 3));
+                    Assert.That(server.CaptureMemoryDiagnostics().PendingCommands,
+                        Is.Zero);
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.DeleteEventReceiver(ref receiver);
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void CommandFramingViolationDisconnectsOnlyOffendingPeer()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            var receiver = World<AuthorityWorld>
+                .RegisterEventReceiver<NetworkCommandAcceptedEvent<TestCommand>>();
+            try
+            {
+                using var pool = new NetworkBufferPool(1 << 20);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(98),
+                    out var clientTransportA, out var serverTransportA);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(99),
+                    out var clientTransportB, out var serverTransportB);
+                using (clientTransportA)
+                using (serverTransportA)
+                using (clientTransportB)
+                using (serverTransportB)
+                {
+                    var observer = new TraceCollector();
+                    var serverSchema = Schema<AuthorityWorld>(true);
+                    var clientSchema = Schema<ClientAWorld>(false);
+                    using var server = new NetworkServer<AuthorityWorld>(
+                        serverSchema, static (_, _) => false,
+                        observer: observer, bufferPool: pool);
+                    var offending = server.AddConnection(serverTransportA, 7, 13,
+                        new ScopeId(1), observer);
+                    var admitted = server.AddConnection(serverTransportB, 8, 14,
+                        new ScopeId(1), observer);
+                    SendHello(clientTransportA, pool, clientSchema.Fingerprint);
+                    SendHello(clientTransportB, pool, clientSchema.Fingerprint);
+                    server.Receive();
+                    Assert.That(offending.State,
+                        Is.EqualTo(NetworkSessionState.Established));
+                    Assert.That(admitted.State,
+                        Is.EqualTo(NetworkSessionState.Established));
+
+                    var malformedHeader = Packet(PacketKind.CommandBatch, 13, 1);
+                    malformedHeader.SchemaFingerprint = serverSchema.Fingerprint;
+                    Assert.That(NetworkPacket.TryEncode(pool, malformedHeader,
+                        ReadOnlySpan<byte>.Empty, out var malformedPacket), Is.True);
+                    Assert.That(clientTransportA.TrySend(malformedPacket), Is.True);
+
+                    var clientSessionB = new NetworkSession<ClientAWorld>(
+                        clientTransportB.Connection, NetworkRole.Client,
+                        clientSchema, pool);
+                    Assert.That(clientSessionB.Admit(serverSchema.Fingerprint, 8, 14,
+                        new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
+                    Assert.That(clientSessionB.CreateCommand(
+                        new TestCommand { Value = 22 }, 1, out var valid),
+                        Is.EqualTo(NetworkCommandResult.Queued));
+                    var validPayload = EncodeCommandBatch(valid);
+                    valid.Dispose();
+                    SendCommandBatch(clientTransportB, pool,
+                        serverSchema.Fingerprint, 14, 1, validPayload);
+
+                    server.Receive();
+                    Assert.That(offending.State,
+                        Is.EqualTo(NetworkSessionState.Closed));
+                    Assert.That(admitted.State,
+                        Is.EqualTo(NetworkSessionState.Established));
+                    Assert.That(server.ConnectionCount, Is.EqualTo(1));
+                    Assert.That(observer.Count(NetworkPhase.Send,
+                        NetworkPacketKind.ResyncRequest), Is.Zero);
+                    server.Tick(_ => { });
+
+                    var values = new List<int>();
+                    foreach (World<AuthorityWorld>
+                                 .Event<NetworkCommandAcceptedEvent<TestCommand>> item in receiver)
+                        values.Add(item.Value.Command.Value);
+                    CollectionAssert.AreEqual(new[] { 22 }, values);
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.DeleteEventReceiver(ref receiver);
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        private static void SendHello(INetworkTransport transport,
+            NetworkBufferPool pool, SchemaFingerprint schema)
+        {
+            var header = Packet(PacketKind.Hello, 0, 1);
+            header.SchemaFingerprint = schema;
+            Assert.That(NetworkPacket.TryEncode(pool, header,
+                ReadOnlySpan<byte>.Empty, out var packet), Is.True);
+            Assert.That(transport.TrySend(packet), Is.True);
+        }
+
+        private static void SendCommandBatch(INetworkTransport transport,
+            NetworkBufferPool pool, SchemaFingerprint schema, uint epoch,
+            uint packetSequence, ReadOnlySpan<byte> payload)
+        {
+            var header = Packet(PacketKind.CommandBatch, epoch, packetSequence);
+            header.SchemaFingerprint = schema;
+            Assert.That(NetworkPacket.TryEncode(pool, header, payload,
+                out var packet), Is.True);
+            Assert.That(transport.TrySend(packet), Is.True);
+        }
+
+        private static byte[] EncodeCommandBatch(
+            params NetworkCommandEnvelope[] commands)
+        {
+            var length = 1;
+            for (var index = 0; index < commands.Length; index++)
+                length = checked(length + 17 + commands[index].Payload.Length);
+            var payload = new byte[length];
+            payload[0] = checked((byte)commands.Length);
+            var offset = 1;
+            for (var index = 0; index < commands.Length; index++)
+            {
+                var command = commands[index];
+                Write32(payload, offset, command.Sequence);
+                Write32(payload, offset + 4, command.TargetTick);
+                Write32(payload, offset + 8, command.TypeId.Value);
+                payload[offset + 12] = command.Version;
+                Write32(payload, offset + 13,
+                    checked((uint)command.Payload.Length));
+                command.Payload.Span.CopyTo(payload.AsSpan(offset + 17));
+                offset += 17 + command.Payload.Length;
+            }
+            return payload;
         }
 
         [Test]

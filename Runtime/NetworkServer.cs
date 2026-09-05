@@ -326,9 +326,7 @@ namespace UniGame.StaticEcs.Network
                     unchecked((int)(ServerTick - peer.AcknowledgedSnapshotTick)),
                     ElapsedNanoseconds(started), activeConnections: ActiveConnectionCount,
                     activePeers: ActivePeerCount);
-                if (!PacketHeader.HasForeignProtocolVersion(packet.Span))
-                    return false;
-                CleanupPeer(peer);
+                DisconnectPeer(peer);
                 return true;
             }
             var packetValidation = peer.Session.ValidatePacket(in header);
@@ -353,7 +351,7 @@ namespace UniGame.StaticEcs.Network
                     ElapsedNanoseconds(started), activeConnections: ActiveConnectionCount,
                     activePeers: ActivePeerCount,
                     packetValidationResult: packetValidation);
-                CleanupPeer(peer);
+                DisconnectPeer(peer);
                 return true;
             }
             if (header.Kind == PacketKind.Hello && !Admit(peer,
@@ -363,15 +361,22 @@ namespace UniGame.StaticEcs.Network
             NetworkCommandResult? commandResult = null;
             var decodeResult = NetworkResultCategory.Success;
             var resyncCorrelationId = 0u;
+            var disconnect = false;
             if (header.Kind == PacketKind.CommandBatch)
             {
                 commandResult = duplicateCommandPacket
                     ? NetworkCommandResult.Duplicate
                     : DecodeCommands(peer, packet, payload,
                         checked(ServerTick + 1));
-                if (commandResult != NetworkCommandResult.Queued &&
-                    commandResult != NetworkCommandResult.Duplicate)
-                    decodeResult = NetworkResultCategory.Malformed;
+                if (commandResult == NetworkCommandResult.LimitExceeded)
+                    decodeResult = NetworkResultCategory.Limits;
+                else if (commandResult != NetworkCommandResult.Queued &&
+                         commandResult != NetworkCommandResult.Duplicate &&
+                         commandResult != NetworkCommandResult.TickWindow)
+                {
+                    decodeResult = NetworkResultCategory.Protocol;
+                    disconnect = true;
+                }
             }
             else if (header.Kind == PacketKind.TransactionCommand)
             {
@@ -379,15 +384,17 @@ namespace UniGame.StaticEcs.Network
                     checked(ServerTick + 1), duplicateTransactionPacket);
                 if (duplicateTransactionPacket &&
                     commandResult != NetworkCommandResult.Duplicate)
-                {
-                    CleanupPeer(peer);
-                    return true;
-                }
+                    disconnect = true;
                 if (commandResult == NetworkCommandResult.PolicyRejected)
                     decodeResult = NetworkResultCategory.Policy;
+                else if (commandResult == NetworkCommandResult.LimitExceeded)
+                    decodeResult = NetworkResultCategory.Limits;
                 else if (commandResult != NetworkCommandResult.Queued &&
                          commandResult != NetworkCommandResult.Duplicate)
-                    decodeResult = NetworkResultCategory.Malformed;
+                {
+                    decodeResult = NetworkResultCategory.Protocol;
+                    disconnect = true;
+                }
             }
             else if (header.Kind == PacketKind.Ping)
                 Send(peer, PacketKind.Pong, ServerTick, PacketHeader.NoneTick,
@@ -412,7 +419,7 @@ namespace UniGame.StaticEcs.Network
                         acknowledgedSnapshotTick: peer.AcknowledgedSnapshotTick,
                         oldestHistoryTick: _coordinator.OldestHistoryTick(peer.Scope),
                         newestHistoryTick: _coordinator.NewestHistoryTick(peer.Scope));
-                    CleanupPeer(peer);
+                    DisconnectPeer(peer);
                     return true;
                 }
                 resyncCorrelationId = request.CorrelationId;
@@ -442,6 +449,11 @@ namespace UniGame.StaticEcs.Network
                 newestHistoryTick: _coordinator.NewestHistoryTick(peer.Scope));
             peer.Session.ReportSession(ServerTick, peer.AcknowledgedSnapshotTick,
                 peer.ServerProcessedCommandSequence, peer.PacketSequence);
+            if (disconnect)
+            {
+                DisconnectPeer(peer);
+                return true;
+            }
             if (header.Kind == PacketKind.Disconnect)
                 return true;
             return false;
@@ -531,26 +543,12 @@ namespace UniGame.StaticEcs.Network
             ReadOnlyMemory<byte> payload, uint serverTick)
         {
             if (payload.Length < 1)
-            {
-                SendResync(peer, serverTick,
-                    NetworkResyncReason.ServerEmptyPayload,
-                    NetworkResyncSource.ServerCommandDecode,
-                    NetworkCommandResult.Malformed);
                 return NetworkCommandResult.Malformed;
-            }
 
             var bytes = payload.Span;
             int count = bytes[0];
             if (count < 1 || count > ProtocolLimits.MaxCommandsPerBatch)
-            {
-                SendResync(peer, serverTick,
-                    NetworkResyncReason.ServerInvalidCommandCount,
-                    NetworkResyncSource.ServerCommandDecode,
-                    count > ProtocolLimits.MaxCommandsPerBatch
-                        ? NetworkCommandResult.LimitExceeded
-                        : NetworkCommandResult.Malformed);
                 return NetworkCommandResult.Malformed;
-            }
 
             int offset = 1;
             var commands = peer.DecodedCommands;
@@ -560,10 +558,6 @@ namespace UniGame.StaticEcs.Network
                 if (offset > bytes.Length - 17)
                 {
                     DisposeCommands(commands, decoded);
-                    SendResync(peer, serverTick,
-                        NetworkResyncReason.ServerTruncatedCommandHeader,
-                        NetworkResyncSource.ServerCommandDecode,
-                        NetworkCommandResult.Malformed);
                     return NetworkCommandResult.Malformed;
                 }
 
@@ -578,21 +572,13 @@ namespace UniGame.StaticEcs.Network
                     payloadLength > (uint)(bytes.Length - offset))
                 {
                     DisposeCommands(commands, decoded);
-                    SendResync(peer, serverTick,
-                        NetworkResyncReason.ServerInvalidCommandEnvelope,
-                        NetworkResyncSource.ServerCommandDecode,
-                        payloadLength > ProtocolLimits.MaxCommandBytes
-                            ? NetworkCommandResult.LimitExceeded
-                            : NetworkCommandResult.Malformed);
-                    return payloadLength > ProtocolLimits.MaxCommandBytes
-                        ? NetworkCommandResult.LimitExceeded
-                        : NetworkCommandResult.Malformed;
+                    return NetworkCommandResult.Malformed;
                 }
 
                 var exactLength = checked((int)payloadLength);
                 var exact = packet.RetainSlice(PacketHeader.Size + offset, exactLength);
                 offset += exactLength;
-                var envelope = new NetworkCommandEnvelope(
+                commands[decoded++] = new NetworkCommandEnvelope(
                     peer.Transport.Connection,
                     peer.PeerId,
                     peer.Epoch,
@@ -601,16 +587,11 @@ namespace UniGame.StaticEcs.Network
                     new NetworkTypeId(idValue),
                     version,
                     exact);
-                commands[decoded++] = envelope;
             }
 
             if (offset != bytes.Length)
             {
                 DisposeCommands(commands, decoded);
-                SendResync(peer, serverTick,
-                    NetworkResyncReason.ServerTrailingPayloadBytes,
-                    NetworkResyncSource.ServerCommandDecode,
-                    NetworkCommandResult.Malformed);
                 return NetworkCommandResult.Malformed;
             }
 
@@ -618,25 +599,30 @@ namespace UniGame.StaticEcs.Network
             for (var i = 0; i < decoded; i++)
             {
                 var result = _coordinator.Queue(commands[i], serverTick);
-                if (result != NetworkCommandResult.Queued &&
-                    result != NetworkCommandResult.Duplicate)
+                if (result == NetworkCommandResult.TickWindow ||
+                    result == NetworkCommandResult.Duplicate)
+                {
+                    commands[i].Dispose();
+                    commands[i] = default;
+                    continue;
+                }
+                if (result == NetworkCommandResult.LimitExceeded)
                 {
                     for (var j = i; j < decoded; j++)
                     {
-                        var remaining = commands[j];
-                        remaining.Dispose();
+                        commands[j].Dispose();
                         commands[j] = default;
                     }
-                    SendResync(peer, serverTick,
-                        NetworkResyncReason.ServerCommandQueueRejected,
-                        NetworkResyncSource.ServerCommandDecode,
-                        result);
                     return result;
                 }
-                if (result == NetworkCommandResult.Duplicate)
+                if (result != NetworkCommandResult.Queued)
                 {
-                    var duplicate = commands[i];
-                    duplicate.Dispose();
+                    for (var j = i; j < decoded; j++)
+                    {
+                        commands[j].Dispose();
+                        commands[j] = default;
+                    }
+                    return result;
                 }
                 commands[i] = default;
             }
@@ -976,30 +962,6 @@ namespace UniGame.StaticEcs.Network
             }
         }
 
-        private bool SendResync(Peer peer, uint serverTick,
-            NetworkResyncReason resyncReason,
-            NetworkResyncSource resyncSource,
-            NetworkCommandResult? commandResult = null)
-        {
-            var startsRecovery = !peer.ResyncRequested;
-            var correlationId = peer.ResyncCorrelationId;
-            if (correlationId == 0)
-            {
-                correlationId = peer.PacketSequence;
-                if (correlationId == 0) return false;
-                peer.ResyncCorrelationId = correlationId;
-                if (startsRecovery)
-                    peer.ResyncSnapshotTick = 0;
-            }
-            peer.ResyncRequested = true;
-            Span<byte> payload = stackalloc byte[ResyncRequestPayload.Size];
-            if (!new ResyncRequestPayload(correlationId).TryWrite(payload))
-                return false;
-            return Send(peer, PacketKind.ResyncRequest, serverTick,
-                PacketHeader.NoneTick, payload, resyncReason, resyncSource,
-                correlationId, commandResult);
-        }
-
         private bool Send(Peer peer, PacketKind kind, uint serverTick,
             uint acknowledgedTick, ReadOnlySpan<byte> payload,
             NetworkResyncReason resyncReason = NetworkResyncReason.None,
@@ -1049,6 +1011,13 @@ namespace UniGame.StaticEcs.Network
                 _observer.Observe(in value);
             }
             catch { }
+        }
+
+        private void DisconnectPeer(Peer peer)
+        {
+            Send(peer, PacketKind.Disconnect, ServerTick, PacketHeader.NoneTick,
+                ReadOnlySpan<byte>.Empty);
+            CleanupPeer(peer);
         }
 
         private void ClosePeer(Peer peer)
