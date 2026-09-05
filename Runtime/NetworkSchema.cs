@@ -341,7 +341,15 @@ namespace UniGame.StaticEcs.Network
         public override NetworkCommandResult Dispatch(byte[] buffer, int offset,
             int length, byte version, in NetworkCommandContext context)
         {
-            var command = Read(buffer, offset, length, version);
+            T command;
+            try
+            {
+                command = Read(buffer, offset, length, version);
+            }
+            catch (Exception)
+            {
+                return NetworkCommandResult.Malformed;
+            }
             var accepted = default(TPolicy).Authorize(in context, in command);
             if (accepted) World<TWorld>.SendEvent(new NetworkCommandAcceptedEvent<T> { Command = command, Context = context });
             else World<TWorld>.SendEvent(new NetworkCommandRejectedEvent<T> { Command = command, Context = context });

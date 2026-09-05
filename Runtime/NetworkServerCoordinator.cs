@@ -118,24 +118,38 @@ namespace UniGame.StaticEcs.Network
         {
             _commands.Sort((a, b) => { var tick = a.Envelope.TargetTick.CompareTo(b.Envelope.TargetTick); if (tick != 0) return tick; var peer = a.Envelope.PeerId.CompareTo(b.Envelope.PeerId); return peer != 0 ? peer : a.Envelope.Sequence.CompareTo(b.Envelope.Sequence); });
             var summary = default(NetworkDispatchSummary);
-            for (var i = 0; i < _commands.Count; i++)
+            var consumed = 0;
+            try
             {
-                if (_commands[i].Envelope.TargetTick > serverTick) continue;
-                var pending = _commands[i];
-                var result = pending.Session.Dispatch(pending.Envelope, pending.Entry);
-                summary.Add(result);
-                if (result == NetworkCommandResult.Dispatched ||
-                    result == NetworkCommandResult.PolicyRejected)
+                while (consumed < _commands.Count)
                 {
-                    _processedCommands[pending.Session.Connection] = new ProcessedCommandCursor(
-                        pending.Envelope.TargetTick,
-                        pending.Envelope.Sequence);
+                    if (_commands[consumed].Envelope.TargetTick > serverTick) break;
+                    var pending = _commands[consumed];
+                    var envelope = pending.Envelope;
+                    try
+                    {
+                        var result = pending.Session.Dispatch(envelope, pending.Entry);
+                        summary.Add(result);
+                        if (result == NetworkCommandResult.Dispatched ||
+                            result == NetworkCommandResult.PolicyRejected)
+                        {
+                            _processedCommands[pending.Session.Connection] = new ProcessedCommandCursor(
+                                envelope.TargetTick,
+                                envelope.Sequence);
+                        }
+                    }
+                    finally
+                    {
+                        DecrementPending(envelope);
+                        envelope.Dispose();
+                        consumed++;
+                    }
                 }
-                DecrementPending(pending.Envelope);
-                var envelope = pending.Envelope;
-                envelope.Dispose();
             }
-            if (summary.Total > 0) _commands.RemoveRange(0, summary.Total);
+            finally
+            {
+                if (consumed > 0) _commands.RemoveRange(0, consumed);
+            }
             return summary;
         }
 
