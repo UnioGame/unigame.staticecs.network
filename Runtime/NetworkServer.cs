@@ -416,11 +416,13 @@ namespace UniGame.StaticEcs.Network
                     return true;
                 }
                 resyncCorrelationId = request.CorrelationId;
+                var startsRecovery = !peer.ResyncRequested;
                 peer.ResyncRequested = true;
                 if (peer.ResyncCorrelationId == 0)
                 {
                     peer.ResyncCorrelationId = request.CorrelationId;
-                    peer.ResyncSnapshotTick = 0;
+                    if (startsRecovery)
+                        peer.ResyncSnapshotTick = 0;
                 }
             }
             else if (header.Kind == PacketKind.Disconnect)
@@ -654,14 +656,9 @@ namespace UniGame.StaticEcs.Network
 
         private void DecodeAcknowledgement(Peer peer, uint acknowledgedTick)
         {
-            if (acknowledgedTick == 0)
-            {
-                peer.AcknowledgedSnapshotTick = 0;
-                peer.ResyncRequested = true;
+            if (acknowledgedTick <= peer.AcknowledgedSnapshotTick)
                 return;
-            }
-            if (acknowledgedTick < peer.AcknowledgedSnapshotTick ||
-                acknowledgedTick > ServerTick ||
+            if (acknowledgedTick > ServerTick ||
                 !_coordinator.TryGetCapture(peer.Scope, acknowledgedTick,
                     out var baseline) ||
                 baseline.Scope != peer.Scope ||
@@ -671,13 +668,10 @@ namespace UniGame.StaticEcs.Network
                 return;
             }
             peer.AcknowledgedSnapshotTick = acknowledgedTick;
-            if (peer.ResyncCorrelationId != 0 &&
+            if (peer.ResyncRequested &&
                 (peer.ResyncSnapshotTick == 0 ||
                  acknowledgedTick < peer.ResyncSnapshotTick))
-            {
-                peer.ResyncRequested = true;
                 return;
-            }
             peer.ResyncRequested = false;
             peer.ResyncCorrelationId = 0;
             peer.ResyncSnapshotTick = 0;
@@ -707,7 +701,11 @@ namespace UniGame.StaticEcs.Network
                     }
                 }
                 if (keyframe)
+                {
                     peer.ResyncRequested = true;
+                    if (peer.ResyncSnapshotTick == 0)
+                        peer.ResyncSnapshotTick = snapshot.ServerTick;
+                }
 
                 var body = keyframe ? snapshot.Bytes.Span : delta.Span;
                 var reliableLimit = peer.Transport.MaxReliablePayloadBytes;
@@ -775,8 +773,6 @@ namespace UniGame.StaticEcs.Network
                         payload.Dispose();
                     }
                 }
-                if (keyframe && peer.ResyncCorrelationId != 0)
-                    peer.ResyncSnapshotTick = snapshot.ServerTick;
             }
             finally
             {
@@ -985,13 +981,15 @@ namespace UniGame.StaticEcs.Network
             NetworkResyncSource resyncSource,
             NetworkCommandResult? commandResult = null)
         {
+            var startsRecovery = !peer.ResyncRequested;
             var correlationId = peer.ResyncCorrelationId;
             if (correlationId == 0)
             {
                 correlationId = peer.PacketSequence;
                 if (correlationId == 0) return false;
                 peer.ResyncCorrelationId = correlationId;
-                peer.ResyncSnapshotTick = 0;
+                if (startsRecovery)
+                    peer.ResyncSnapshotTick = 0;
             }
             peer.ResyncRequested = true;
             Span<byte> payload = stackalloc byte[ResyncRequestPayload.Size];
