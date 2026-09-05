@@ -957,7 +957,6 @@ namespace UniGame.StaticEcs.Network.Tests
                         PacketKind.Ack, 1, 4, 2);
                     server.Receive();
 
-                    entity.Set(new TestComponent { Value = 3 });
                     server.Tick(_ => { });
                     var delta = ReceiveChunk(clientTransport);
                     Assert.That(delta.PayloadKind,
