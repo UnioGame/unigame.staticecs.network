@@ -561,6 +561,114 @@ namespace UniGame.StaticEcs.Network.Tests
             }
         }
 
+        [Test]
+        public void TransactionSchemaAndFramingViolationsDisconnectOnlyOffenders()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                using var pool = new NetworkBufferPool(1 << 20);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(100),
+                    out var clientTransportA, out var serverTransportA);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(101),
+                    out var clientTransportB, out var serverTransportB);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(102),
+                    out var clientTransportC, out var serverTransportC);
+                using (clientTransportA)
+                using (serverTransportA)
+                using (clientTransportB)
+                using (serverTransportB)
+                using (clientTransportC)
+                using (serverTransportC)
+                {
+                    var serverSchema = Schema<AuthorityWorld>(true);
+                    var clientSchema = Schema<ClientAWorld>(false);
+                    using var server = new NetworkServer<AuthorityWorld>(
+                        serverSchema, static (_, _) => false,
+                        bufferPool: pool);
+                    var schemaOffender = server.AddConnection(serverTransportA,
+                        7, 20, new ScopeId(1));
+                    var malformedOffender = server.AddConnection(serverTransportB,
+                        8, 21, new ScopeId(1));
+                    var healthy = server.AddConnection(serverTransportC,
+                        9, 22, new ScopeId(1));
+                    SendHello(clientTransportA, pool, clientSchema.Fingerprint);
+                    SendHello(clientTransportB, pool, clientSchema.Fingerprint);
+                    SendHello(clientTransportC, pool, clientSchema.Fingerprint);
+                    server.Receive();
+                    Assert.That(schemaOffender.State,
+                        Is.EqualTo(NetworkSessionState.Established));
+                    Assert.That(malformedOffender.State,
+                        Is.EqualTo(NetworkSessionState.Established));
+                    Assert.That(healthy.State,
+                        Is.EqualTo(NetworkSessionState.Established));
+                    DrainTransport(clientTransportA);
+                    DrainTransport(clientTransportB);
+                    DrainTransport(clientTransportC);
+                    Assert.That(server.CaptureBufferDiagnostics().OutstandingLeases,
+                        Is.Zero);
+
+                    var schemaInvalidPayload =
+                        new byte[NetworkTransactionWire.CommandHeaderSize];
+                    Assert.That(NetworkTransactionWire.TryWriteCommand(
+                        schemaInvalidPayload, new NetworkTransactionId(1),
+                        new NetworkTypeId(999), 0, ReadOnlySpan<byte>.Empty),
+                        Is.True);
+                    SendTransactionCommand(clientTransportA, pool,
+                        serverSchema.Fingerprint, 20, 2, schemaInvalidPayload);
+                    var malformedPayload =
+                        new byte[NetworkTransactionWire.CommandHeaderSize];
+                    SendTransactionCommand(clientTransportB, pool,
+                        serverSchema.Fingerprint, 21, 2, malformedPayload);
+
+                    server.Receive();
+
+                    Assert.That(schemaOffender.State,
+                        Is.EqualTo(NetworkSessionState.Closed));
+                    Assert.That(malformedOffender.State,
+                        Is.EqualTo(NetworkSessionState.Closed));
+                    Assert.That(healthy.State,
+                        Is.EqualTo(NetworkSessionState.Established));
+                    Assert.That(server.ConnectionCount, Is.EqualTo(1));
+                    Assert.That(server.PendingTransactionCount, Is.Zero);
+                    Assert.That(DrainTransport(clientTransportA), Is.EqualTo(1));
+                    Assert.That(DrainTransport(clientTransportB), Is.EqualTo(1));
+                    Assert.That(server.CaptureBufferDiagnostics().OutstandingLeases,
+                        Is.Zero);
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        private static void SendTransactionCommand(
+            INetworkTransport transport, NetworkBufferPool pool,
+            SchemaFingerprint schema, uint epoch, uint packetSequence,
+            ReadOnlySpan<byte> payload)
+        {
+            var header = Packet(PacketKind.TransactionCommand, epoch,
+                packetSequence);
+            header.SchemaFingerprint = schema;
+            Assert.That(NetworkPacket.TryEncode(pool, header, payload,
+                out var packet), Is.True);
+            Assert.That(transport.TrySend(packet), Is.True);
+        }
+
+        private static int DrainTransport(INetworkTransport transport)
+        {
+            var count = 0;
+            while (transport.TryReceive(out var packet))
+            {
+                packet.Dispose();
+                count++;
+            }
+            return count;
+        }
+
         private static void SendHello(INetworkTransport transport,
             NetworkBufferPool pool, SchemaFingerprint schema)
         {

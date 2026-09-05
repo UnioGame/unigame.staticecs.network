@@ -857,17 +857,7 @@ namespace UniGame.StaticEcs.Network
             if (validation != NetworkCommandResult.Queued)
             {
                 envelope.Dispose();
-                // Keep the policy result in the same bounded transaction ledger
-                // as accepted commands. It cannot be lost when reliable send is
-                // stalled, and it still consumes one of the 256 pending slots.
-                peer.Transactions.Add(transactionId,
-                    new NetworkServerTransaction(transactionId, default,
-                        default, applicationTick)
-                    {
-                        Dispatched = true,
-                        CompletionStatus = NetworkTransactionStatus.PolicyRejected
-                    });
-                return NetworkCommandResult.PolicyRejected;
+                return validation;
             }
             peer.Transactions.Add(transactionId,
                 new NetworkServerTransaction(transactionId, envelope, entry,
