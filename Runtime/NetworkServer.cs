@@ -23,6 +23,8 @@ namespace UniGame.StaticEcs.Network
         private readonly bool _ownsBufferPool;
         private readonly Dictionary<ScopeId, NetworkSnapshot> _captures =
             new Dictionary<ScopeId, NetworkSnapshot>();
+        private readonly Dictionary<SnapshotDeltaKey, NetworkBufferLease> _snapshotDeltas =
+            new Dictionary<SnapshotDeltaKey, NetworkBufferLease>();
         private uint _activeTick;
         private int _activeConnectionCount;
         private int _activePeerCount;
@@ -69,6 +71,7 @@ namespace UniGame.StaticEcs.Network
             if (_disposed)
                 return;
             _disposed = true;
+            ClearSnapshotDeltas();
             while (_peers.Count > 0)
                 CleanupPeer(_peers[_peers.Count - 1]);
             _peers.Clear();
@@ -213,7 +216,14 @@ namespace UniGame.StaticEcs.Network
             }
             finally
             {
-                _activeTick = 0;
+                try
+                {
+                    ClearSnapshotDeltas();
+                }
+                finally
+                {
+                    _activeTick = 0;
+                }
             }
         }
 
@@ -678,104 +688,133 @@ namespace UniGame.StaticEcs.Network
         private void SendSnapshot(Peer peer, NetworkSnapshot snapshot)
         {
             NetworkBufferLease delta = null;
+            var baselineTick = peer.AcknowledgedSnapshotTick;
+            NetworkSnapshot baseline = null;
+            var keyframe = peer.ResyncRequested || baselineTick == 0;
+            if (!keyframe)
+            {
+                _coordinator.TryGetCapture(peer.Scope, baselineTick,
+                    out baseline);
+                if (baseline == null || baseline.Scope != peer.Scope ||
+                    baseline.SchemaFingerprint != _schema.Fingerprint)
+                    baseline = null;
+                if (!TryGetSnapshotDelta(peer.Scope, baselineTick, baseline,
+                        snapshot, out delta))
+                    keyframe = true;
+            }
+            if (keyframe)
+            {
+                peer.ResyncRequested = true;
+                if (peer.ResyncSnapshotTick == 0)
+                    peer.ResyncSnapshotTick = snapshot.ServerTick;
+            }
+
+            var body = keyframe ? snapshot.Bytes.Span : delta.Span;
+            var reliableLimit = peer.Transport.MaxReliablePayloadBytes;
+            if (reliableLimit <= PacketHeader.Size + SnapshotChunkHeader.Size)
+            {
+                peer.ResyncRequested = true;
+                return;
+            }
+            var maxBody = Math.Min(
+                reliableLimit - PacketHeader.Size - SnapshotChunkHeader.Size,
+                ProtocolLimits.MaxWirePayloadBytes - SnapshotChunkHeader.Size);
+            if (body.Length > ProtocolLimits.MaxDecodedPayloadBytes)
+            {
+                peer.ResyncRequested = true;
+                return;
+            }
+            var chunkCountLong = (body.Length + (long)maxBody - 1L) / maxBody;
+            if (chunkCountLong < 1 ||
+                chunkCountLong > ProtocolLimits.MaxChunkMappings)
+            {
+                peer.ResyncRequested = true;
+                return;
+            }
+            var chunkCount = checked((uint)chunkCountLong);
+            for (uint chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++)
+            {
+                var bodyOffset = checked((int)((long)chunkIndex *
+                                               maxBody));
+                var bodyLength = Math.Min(maxBody, body.Length - bodyOffset);
+                var payload = _bufferPool.Rent(checked(
+                    SnapshotChunkHeader.Size + bodyLength));
+                try
+                {
+                    var chunk = new SnapshotChunkHeader
+                    {
+                        PayloadKind = keyframe
+                            ? SnapshotPayloadKind.Keyframe
+                            : SnapshotPayloadKind.Delta,
+                        SnapshotTick = snapshot.ServerTick,
+                        BaselineTick = keyframe ? 0 : baselineTick,
+                        TotalLength = checked((uint)snapshot.ByteLength),
+                        TotalHash = snapshot.PayloadHash,
+                        ChunkIndex = chunkIndex,
+                        ChunkCount = chunkCount,
+                        ResyncCorrelationId = keyframe
+                            ? peer.ResyncCorrelationId
+                            : 0
+                    };
+                    if (!chunk.TryWrite(payload.WritableSpan))
+                    {
+                        peer.ResyncRequested = true;
+                        return;
+                    }
+                    body.Slice(bodyOffset, bodyLength).CopyTo(
+                        payload.WritableSpan.Slice(SnapshotChunkHeader.Size));
+                    if (!SendSnapshotChunk(peer, snapshot.ServerTick,
+                            chunkIndex + 1, payload.Span))
+                    {
+                        peer.ResyncRequested = true;
+                        return;
+                    }
+                }
+                finally
+                {
+                    payload.Dispose();
+                }
+            }
+        }
+
+        private bool TryGetSnapshotDelta(ScopeId scope, uint baselineTick,
+            NetworkSnapshot baseline, NetworkSnapshot target,
+            out NetworkBufferLease delta)
+        {
+            var key = new SnapshotDeltaKey(scope, baselineTick,
+                target.ServerTick);
+            if (_snapshotDeltas.TryGetValue(key, out delta))
+                return delta != null;
+
+            NetworkBufferLease lease = null;
             try
             {
-                var baselineTick = peer.AcknowledgedSnapshotTick;
-                NetworkSnapshot baseline = null;
-                var keyframe = peer.ResyncRequested || baselineTick == 0 ||
-                    !_coordinator.TryGetCapture(peer.Scope, baselineTick,
-                        out baseline) ||
-                    baseline.Scope != peer.Scope ||
-                    baseline.SchemaFingerprint != _schema.Fingerprint;
-                if (!keyframe)
+                if (baseline != null &&
+                    SnapshotDeltaCodec.TryEncode(_bufferPool, baseline,
+                        target, out lease) &&
+                    lease.Length < target.ByteLength)
                 {
-                    if (!SnapshotDeltaCodec.TryEncode(_bufferPool, baseline,
-                            snapshot, out delta) ||
-                        delta.Length >= snapshot.ByteLength)
-                    {
-                        delta?.Dispose();
-                        delta = null;
-                        keyframe = true;
-                    }
-                }
-                if (keyframe)
-                {
-                    peer.ResyncRequested = true;
-                    if (peer.ResyncSnapshotTick == 0)
-                        peer.ResyncSnapshotTick = snapshot.ServerTick;
+                    _snapshotDeltas.Add(key, lease);
+                    delta = lease;
+                    lease = null;
+                    return true;
                 }
 
-                var body = keyframe ? snapshot.Bytes.Span : delta.Span;
-                var reliableLimit = peer.Transport.MaxReliablePayloadBytes;
-                if (reliableLimit <= PacketHeader.Size + SnapshotChunkHeader.Size)
-                {
-                    peer.ResyncRequested = true;
-                    return;
-                }
-                var maxBody = Math.Min(
-                    reliableLimit - PacketHeader.Size - SnapshotChunkHeader.Size,
-                    ProtocolLimits.MaxWirePayloadBytes - SnapshotChunkHeader.Size);
-                if (body.Length > ProtocolLimits.MaxDecodedPayloadBytes)
-                {
-                    peer.ResyncRequested = true;
-                    return;
-                }
-                var chunkCountLong = (body.Length + (long)maxBody - 1L) / maxBody;
-                if (chunkCountLong < 1 ||
-                    chunkCountLong > ProtocolLimits.MaxChunkMappings)
-                {
-                    peer.ResyncRequested = true;
-                    return;
-                }
-                var chunkCount = checked((uint)chunkCountLong);
-                for (uint chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++)
-                {
-                    var bodyOffset = checked((int)((long)chunkIndex *
-                                                   maxBody));
-                    var bodyLength = Math.Min(maxBody, body.Length - bodyOffset);
-                    var payload = _bufferPool.Rent(checked(
-                        SnapshotChunkHeader.Size + bodyLength));
-                    try
-                    {
-                        var chunk = new SnapshotChunkHeader
-                        {
-                            PayloadKind = keyframe
-                                ? SnapshotPayloadKind.Keyframe
-                                : SnapshotPayloadKind.Delta,
-                            SnapshotTick = snapshot.ServerTick,
-                            BaselineTick = keyframe ? 0 : baselineTick,
-                            TotalLength = checked((uint)snapshot.ByteLength),
-                            TotalHash = snapshot.PayloadHash,
-                            ChunkIndex = chunkIndex,
-                            ChunkCount = chunkCount,
-                            ResyncCorrelationId = keyframe
-                                ? peer.ResyncCorrelationId
-                                : 0
-                        };
-                        if (!chunk.TryWrite(payload.WritableSpan))
-                        {
-                            peer.ResyncRequested = true;
-                            return;
-                        }
-                        body.Slice(bodyOffset, bodyLength).CopyTo(
-                            payload.WritableSpan.Slice(SnapshotChunkHeader.Size));
-                        if (!SendSnapshotChunk(peer, snapshot.ServerTick,
-                                chunkIndex + 1, payload.Span))
-                        {
-                            peer.ResyncRequested = true;
-                            return;
-                        }
-                    }
-                    finally
-                    {
-                        payload.Dispose();
-                    }
-                }
+                _snapshotDeltas.Add(key, null);
+                delta = null;
+                return false;
             }
             finally
             {
-                delta?.Dispose();
+                lease?.Dispose();
             }
+        }
+
+        private void ClearSnapshotDeltas()
+        {
+            foreach (var delta in _snapshotDeltas.Values)
+                delta?.Dispose();
+            _snapshotDeltas.Clear();
         }
 
         private bool SendSnapshotChunk(Peer peer, uint serverTick,
@@ -1103,6 +1142,31 @@ namespace UniGame.StaticEcs.Network
 
         private static NetworkPacketKind DiagnosticKind(PacketKind kind) => (NetworkPacketKind)(byte)kind;
         private static long ElapsedNanoseconds(long started) => (Stopwatch.GetTimestamp() - started) * 1000000000L / Stopwatch.Frequency;
+
+        private readonly struct SnapshotDeltaKey : IEquatable<SnapshotDeltaKey>
+        {
+            internal SnapshotDeltaKey(ScopeId scope, uint baselineTick,
+                uint targetTick)
+            {
+                Scope = scope;
+                BaselineTick = baselineTick;
+                TargetTick = targetTick;
+            }
+
+            private ScopeId Scope { get; }
+            private uint BaselineTick { get; }
+            private uint TargetTick { get; }
+
+            public bool Equals(SnapshotDeltaKey other) => Scope == other.Scope &&
+                BaselineTick == other.BaselineTick && TargetTick == other.TargetTick;
+
+            public override bool Equals(object obj) =>
+                obj is SnapshotDeltaKey other && Equals(other);
+
+            public override int GetHashCode() => unchecked(
+                (Scope.GetHashCode() * 397) ^ (int)BaselineTick ^
+                ((int)TargetTick * 397));
+        }
 
         private sealed class Peer
         {

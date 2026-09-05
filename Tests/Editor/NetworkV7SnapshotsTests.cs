@@ -1114,5 +1114,166 @@ namespace UniGame.StaticEcs.Network.Tests
             }
         }
 
+
+        [Test]
+        public void ServerDeltaCacheReusesSameBaselineAndIsolatesDifferentBaselines()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var scope = new ScopeId(42);
+                using (var pool = new NetworkBufferPool(0))
+                using (var mock = new TwoClientNetworkMock())
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true, bufferPool: pool))
+                {
+                    server.AddConnection(mock.ServerA, 1, 11, scope);
+                    server.AddConnection(mock.ServerB, 2, 22, scope);
+                    SendPeerPacket(mock.ClientA, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    SendPeerPacket(mock.ClientB, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(mock.ClientA.TryReceive(out var readyA), Is.True);
+                    readyA.Dispose();
+                    Assert.That(mock.ClientB.TryReceive(out var readyB), Is.True);
+                    readyB.Dispose();
+
+                    var first = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    first.Set(new TestComponent { Value = 1 });
+                    var second = World<AuthorityWorld>.NewEntity<SecondEntity>();
+                    second.Set(new TestComponent { Value = 10 });
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(mock.ClientA).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                    Assert.That(ReceiveChunk(mock.ClientB).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+
+                    SendPeerPacket(mock.ClientA, schema.Fingerprint,
+                        PacketKind.Ack, 1, 2, 1);
+                    SendPeerPacket(mock.ClientB, schema.Fingerprint,
+                        PacketKind.Ack, 1, 2, 1);
+                    server.Receive();
+
+                    first.Set(new TestComponent { Value = 2 });
+                    var beforeShared = pool.CaptureDiagnostics().PoolMisses;
+                    server.Tick(_ => { });
+                    var sharedMisses = pool.CaptureDiagnostics().PoolMisses -
+                        beforeShared;
+                    var sharedA = ReceiveSnapshotChunk(mock.ClientA,
+                        out var sharedPacketA, out var sharedBodyA);
+                    var sharedB = ReceiveSnapshotChunk(mock.ClientB,
+                        out var sharedPacketB, out var sharedBodyB);
+                    Assert.That(sharedA.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(sharedB.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(sharedA.BaselineTick, Is.EqualTo(1));
+                    Assert.That(sharedB.BaselineTick, Is.EqualTo(1));
+                    CollectionAssert.AreEqual(sharedBodyA, sharedBodyB);
+                    Assert.That(sharedPacketA.SessionEpoch, Is.EqualTo(11));
+                    Assert.That(sharedPacketB.SessionEpoch, Is.EqualTo(22));
+                    Assert.That(sharedPacketA.SessionEpoch,
+                        Is.Not.EqualTo(sharedPacketB.SessionEpoch));
+                    Assert.That(sharedMisses, Is.GreaterThan(0));
+
+                    Assert.That(server.TryGetCapture(scope, 1,
+                        out var baselineOne), Is.True);
+                    Assert.That(server.TryGetCapture(scope, 2,
+                        out var targetTwo), Is.True);
+                    AssertReconstructedSnapshot(pool, baselineOne,
+                        sharedBodyA, in sharedA, schema.Fingerprint, scope,
+                        targetTwo);
+
+                    SendPeerPacket(mock.ClientA, schema.Fingerprint,
+                        PacketKind.Ack, 1, 3, 2);
+                    server.Receive();
+                    first.Set(new TestComponent { Value = 3 });
+                    var beforeDifferent = pool.CaptureDiagnostics().PoolMisses;
+                    server.Tick(_ => { });
+                    var differentMisses = pool.CaptureDiagnostics().PoolMisses -
+                        beforeDifferent;
+                    var differentA = ReceiveSnapshotChunk(mock.ClientA,
+                        out var differentPacketA, out var differentBodyA);
+                    var differentB = ReceiveSnapshotChunk(mock.ClientB,
+                        out var differentPacketB, out var differentBodyB);
+                    Assert.That(differentA.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(differentB.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(differentA.BaselineTick, Is.EqualTo(2));
+                    Assert.That(differentB.BaselineTick, Is.EqualTo(1));
+                    Assert.That(differentPacketA.SessionEpoch,
+                        Is.EqualTo(11));
+                    Assert.That(differentPacketB.SessionEpoch,
+                        Is.EqualTo(22));
+                    Assert.That(differentMisses,
+                        Is.EqualTo(sharedMisses + 1));
+                    Assert.That(server.TryGetCapture(scope, 3,
+                        out var targetThree), Is.True);
+                    AssertReconstructedSnapshot(pool,
+                        baselineOne, differentBodyB, in differentB,
+                        schema.Fingerprint, scope, targetThree);
+                    Assert.That(server.TryGetCapture(scope, 2,
+                        out var baselineTwo), Is.True);
+                    AssertReconstructedSnapshot(pool,
+                        baselineTwo, differentBodyA, in differentA,
+                        schema.Fingerprint, scope, targetThree);
+                    Assert.That(differentBodyA.Length,
+                        Is.GreaterThan(0));
+                }
+
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        private static SnapshotChunkHeader ReceiveSnapshotChunk(
+            INetworkTransport transport, out PacketHeader packetHeader,
+            out byte[] body)
+        {
+            Assert.That(transport.TryReceive(out var packet), Is.True);
+            try
+            {
+                Assert.That(NetworkPacket.TryDecode(packet,
+                    out packetHeader, out var payload), Is.True);
+                Assert.That(packetHeader.Kind,
+                    Is.EqualTo(PacketKind.SnapshotChunk));
+                Assert.That(SnapshotChunkHeader.TryRead(payload.Span,
+                    out var chunk), Is.True);
+                body = payload.Slice(SnapshotChunkHeader.Size).ToArray();
+                return chunk;
+            }
+            finally
+            {
+                packet.Dispose();
+            }
+        }
+
+        private static void AssertReconstructedSnapshot(NetworkBufferPool pool,
+            NetworkSnapshot baseline, byte[] body,
+            in SnapshotChunkHeader header, SchemaFingerprint schema,
+            ScopeId scope, NetworkSnapshot target)
+        {
+            NetworkBufferLease canonical = null;
+            try
+            {
+                Assert.That(SnapshotDeltaCodec.TryReconstruct(pool, baseline,
+                    body, in header, schema, scope, out canonical,
+                    out _, out _), Is.True);
+                Assert.That(canonical.Span.SequenceEqual(target.Bytes.Span),
+                    Is.True);
+            }
+            finally
+            {
+                canonical?.Dispose();
+            }
+        }
+
     }
 }
