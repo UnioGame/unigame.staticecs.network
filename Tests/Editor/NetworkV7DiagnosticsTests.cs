@@ -63,6 +63,222 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void ServerDiagnosticsCountersTrackAdmissionRejectionAndReadyFailure()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var serverSchema = Schema<AuthorityWorld>(true);
+                var clientSchema = Schema<ClientAWorld>(false);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(901),
+                    out var rejectClientTransport, out var rejectServerTransport);
+                using (rejectClientTransport)
+                using (rejectServerTransport)
+                {
+                    var events = new TraceCollector();
+                    using (var server = new NetworkServer<AuthorityWorld>(
+                        serverSchema, static (_, _) => true, observer: events,
+                        admissionPolicy: new RecordingAdmissionPolicy(
+                            new List<string>(), false)))
+                    using (var client = new NetworkClient<ClientAWorld>(
+                        rejectClientTransport, clientSchema))
+                    {
+                        server.AddConnection(rejectServerTransport, 1, 1,
+                            new ScopeId(1));
+                        client.BeginHandshake();
+                        server.Receive();
+                        client.Process();
+
+                        var rejection = events.Single(NetworkPhase.Decode,
+                            NetworkPacketKind.Hello);
+                        Assert.That(rejection.ActiveConnections, Is.EqualTo(1));
+                        Assert.That(rejection.ActivePeers, Is.Zero);
+                        var disconnect = events.Single(NetworkPhase.Send,
+                            NetworkPacketKind.Disconnect);
+                        Assert.That(disconnect.ActiveConnections, Is.EqualTo(1));
+                        Assert.That(disconnect.ActivePeers, Is.Zero);
+                        Assert.That(server.ConnectionCount, Is.Zero);
+                        Assert.That(client.Session.State,
+                            Is.EqualTo(NetworkSessionState.Closed));
+                    }
+                }
+
+                MemoryNetworkTransport.CreatePair(new ConnectionId(902),
+                    out var rejectedEpochClientTransport,
+                    out var rejectedEpochServerTransport);
+                using (rejectedEpochClientTransport)
+                using (rejectedEpochServerTransport)
+                {
+                    var events = new TraceCollector();
+                    using (var server = new NetworkServer<AuthorityWorld>(
+                        serverSchema, static (_, _) => true, observer: events))
+                    using (var client = new NetworkClient<ClientAWorld>(
+                        rejectedEpochClientTransport, clientSchema))
+                    {
+                        server.AddConnection(rejectedEpochServerTransport, 2, 0,
+                            new ScopeId(1));
+                        client.BeginHandshake();
+                        server.Receive();
+                        client.Process();
+
+                        var rejection = events.Single(NetworkPhase.Decode,
+                            NetworkPacketKind.Hello);
+                        Assert.That(rejection.ActiveConnections, Is.Zero);
+                        Assert.That(rejection.ActivePeers, Is.Zero);
+                        Assert.That(server.ConnectionCount, Is.Zero);
+                        Assert.That(client.Session.State,
+                            Is.EqualTo(NetworkSessionState.Closed));
+                    }
+                }
+
+                MemoryNetworkTransport.CreatePair(new ConnectionId(906),
+                    out var readyClientTransport, out var readyServerInner);
+                using (readyClientTransport)
+                using (var readyServerTransport = new LimitedNetworkTransport(
+                    readyServerInner, readyServerInner.MaxUnreliablePayloadBytes))
+                {
+                    readyServerTransport.FailOnSendNumber = 1;
+                    var events = new TraceCollector();
+                    using (var server = new NetworkServer<AuthorityWorld>(
+                        serverSchema, static (_, _) => true, observer: events))
+                    using (var client = new NetworkClient<ClientAWorld>(
+                        readyClientTransport, clientSchema))
+                    {
+                        server.AddConnection(readyServerTransport, 2, 2,
+                            new ScopeId(1));
+                        client.BeginHandshake();
+                        server.Receive();
+                        client.Process();
+
+                        var ready = events.Single(NetworkPhase.Send,
+                            NetworkPacketKind.Ready);
+                        Assert.That(ready.Result,
+                            Is.EqualTo(NetworkResultCategory.Transport));
+                        Assert.That(ready.ActiveConnections, Is.EqualTo(1));
+                        Assert.That(ready.ActivePeers, Is.EqualTo(1));
+                        var disconnect = events.Single(NetworkPhase.Send,
+                            NetworkPacketKind.Disconnect);
+                        Assert.That(disconnect.ActiveConnections, Is.Zero);
+                        Assert.That(disconnect.ActivePeers, Is.Zero);
+                        Assert.That(server.ConnectionCount, Is.Zero);
+                        Assert.That(client.Session.State,
+                            Is.EqualTo(NetworkSessionState.Closed));
+                    }
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ServerDiagnosticsCountersRemainIdempotentThroughObserverFailureAndDisposal()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var serverSchema = Schema<AuthorityWorld>(true);
+                var clientSchema = Schema<ClientAWorld>(false);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(903),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    var events = new TraceCollector();
+                    var order = new List<string>();
+                    var peerObserver = new ThrowingPeerObserver(order);
+                    using (var server = new NetworkServer<AuthorityWorld>(
+                        serverSchema, static (_, _) => true, observer: events,
+                        peerObserver: peerObserver))
+                    using (var client = new NetworkClient<ClientAWorld>(
+                        clientTransport, clientSchema))
+                    {
+                        server.AddConnection(serverTransport, 3, 3,
+                            new ScopeId(1));
+                        client.BeginHandshake();
+                        server.Receive();
+                        client.Process();
+
+                        Assert.That(order, Is.EqualTo(new[]
+                        {
+                            "admitted", "disconnected"
+                        }));
+                        var disconnect = events.Single(NetworkPhase.Send,
+                            NetworkPacketKind.Disconnect);
+                        Assert.That(disconnect.ActiveConnections, Is.EqualTo(1));
+                        Assert.That(disconnect.ActivePeers, Is.EqualTo(1));
+                        Assert.That(server.ConnectionCount, Is.Zero);
+                        Assert.That(server.RemoveConnection(new ConnectionId(903)),
+                            Is.False);
+                        Assert.That(server.RemoveConnection(new ConnectionId(903)),
+                            Is.False);
+
+                        events.Events.Clear();
+                        MemoryNetworkTransport.CreatePair(new ConnectionId(904),
+                            out var retryClientTransport, out var retryServerTransport);
+                        using (retryClientTransport)
+                        using (retryServerTransport)
+                        using (var retryClient = new NetworkClient<ClientAWorld>(
+                            retryClientTransport, clientSchema))
+                        {
+                            server.AddConnection(retryServerTransport, 4, 4,
+                                new ScopeId(1));
+                            retryClient.BeginHandshake();
+                            server.Receive();
+                            retryClient.Process();
+
+                            var ready = events.Single(NetworkPhase.Send,
+                                NetworkPacketKind.Ready);
+                            Assert.That(ready.ActiveConnections, Is.EqualTo(1));
+                            Assert.That(ready.ActivePeers, Is.EqualTo(1));
+                            Assert.That(server.ConnectionCount, Is.Zero);
+                        }
+                        Assert.That(order, Is.EqualTo(new[]
+                        {
+                            "admitted", "disconnected", "admitted", "disconnected"
+                        }));
+                    }
+                }
+
+                MemoryNetworkTransport.CreatePair(new ConnectionId(905),
+                    out var disposeClientTransport, out var disposeServerTransport);
+                using (disposeClientTransport)
+                using (disposeServerTransport)
+                {
+                    var peerObserver = new TestPeerObserver();
+                    using (var server = new NetworkServer<AuthorityWorld>(
+                        serverSchema, static (_, _) => true,
+                        peerObserver: peerObserver))
+                    using (var client = new NetworkClient<ClientAWorld>(
+                        disposeClientTransport, clientSchema))
+                    {
+                        server.AddConnection(disposeServerTransport, 5, 5,
+                            new ScopeId(1));
+                        client.BeginHandshake();
+                        server.Receive();
+                        client.Process();
+                        Assert.That(server.ConnectionCount, Is.EqualTo(1));
+
+                        server.Dispose();
+                        server.Dispose();
+                        Assert.That(server.ConnectionCount, Is.Zero);
+                        Assert.That(peerObserver.DisconnectedPeers.Count,
+                            Is.EqualTo(1));
+                    }
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
         public void PacketValidationIsStateEpochAndStrictSequenceBound()
         {
             var schema = NetworkCompilerSupport.Create<TestWorld>().Freeze();

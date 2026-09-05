@@ -24,6 +24,8 @@ namespace UniGame.StaticEcs.Network
         private readonly Dictionary<ScopeId, NetworkSnapshot> _captures =
             new Dictionary<ScopeId, NetworkSnapshot>();
         private uint _activeTick;
+        private int _activeConnectionCount;
+        private int _activePeerCount;
         private bool _disposed;
 
         /// <summary>Gets the latest authoritative tick completed by this server.</summary>
@@ -92,6 +94,8 @@ namespace UniGame.StaticEcs.Network
                 NetworkRole.Server, _schema, _bufferPool, observer ?? _observer);
             var peer = new Peer(transport, session, peerId, epoch, scope);
             _peers.Add(peer);
+            peer.ConnectionCounted = true;
+            _activeConnectionCount++;
             session.ReportSession(ServerTick, 0, 0, peer.PacketSequence);
             return session;
         }
@@ -467,7 +471,7 @@ namespace UniGame.StaticEcs.Network
                 contentFingerprint != _contentFingerprint)
             {
                 Send(peer, PacketKind.Disconnect, 0, PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
-                peer.Session.Close();
+                CloseSession(peer);
                 return false;
             }
 
@@ -485,14 +489,21 @@ namespace UniGame.StaticEcs.Network
                         TraceAdmissionFailure(peer, rejection);
                         TryRollbackAdmission(in data);
                         Send(peer, PacketKind.Disconnect, 0, PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
-                        peer.Session.Close();
+                        CloseSession(peer);
                         return false;
                     }
                 }
 
-                if (peer.Session.Admit(remoteFingerprint, peer.PeerId, peer.Epoch, peer.Scope) !=
-                    NetworkAdmissionResult.Accepted)
+                var admission = peer.Session.Admit(remoteFingerprint,
+                    peer.PeerId, peer.Epoch, peer.Scope);
+                if (admission != NetworkAdmissionResult.Accepted)
+                {
+                    if (peer.Session.State == NetworkSessionState.Rejected)
+                        CloseSession(peer);
                     throw new InvalidOperationException("Session rejected a validated peer admission.");
+                }
+                peer.PeerCounted = true;
+                _activePeerCount++;
 
                 _coordinator.Add(peer.Session);
                 Span<byte> payload = stackalloc byte[12];
@@ -505,7 +516,7 @@ namespace UniGame.StaticEcs.Network
             {
                 TraceAdmissionFailure(peer, NetworkAdmissionRejection.PolicyError);
                 _coordinator.Remove(peer.Transport.Connection);
-                peer.Session.Close();
+                CloseSession(peer);
                 if (policyInvoked)
                     TryRollbackAdmission(in data);
                 Send(peer, PacketKind.Disconnect, 0, PacketHeader.NoneTick, ReadOnlySpan<byte>.Empty);
@@ -986,8 +997,8 @@ namespace UniGame.StaticEcs.Network
             return sent;
         }
 
-        private int ActiveConnectionCount { get { var count = 0; for (var i = 0; i < _peers.Count; i++) if (_peers[i].Session.State == NetworkSessionState.Handshaking || _peers[i].Session.State == NetworkSessionState.Established) count++; return count; } }
-        private int ActivePeerCount { get { var count = 0; for (var i = 0; i < _peers.Count; i++) if (_peers[i].Session.State == NetworkSessionState.Established) count++; return count; } }
+        private int ActiveConnectionCount => _activeConnectionCount;
+        private int ActivePeerCount => _activePeerCount;
 
         private void TraceDispatch(uint serverTick, NetworkDispatchSummary summary, long durationNanoseconds)
         {
@@ -1010,9 +1021,24 @@ namespace UniGame.StaticEcs.Network
             CleanupPeer(peer);
         }
 
-        private void ClosePeer(Peer peer)
+        private void CloseSession(Peer peer)
         {
             peer.Session.Close();
+            if (peer.PeerCounted)
+            {
+                peer.PeerCounted = false;
+                _activePeerCount--;
+            }
+            if (peer.ConnectionCounted)
+            {
+                peer.ConnectionCounted = false;
+                _activeConnectionCount--;
+            }
+        }
+
+        private void ClosePeer(Peer peer)
+        {
+            CloseSession(peer);
             if (peer.AdmissionNotified && !peer.DisconnectNotified)
             {
                 peer.DisconnectNotified = true;
@@ -1092,6 +1118,8 @@ namespace UniGame.StaticEcs.Network
             internal bool ResyncRequested;
             internal uint ResyncCorrelationId;
             internal uint ResyncSnapshotTick;
+            internal bool ConnectionCounted;
+            internal bool PeerCounted;
             internal bool AdmissionNotified;
             internal bool DisconnectNotified;
             internal uint LastReceivedPacketSequence =>
