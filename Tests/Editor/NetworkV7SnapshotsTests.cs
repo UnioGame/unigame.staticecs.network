@@ -1151,9 +1151,9 @@ namespace UniGame.StaticEcs.Network.Tests
                         Is.EqualTo(SnapshotPayloadKind.Keyframe));
 
                     SendPeerPacket(mock.ClientA, schema.Fingerprint,
-                        PacketKind.Ack, 1, 2, 1);
+                        PacketKind.Ack, 11, 2, 1);
                     SendPeerPacket(mock.ClientB, schema.Fingerprint,
-                        PacketKind.Ack, 1, 2, 1);
+                        PacketKind.Ack, 22, 2, 1);
                     server.Receive();
 
                     first.Set(new TestComponent { Value = 2 });
@@ -1187,7 +1187,7 @@ namespace UniGame.StaticEcs.Network.Tests
                         targetTwo);
 
                     SendPeerPacket(mock.ClientA, schema.Fingerprint,
-                        PacketKind.Ack, 1, 3, 2);
+                        PacketKind.Ack, 11, 3, 2);
                     server.Receive();
                     first.Set(new TestComponent { Value = 3 });
                     var beforeDifferent = pool.CaptureDiagnostics().PoolMisses;
@@ -1259,12 +1259,14 @@ namespace UniGame.StaticEcs.Network.Tests
 
                     var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
                     entity.Set(new TestComponent { Value = 1 });
+                    var unchanged = World<AuthorityWorld>.NewEntity<SecondEntity>();
+                    unchanged.Set(new TestComponent { Value = 10 });
                     server.Tick(_ => { });
                     Assert.That(ReceiveChunk(clientTransport).PayloadKind,
                         Is.EqualTo(SnapshotPayloadKind.Keyframe));
 
                     SendPeerPacket(clientTransport, schema.Fingerprint,
-                        PacketKind.Ack, 1, 2, 1);
+                        PacketKind.Ack, 31, 2, 1);
                     server.Receive();
                     entity.Set(new TestComponent { Value = 2 });
 
