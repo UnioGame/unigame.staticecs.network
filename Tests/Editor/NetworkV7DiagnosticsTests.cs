@@ -279,6 +279,75 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void ReentrantDisconnectRemovalLeavesOtherPeersAndDisposesOnce()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var serverSchema = Schema<AuthorityWorld>(true);
+                var clientSchema = Schema<ClientAWorld>(false);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(911),
+                    out var clientATransport, out var serverATransport);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(912),
+                    out var clientBTransport, out var serverBTransport);
+                using (clientATransport)
+                using (serverATransport)
+                using (clientBTransport)
+                using (serverBTransport)
+                {
+                    var peerObserver = new ReentrantRemovalPeerObserver(
+                        new ConnectionId(911));
+                    using (var server = new NetworkServer<AuthorityWorld>(
+                        serverSchema, static (_, _) => true,
+                        peerObserver: peerObserver))
+                    using (var clientA = new NetworkClient<ClientAWorld>(
+                        clientATransport, clientSchema))
+                    using (var clientB = new NetworkClient<ClientAWorld>(
+                        clientBTransport, clientSchema))
+                    {
+                        peerObserver.Server = server;
+                        server.AddConnection(serverATransport, 1, 1,
+                            new ScopeId(1));
+                        server.AddConnection(serverBTransport, 2, 2,
+                            new ScopeId(1));
+                        clientA.BeginHandshake();
+                        clientB.BeginHandshake();
+                        server.Receive();
+                        clientA.Process();
+                        clientB.Process();
+
+                        Assert.That(server.ConnectionCount, Is.EqualTo(2));
+                        Assert.That(server.RemoveConnection(new ConnectionId(911)),
+                            Is.True);
+                        Assert.That(peerObserver.ReentrantRemovalResult,
+                            Is.False);
+                        Assert.That(server.ConnectionCount, Is.EqualTo(1));
+                        Assert.That(server.RemoveConnection(new ConnectionId(911)),
+                            Is.False);
+                        Assert.That(peerObserver.DisconnectedPeers.Count,
+                            Is.EqualTo(1));
+
+                        server.Dispose();
+                        server.Dispose();
+                        Assert.That(server.ConnectionCount, Is.Zero);
+                        Assert.That(peerObserver.DisconnectedPeers.Count,
+                            Is.EqualTo(2));
+                        Assert.That(peerObserver.DisconnectedPeers[0].PeerId,
+                            Is.EqualTo(1));
+                        Assert.That(peerObserver.DisconnectedPeers[1].PeerId,
+                            Is.EqualTo(2));
+                    }
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
         public void PacketValidationIsStateEpochAndStrictSequenceBound()
         {
             var schema = NetworkCompilerSupport.Create<TestWorld>().Freeze();
@@ -470,6 +539,30 @@ namespace UniGame.StaticEcs.Network.Tests
                 pool.Dispose();
                 World<AuthorityWorld>.Destroy();
                 World<ClientAWorld>.Destroy();
+            }
+        }
+
+        private sealed class ReentrantRemovalPeerObserver : INetworkPeerObserver
+        {
+            private readonly ConnectionId _connection;
+            internal NetworkServer<AuthorityWorld> Server;
+            internal readonly List<NetworkPeerData> DisconnectedPeers =
+                new List<NetworkPeerData>();
+            internal bool ReentrantRemovalResult { get; private set; }
+
+            internal ReentrantRemovalPeerObserver(ConnectionId connection)
+            {
+                _connection = connection;
+            }
+
+            public void Admitted(in NetworkPeerData peer)
+            {
+            }
+
+            public void Disconnected(in NetworkPeerData peer)
+            {
+                DisconnectedPeers.Add(peer);
+                ReentrantRemovalResult = Server.RemoveConnection(_connection);
             }
         }
 

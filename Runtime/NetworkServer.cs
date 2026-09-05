@@ -69,8 +69,8 @@ namespace UniGame.StaticEcs.Network
             if (_disposed)
                 return;
             _disposed = true;
-            for (var i = _peers.Count - 1; i >= 0; i--)
-                CleanupPeer(_peers[i]);
+            while (_peers.Count > 0)
+                CleanupPeer(_peers[_peers.Count - 1]);
             _peers.Clear();
             _coordinator.Clear();
             _replicator.Dispose();
@@ -107,7 +107,6 @@ namespace UniGame.StaticEcs.Network
             {
                 if (_peers[i].Transport.Connection != connection) continue;
                 CleanupPeer(_peers[i]);
-                _peers.RemoveAt(i);
                 return true;
             }
             return false;
@@ -135,8 +134,10 @@ namespace UniGame.StaticEcs.Network
                     }
                     if (!remove)
                         continue;
-                    _peers.RemoveAt(i);
-                    i--;
+                    var removedIndex = _peers.IndexOf(peer);
+                    if (removedIndex >= 0)
+                        _peers.RemoveAt(removedIndex);
+                    i = removedIndex >= 0 ? removedIndex - 1 : -1;
                     break;
                 }
             }
@@ -1038,6 +1039,7 @@ namespace UniGame.StaticEcs.Network
 
         private void ClosePeer(Peer peer)
         {
+            _peers.Remove(peer);
             CloseSession(peer);
             if (peer.AdmissionNotified && !peer.DisconnectNotified)
             {
