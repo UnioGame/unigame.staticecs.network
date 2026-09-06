@@ -379,6 +379,7 @@ namespace UniGame.StaticEcs.Network
                              preview.PayloadKind != SnapshotPayloadKind.Keyframe) ||
                             (preview.PayloadKind == SnapshotPayloadKind.Keyframe &&
                              _resyncCorrelationId != 0 &&
+                             resyncCorrelationId != 0 &&
                              resyncCorrelationId != _resyncCorrelationId)))
                         {
                             RequestDisconnect(NetworkRecoveryReason.ProtocolIncompatible);
@@ -1019,13 +1020,17 @@ namespace UniGame.StaticEcs.Network
             ServerProcessedCommandTick = header.ServerProcessedCommandTick;
             ServerProcessedCommandSequence = header.ServerProcessedCommandSequence;
             _session.ReportSnapshot(staged.Snapshot, History);
+            var completesRecovery =
+                payloadKind == SnapshotPayloadKind.Keyframe &&
+                (_resyncCorrelationId == 0 ||
+                 resyncCorrelationId == _resyncCorrelationId);
             var acknowledged = Send(PacketKind.Ack, _session.Epoch,
                 PacketHeader.NoneTick, AcknowledgedSnapshotTick,
                 ReadOnlySpan<byte>.Empty,
                 resyncCorrelationId: payloadKind == SnapshotPayloadKind.Keyframe
-                    ? _resyncCorrelationId
+                    ? resyncCorrelationId
                     : 0);
-            if (payloadKind == SnapshotPayloadKind.Keyframe)
+            if (completesRecovery)
             {
                 RequestRecovery(NetworkRecoveryPhase.None,
                     NetworkRecoveryReason.None, staged.ServerTick);
