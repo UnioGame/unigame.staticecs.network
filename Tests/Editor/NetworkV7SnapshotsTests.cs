@@ -482,7 +482,7 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
-        public void RepeatedLocalResyncKeepsCorrelationUntilKeyframeAck()
+        public void InFlightUncorrelatedKeyframeDoesNotCompleteCorrelatedRecovery()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
             CreateReplicationWorld<ClientAWorld>(false);
@@ -500,8 +500,9 @@ namespace UniGame.StaticEcs.Network.Tests
                 server = new NetworkServer<AuthorityWorld>(
                     Schema<AuthorityWorld>(true), static (_, _) => true,
                     bufferPool: pool);
+                var clientSchema = Schema<ClientAWorld>(false);
                 client = new NetworkClient<ClientAWorld>(simulator.Client,
-                    Schema<ClientAWorld>(false), new ScopeId(1), observer,
+                    clientSchema, new ScopeId(1), observer,
                     bufferPool: pool);
                 var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
                 entity.Set(new TestComponent { Value = 1 });
@@ -513,56 +514,90 @@ namespace UniGame.StaticEcs.Network.Tests
                 server.Tick(_ => { });
                 simulator.Advance(0);
                 client.Process();
-                simulator.Advance(0);
-                server.Receive();
                 Assert.That(client.Session.State,
                     Is.EqualTo(NetworkSessionState.Established));
 
+                entity.Set(new TestComponent { Value = 2 });
                 observer.Events.Clear();
+                server.Tick(_ => { });
+                var inFlightKeyframeTick = server.ServerTick;
+                simulator.Advance(0);
                 client.RequestFullResync(
                     NetworkRecoveryReason.PredictionHistoryUnavailable);
+                var correlationId = observer.Single(NetworkPhase.Send,
+                    NetworkPacketKind.ResyncRequest).ResyncCorrelationId;
+                Assert.That(correlationId, Is.Not.Zero);
+                client.Process();
+
+                Assert.That(client.Session.State,
+                    Is.EqualTo(NetworkSessionState.Established));
+                Assert.That(client.AcknowledgedSnapshotTick,
+                    Is.EqualTo(inFlightKeyframeTick));
+                Assert.That(ReadReplicaValue(), Is.EqualTo(2));
+                Assert.That(client.TryConsumeRecoveryTransition(
+                    out var recovery), Is.True);
+                Assert.That(recovery.Phase,
+                    Is.EqualTo(NetworkRecoveryPhase.AwaitingKeyframe));
+                Assert.That(observer.Single(NetworkPhase.Send,
+                        NetworkPacketKind.Ack).ResyncCorrelationId,
+                    Is.Zero);
+
+                observer.Events.Clear();
+                client.RequestFullResync(NetworkRecoveryReason.SnapshotRejected);
+                Assert.That(observer.Single(NetworkPhase.Send,
+                        NetworkPacketKind.ResyncRequest).ResyncCorrelationId,
+                    Is.EqualTo(correlationId));
                 simulator.Advance(0);
                 server.Receive();
-                client.RequestFullResync(NetworkRecoveryReason.SnapshotRejected);
 
-                uint firstCorrelation = 0;
-                uint secondCorrelation = 0;
-                var requestCount = 0;
-                for (var index = 0; index < observer.Events.Count; index++)
-                {
-                    var value = observer.Events[index];
-                    if (value.Phase != NetworkPhase.Send ||
-                        value.PacketKind != NetworkPacketKind.ResyncRequest)
-                        continue;
-                    if (requestCount++ == 0)
-                        firstCorrelation = value.ResyncCorrelationId;
-                    else
-                        secondCorrelation = value.ResyncCorrelationId;
-                }
-                Assert.That(requestCount, Is.EqualTo(2));
-                Assert.That(firstCorrelation, Is.Not.Zero);
-                Assert.That(secondCorrelation, Is.EqualTo(firstCorrelation));
-
-                entity.Set(new TestComponent { Value = 2 });
+                entity.Set(new TestComponent { Value = 3 });
                 server.Tick(_ => { });
                 var keyframeTick = server.ServerTick;
                 simulator.Advance(0);
                 client.Process();
-                simulator.Advance(0);
-                server.Receive();
 
                 Assert.That(client.AcknowledgedSnapshotTick,
                     Is.EqualTo(keyframeTick));
+                Assert.That(ReadReplicaValue(), Is.EqualTo(3));
                 Assert.That(client.Session.State,
                     Is.EqualTo(NetworkSessionState.Established));
-                Assert.That(server.ConnectionCount, Is.EqualTo(1));
+                Assert.That(client.TryConsumeRecoveryTransition(out recovery),
+                    Is.True);
+                Assert.That(recovery.Phase,
+                    Is.EqualTo(NetworkRecoveryPhase.None));
                 Assert.That(observer.Single(NetworkPhase.Send,
                         NetworkPacketKind.Ack).ResyncCorrelationId,
-                    Is.EqualTo(firstCorrelation));
-                var stats = simulator.CaptureStats();
-                Assert.That(stats.ClientToServer.QueuedPackets, Is.Zero);
-                Assert.That(stats.ServerToClient.QueuedPackets, Is.Zero);
-                Assert.That(stats.ReplayErrors, Is.Zero);
+                    Is.EqualTo(correlationId));
+                simulator.Advance(0);
+                server.Receive();
+
+                observer.Events.Clear();
+                client.RequestFullResync(NetworkRecoveryReason.SnapshotRejected);
+                var conflictingCorrelation = observer.Single(NetworkPhase.Send,
+                    NetworkPacketKind.ResyncRequest).ResyncCorrelationId;
+                simulator.Advance(0);
+                server.Receive();
+                entity.Set(new TestComponent { Value = 4 });
+                server.Tick(_ => { });
+                simulator.Advance(0);
+                var conflictChunk = ReceiveSnapshotChunk(simulator.Client,
+                    out var conflictPacket, out var conflictBody);
+                Assert.That(conflictChunk.ResyncCorrelationId,
+                    Is.EqualTo(conflictingCorrelation));
+                conflictChunk.ResyncCorrelationId = conflictingCorrelation + 1;
+                SendSnapshotChunk(simulator.Server, clientSchema.Fingerprint,
+                    conflictPacket.PacketSequence, conflictChunk, conflictBody);
+                simulator.Advance(0);
+                client.Process();
+
+                Assert.That(client.Session.State,
+                    Is.EqualTo(NetworkSessionState.Closed));
+                Assert.That(client.TryConsumeRecoveryTransition(out recovery),
+                    Is.True);
+                Assert.That(recovery.Phase,
+                    Is.EqualTo(NetworkRecoveryPhase.DisconnectRequired));
+                Assert.That(recovery.Reason,
+                    Is.EqualTo(NetworkRecoveryReason.ProtocolIncompatible));
             }
             finally
             {
