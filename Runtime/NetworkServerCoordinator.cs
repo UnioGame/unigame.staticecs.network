@@ -98,7 +98,6 @@ namespace UniGame.StaticEcs.Network
             if (count >= _maxPendingCommandsPerPeer ||
                 envelope.ExactLength > _maxPendingBytesPerPeer - bytes)
                 return NetworkCommandResult.LimitExceeded;
-            using var commandScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.Command);
             var result = session.Validate(envelope, serverTick, pastWindow, futureWindow, out var entry);
             if (result == NetworkCommandResult.Queued)
             {
