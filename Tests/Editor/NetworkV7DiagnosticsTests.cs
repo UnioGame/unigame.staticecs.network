@@ -542,6 +542,67 @@ namespace UniGame.StaticEcs.Network.Tests
             }
         }
 
+        [Test]
+        public void DiagnosticScopeBindsOneImmutableSinkAcrossReplacement()
+        {
+            var original = NetworkDiagnosticMarkers.Sink;
+            var first = new RecordingMarkerSink();
+            var second = new RecordingMarkerSink();
+            try
+            {
+                NetworkDiagnosticMarkers.Sink = first;
+                using (NetworkDiagnosticMarkers.Measure(
+                           NetworkDiagnosticPhase.Command))
+                {
+                    NetworkDiagnosticMarkers.Sink = second;
+                }
+
+                Assert.That(first.Begins, Is.EqualTo(1));
+                Assert.That(first.Ends, Is.EqualTo(1));
+                Assert.That(second.Begins, Is.Zero);
+                Assert.That(second.Ends, Is.Zero);
+                Assert.That(NetworkDiagnosticMarkers.Sink,
+                    Is.SameAs(second));
+            }
+            finally
+            {
+                NetworkDiagnosticMarkers.Sink = original;
+            }
+        }
+
+        [Test]
+        public void DiagnosticScopeSkipsEndWhenNoSinkWasBoundAtBegin()
+        {
+            var original = NetworkDiagnosticMarkers.Sink;
+            var installed = new RecordingMarkerSink();
+            try
+            {
+                NetworkDiagnosticMarkers.Sink = null;
+                using (NetworkDiagnosticMarkers.Measure(
+                           NetworkDiagnosticPhase.OwnerLookup))
+                {
+                    NetworkDiagnosticMarkers.Sink = installed;
+                }
+
+                Assert.That(installed.Begins, Is.Zero);
+                Assert.That(installed.Ends, Is.Zero);
+            }
+            finally
+            {
+                NetworkDiagnosticMarkers.Sink = original;
+            }
+        }
+
+        private sealed class RecordingMarkerSink : INetworkDiagnosticMarkerSink
+        {
+            internal int Begins { get; private set; }
+            internal int Ends { get; private set; }
+
+            public void Begin(NetworkDiagnosticPhase phase) => Begins++;
+
+            public void End(NetworkDiagnosticPhase phase) => Ends++;
+        }
+
         private sealed class ReentrantRemovalPeerObserver : INetworkPeerObserver
         {
             private readonly ConnectionId _connection;

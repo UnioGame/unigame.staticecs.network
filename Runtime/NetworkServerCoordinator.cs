@@ -303,20 +303,27 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Creates one allocation-free scope that ends when disposed.</summary>
         public static Scope Measure(NetworkDiagnosticPhase phase) => new Scope(phase);
 
-        /// <summary>Value-type diagnostic scope with no heap allocation.</summary>
+        /// <summary>Value-type diagnostic scope that binds one immutable sink for its whole lifetime.</summary>
         public readonly struct Scope : System.IDisposable
         {
+            private readonly INetworkDiagnosticMarkerSink _sink;
             private readonly NetworkDiagnosticPhase _phase;
 
-            /// <summary>Begins the supplied phase immediately.</summary>
+            /// <summary>Captures the current sink and begins the supplied phase immediately.</summary>
             public Scope(NetworkDiagnosticPhase phase)
             {
                 _phase = phase;
-                Begin(phase);
+                _sink = Sink;
+                if (_sink != null)
+                    _sink.Begin(phase);
             }
 
             /// <inheritdoc />
-            public void Dispose() => End(_phase);
+            public void Dispose()
+            {
+                if (_sink != null)
+                    _sink.End(_phase);
+            }
         }
     }
 }

@@ -201,6 +201,7 @@ namespace UniGame.StaticEcs.Network
                     // counted until their receipt is actually accepted by transport.
                     if (peer.HasPendingReceiptWork)
                         continue;
+                    using var snapshotScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.Snapshot);
                     if (!_captures.TryGetValue(peer.Scope, out var capture))
                     {
                         var started = Stopwatch.GetTimestamp();
@@ -564,6 +565,7 @@ namespace UniGame.StaticEcs.Network
             NetworkBufferLease packet,
             ReadOnlyMemory<byte> payload, uint serverTick)
         {
+            using var commandScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.Command);
             if (payload.Length < 1)
                 return NetworkCommandResult.Malformed;
 
@@ -687,7 +689,6 @@ namespace UniGame.StaticEcs.Network
 
         private void SendSnapshot(Peer peer, NetworkSnapshot snapshot)
         {
-            using var snapshotScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.Snapshot);
             NetworkBufferLease delta = null;
             var baselineTick = peer.AcknowledgedSnapshotTick;
             NetworkSnapshot baseline = null;
@@ -862,6 +863,7 @@ namespace UniGame.StaticEcs.Network
             NetworkBufferLease packet, ReadOnlyMemory<byte> payload,
             uint applicationTick, bool duplicatePacket = false)
         {
+            using var commandScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.Command);
             if (packet.Length > peer.Transport.MaxReliablePayloadBytes)
                 return NetworkCommandResult.LimitExceeded;
             if (!NetworkTransactionWire.TryReadCommand(payload.Span,
@@ -920,6 +922,7 @@ namespace UniGame.StaticEcs.Network
 
         private static void DispatchTransactions(Peer peer)
         {
+            using var commandScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.Command);
             foreach (var transaction in peer.Transactions.Values)
             {
                 if (transaction.Dispatched || transaction.ReceiptSent)
