@@ -687,6 +687,7 @@ namespace UniGame.StaticEcs.Network
 
         private void SendSnapshot(Peer peer, NetworkSnapshot snapshot)
         {
+            using var snapshotScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.Snapshot);
             NetworkBufferLease delta = null;
             var baselineTick = peer.AcknowledgedSnapshotTick;
             NetworkSnapshot baseline = null;
@@ -820,6 +821,7 @@ namespace UniGame.StaticEcs.Network
         private bool SendSnapshotChunk(Peer peer, uint serverTick,
             uint sequence, ReadOnlySpan<byte> payload)
         {
+            using var packetScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.PacketPreparation);
             var started = Stopwatch.GetTimestamp();
             var header = new PacketHeader
             {

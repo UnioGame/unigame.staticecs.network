@@ -98,6 +98,7 @@ namespace UniGame.StaticEcs.Network
             if (count >= _maxPendingCommandsPerPeer ||
                 envelope.ExactLength > _maxPendingBytesPerPeer - bytes)
                 return NetworkCommandResult.LimitExceeded;
+            using var commandScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.Command);
             var result = session.Validate(envelope, serverTick, pastWindow, futureWindow, out var entry);
             if (result == NetworkCommandResult.Queued)
             {
@@ -116,6 +117,7 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Dispatches queued commands ordered by target tick, trusted peer, then sequence.</summary>
         internal NetworkDispatchSummary Dispatch(uint serverTick)
         {
+            using var commandScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.Command);
             _commands.Sort((a, b) => { var tick = a.Envelope.TargetTick.CompareTo(b.Envelope.TargetTick); if (tick != 0) return tick; var peer = a.Envelope.PeerId.CompareTo(b.Envelope.PeerId); return peer != 0 ? peer : a.Envelope.Sequence.CompareTo(b.Envelope.Sequence); });
             var summary = default(NetworkDispatchSummary);
             var consumed = 0;
@@ -244,5 +246,77 @@ namespace UniGame.StaticEcs.Network
         internal int Accepted { get; private set; }
         internal int Rejected { get; private set; }
         internal void Add(NetworkCommandResult result) { Total++; if (result == NetworkCommandResult.Dispatched) Accepted++; else if (result == NetworkCommandResult.PolicyRejected) Rejected++; }
+    }
+
+    /// <summary>Names the server work phases that the load profiler measures separately.</summary>
+    public enum NetworkDiagnosticPhase
+    {
+        /// <summary>Command decode, validation, ordering, and apply work.</summary>
+        Command = 0,
+        /// <summary>Owner-to-player resolution used by command apply.</summary>
+        OwnerLookup = 1,
+        /// <summary>Authoritative snapshot capture and delta selection.</summary>
+        Snapshot = 2,
+        /// <summary>Per-peer packet and payload preparation before sending.</summary>
+        PacketPreparation = 3,
+        /// <summary>Adapter reliable queue drain and acknowledgement promotion.</summary>
+        ReliableDrain = 4,
+        /// <summary>Transport-native poll, update, and flush boundary.</summary>
+        NativeUpdate = 5,
+        /// <summary>Inbound transport receive callback processing.</summary>
+        ReceiveCallback = 6,
+        /// <summary>Number of measured phases; not a valid phase value.</summary>
+        Count = 7,
+    }
+
+    /// <summary>Receives allocation-free begin/end notifications for measured server phases.</summary>
+    public interface INetworkDiagnosticMarkerSink
+    {
+        /// <summary>Begins one named phase scope.</summary>
+        void Begin(NetworkDiagnosticPhase phase);
+        /// <summary>Ends one named phase scope.</summary>
+        void End(NetworkDiagnosticPhase phase);
+    }
+
+    /// <summary>Dispatches measured phase scopes to an optional engine-owned marker sink.</summary>
+    public static class NetworkDiagnosticMarkers
+    {
+        /// <summary>Engine-owned sink installed by the profiler layer; null disables emission.</summary>
+        public static INetworkDiagnosticMarkerSink Sink;
+
+        /// <summary>Begins one phase on the installed sink when present.</summary>
+        public static void Begin(NetworkDiagnosticPhase phase)
+        {
+            var sink = Sink;
+            if (sink != null)
+                sink.Begin(phase);
+        }
+
+        /// <summary>Ends one phase on the installed sink when present.</summary>
+        public static void End(NetworkDiagnosticPhase phase)
+        {
+            var sink = Sink;
+            if (sink != null)
+                sink.End(phase);
+        }
+
+        /// <summary>Creates one allocation-free scope that ends when disposed.</summary>
+        public static Scope Measure(NetworkDiagnosticPhase phase) => new Scope(phase);
+
+        /// <summary>Value-type diagnostic scope with no heap allocation.</summary>
+        public readonly struct Scope : System.IDisposable
+        {
+            private readonly NetworkDiagnosticPhase _phase;
+
+            /// <summary>Begins the supplied phase immediately.</summary>
+            public Scope(NetworkDiagnosticPhase phase)
+            {
+                _phase = phase;
+                Begin(phase);
+            }
+
+            /// <inheritdoc />
+            public void Dispose() => End(_phase);
+        }
     }
 }
