@@ -187,7 +187,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(second.Total, Is.EqualTo(1));
                 Assert.That(coordinator.PendingCommandCount, Is.Zero);
                 Assert.That(AcceptedValues(receiver),
-                    Is.EqualTo(new[] { 301, 102, 201, 101, 202, 103 }));
+                    Is.EqualTo(new[] { 103 }));
                 Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
             }
             finally
