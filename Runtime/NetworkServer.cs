@@ -739,42 +739,27 @@ namespace UniGame.StaticEcs.Network
                 var bodyOffset = checked((int)((long)chunkIndex *
                                                maxBody));
                 var bodyLength = Math.Min(maxBody, body.Length - bodyOffset);
-                var payload = _bufferPool.Rent(checked(
-                    SnapshotChunkHeader.Size + bodyLength));
-                try
+                var chunk = new SnapshotChunkHeader
                 {
-                    var chunk = new SnapshotChunkHeader
-                    {
-                        PayloadKind = keyframe
-                            ? SnapshotPayloadKind.Keyframe
-                            : SnapshotPayloadKind.Delta,
-                        SnapshotTick = snapshot.ServerTick,
-                        BaselineTick = keyframe ? 0 : baselineTick,
-                        TotalLength = checked((uint)snapshot.ByteLength),
-                        TotalHash = snapshot.PayloadHash,
-                        ChunkIndex = chunkIndex,
-                        ChunkCount = chunkCount,
-                        ResyncCorrelationId = keyframe
-                            ? peer.ResyncCorrelationId
-                            : 0
-                    };
-                    if (!chunk.TryWrite(payload.WritableSpan))
-                    {
-                        peer.ResyncRequested = true;
-                        return;
-                    }
-                    body.Slice(bodyOffset, bodyLength).CopyTo(
-                        payload.WritableSpan.Slice(SnapshotChunkHeader.Size));
-                    if (!SendSnapshotChunk(peer, snapshot.ServerTick,
-                            chunkIndex + 1, payload.Span))
-                    {
-                        peer.ResyncRequested = true;
-                        return;
-                    }
-                }
-                finally
+                    PayloadKind = keyframe
+                        ? SnapshotPayloadKind.Keyframe
+                        : SnapshotPayloadKind.Delta,
+                    SnapshotTick = snapshot.ServerTick,
+                    BaselineTick = keyframe ? 0 : baselineTick,
+                    TotalLength = checked((uint)snapshot.ByteLength),
+                    TotalHash = snapshot.PayloadHash,
+                    ChunkIndex = chunkIndex,
+                    ChunkCount = chunkCount,
+                    ResyncCorrelationId = keyframe
+                        ? peer.ResyncCorrelationId
+                        : 0
+                };
+                if (!SendSnapshotChunk(peer, snapshot.ServerTick,
+                        chunkIndex + 1, in chunk,
+                        body.Slice(bodyOffset, bodyLength)))
                 {
-                    payload.Dispose();
+                    peer.ResyncRequested = true;
+                    return;
                 }
             }
         }
@@ -820,7 +805,8 @@ namespace UniGame.StaticEcs.Network
         }
 
         private bool SendSnapshotChunk(Peer peer, uint serverTick,
-            uint sequence, ReadOnlySpan<byte> payload)
+            uint sequence, in SnapshotChunkHeader chunk,
+            ReadOnlySpan<byte> body)
         {
             using var packetScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.PacketPreparation);
             var started = Stopwatch.GetTimestamp();
@@ -839,8 +825,8 @@ namespace UniGame.StaticEcs.Network
                 SimulationFingerprint = _simulationFingerprint,
                 ContentFingerprint = _contentFingerprint
             };
-            var encoded = NetworkPacket.TryEncode(_bufferPool, header, payload,
-                out var packet);
+            var encoded = SnapshotChunkEncoder.TryEncode(_bufferPool, header,
+                in chunk, body, out var packet);
             var packetBytes = packet?.Length ?? 0;
             var sent = encoded && peer.Transport.TrySend(packet);
             peer.Session.Trace(NetworkPhase.Send, NetworkTraceKind.Point,
