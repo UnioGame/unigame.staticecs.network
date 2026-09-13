@@ -283,6 +283,11 @@ namespace UniGame.StaticEcs.Network.Tests
             NetworkBufferLease canonical = null;
             try
             {
+                for (var i = 0; i < 8; i++)
+                {
+                    var ballast = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    ballast.Set(new TestComponent { Value = 100 + i });
+                }
                 var patched = World<AuthorityWorld>.NewEntity<TestEntity>();
                 patched.Set(new TestComponent { Value = 1 });
                 patched.Set<TestTag>();
@@ -298,7 +303,12 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(SnapshotDeltaCodec.TryEncode(pool, baseline,
                     unchanged, out delta), Is.True);
                 Assert.That(delta.Length, Is.EqualTo(12));
-                Assert.That(Read32(delta.Span, 8), Is.Zero);
+                var expectedDelta = new byte[12];
+                Write32(expectedDelta, 0,
+                    checked((uint)unchanged.EntityCount));
+                Write32(expectedDelta, 4,
+                    checked((uint)unchanged.RecordCount));
+                Assert.That(delta.Span.SequenceEqual(expectedDelta), Is.True);
                 var header = DeltaHeader(baseline, unchanged);
                 Assert.That(SnapshotDeltaCodec.TryReconstruct(pool, baseline,
                     delta.Span, in header, schema.Fingerprint, scope,
@@ -377,6 +387,8 @@ namespace UniGame.StaticEcs.Network.Tests
             var leases = new List<NetworkBufferLease>();
             try
             {
+                var ballast = World<AuthorityWorld>.NewEntity<TestEntity>();
+                ballast.Set(new TestComponent { Value = 50 });
                 var first = World<AuthorityWorld>.NewEntity<TestEntity>();
                 first.Set(new TestComponent { Value = 1 });
                 first.Set<TestTag>();
@@ -479,6 +491,181 @@ namespace UniGame.StaticEcs.Network.Tests
                 pool.Dispose();
                 World<AuthorityWorld>.Destroy();
             }
+        }
+
+        [Test]
+        public void SnapshotDeltaCodec_RejectsEqualityOverflowAndMalformedCandidates()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            var content = new NetworkBufferPool(4L << 20);
+            var probe = new NetworkBufferPool(1L << 20);
+            var schema = Schema<AuthorityWorld>(true);
+            var scope = new ScopeId(29);
+            var replicator = new NetworkReplicator<AuthorityWorld>(schema,
+                static (_, _) => true, scope, bufferPool: content);
+            NetworkSnapshot emptyBaseline = null;
+            NetworkSnapshot oneBaseline = null;
+            NetworkSnapshot equalTarget = null;
+            NetworkSnapshot overflowTarget = null;
+            NetworkSnapshot malformed = null;
+            NetworkBufferLease delta = null;
+            try
+            {
+                Assert.That(replicator.Capture(1, out emptyBaseline),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(emptyBaseline.EntityCount, Is.Zero);
+                World<AuthorityWorld>.NewEntity<TestEntity>();
+                Assert.That(replicator.Capture(2, out oneBaseline),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                for (var i = 0; i < 7; i++)
+                    World<AuthorityWorld>.NewEntity<SecondEntity>();
+                Assert.That(replicator.Capture(3, out equalTarget),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(equalTarget.EntityCount, Is.EqualTo(8));
+                Assert.That(equalTarget.ByteLength, Is.EqualTo(4 + 8 * 15));
+                Assert.That(equalTarget.ByteLength, Is.EqualTo(12 + 7 * 16));
+
+                var beforeEqual = probe.CaptureDiagnostics();
+                Assert.That(SnapshotDeltaCodec.TryEncode(probe, oneBaseline,
+                    equalTarget, out delta), Is.False);
+                Assert.That(delta, Is.Null);
+                AssertRejectedCandidate(probe, in beforeEqual, 1);
+
+                for (var i = 0; i < 8; i++)
+                    World<AuthorityWorld>.NewEntity<SecondEntity>();
+                Assert.That(replicator.Capture(4, out overflowTarget),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(overflowTarget.EntityCount, Is.EqualTo(16));
+                Assert.That(overflowTarget.ByteLength,
+                    Is.EqualTo(4 + 16 * 15));
+                Assert.That(12 + 16 * 16,
+                    Is.GreaterThan(overflowTarget.ByteLength));
+
+                var beforeOverflow = probe.CaptureDiagnostics();
+                Assert.That(SnapshotDeltaCodec.TryEncode(probe, emptyBaseline,
+                    overflowTarget, out delta), Is.False);
+                Assert.That(delta, Is.Null);
+                AssertRejectedCandidate(probe, in beforeOverflow, 0);
+
+                var malformedBytes = oneBaseline.Bytes.ToArray();
+                malformed = new NetworkSnapshot(3,
+                    oneBaseline.SchemaFingerprint, oneBaseline.Scope,
+                    content.Copy(malformedBytes), oneBaseline.EntityCount,
+                    oneBaseline.RecordCount + 1);
+                var beforeMalformed = probe.CaptureDiagnostics();
+                Assert.That(SnapshotDeltaCodec.TryEncode(probe, oneBaseline,
+                    malformed, out delta), Is.False);
+                Assert.That(delta, Is.Null);
+                AssertRejectedCandidate(probe, in beforeMalformed, 0);
+
+                var disposed = new NetworkBufferPool(1024);
+                disposed.Dispose();
+                Assert.Throws<ObjectDisposedException>(() =>
+                    SnapshotDeltaCodec.TryEncode(disposed, oneBaseline,
+                        equalTarget, out delta));
+                Assert.That(delta, Is.Null);
+            }
+            finally
+            {
+                delta?.Dispose();
+                malformed?.Dispose();
+                overflowTarget?.Dispose();
+                equalTarget?.Dispose();
+                oneBaseline?.Dispose();
+                emptyBaseline?.Dispose();
+                replicator.Dispose();
+                Assert.That(content.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+                Assert.That(probe.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+                content.Dispose();
+                probe.Dispose();
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void SnapshotDeltaCodec_ReusesCandidateCapacityAcrossRepeatedEncodes()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            var content = new NetworkBufferPool(4L << 20);
+            var probe = new NetworkBufferPool(1L << 20);
+            var schema = Schema<AuthorityWorld>(true);
+            var scope = new ScopeId(31);
+            var replicator = new NetworkReplicator<AuthorityWorld>(schema,
+                static (_, _) => true, scope, bufferPool: content);
+            NetworkSnapshot baseline = null;
+            NetworkSnapshot target = null;
+            NetworkBufferLease delta = null;
+            try
+            {
+                var first = default(World<AuthorityWorld>.Entity);
+                for (var i = 0; i < 10; i++)
+                {
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = i });
+                    if (i == 0)
+                        first = entity;
+                }
+                Assert.That(replicator.Capture(1, out baseline),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                first.Set(new TestComponent { Value = 100 });
+                Assert.That(replicator.Capture(2, out target),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(target.ByteLength, Is.GreaterThan(256));
+
+                var before = probe.CaptureDiagnostics();
+                for (var i = 0; i < 3; i++)
+                {
+                    Assert.That(SnapshotDeltaCodec.TryEncode(probe, baseline,
+                        target, out delta), Is.True);
+                    Assert.That(delta.Length, Is.LessThan(target.ByteLength));
+                    delta.Dispose();
+                    delta = null;
+                }
+                var after = probe.CaptureDiagnostics();
+                Assert.That(after.OutstandingLeases, Is.Zero);
+                Assert.That(after.OutstandingBytes, Is.Zero);
+                Assert.That(after.PoolMisses - before.PoolMisses,
+                    Is.EqualTo(1));
+                Assert.That(after.RetainedBytes,
+                    Is.GreaterThanOrEqualTo(target.ByteLength));
+                Assert.That(after.RetainedBytes,
+                    Is.LessThan(target.ByteLength * 2));
+                Assert.That(after.RetainedBytes,
+                    Is.EqualTo(after.RetainedHighWaterBytes));
+                Assert.That(after.RetainedBytes,
+                    Is.EqualTo(after.OutstandingHighWaterBytes));
+            }
+            finally
+            {
+                delta?.Dispose();
+                target?.Dispose();
+                baseline?.Dispose();
+                replicator.Dispose();
+                Assert.That(content.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+                Assert.That(probe.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+                content.Dispose();
+                probe.Dispose();
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        private static void AssertRejectedCandidate(NetworkBufferPool pool,
+            in NetworkBufferPoolDiagnostics before, long expectedMisses)
+        {
+            var after = pool.CaptureDiagnostics();
+            Assert.That(after.OutstandingLeases,
+                Is.EqualTo(before.OutstandingLeases));
+            Assert.That(after.OutstandingBytes,
+                Is.EqualTo(before.OutstandingBytes));
+            Assert.That(after.PoolMisses - before.PoolMisses,
+                Is.EqualTo(expectedMisses));
+            Assert.That(after.RetainedBytes, Is.GreaterThan(0));
+            Assert.That(after.RetainedBytes,
+                Is.EqualTo(after.OutstandingHighWaterBytes));
         }
 
         [Test]

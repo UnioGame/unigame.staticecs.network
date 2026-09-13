@@ -33,25 +33,36 @@ namespace UniGame.StaticEcs.Network
             if (pool == null || baseline == null || target == null ||
                 baseline.ServerTick == 0 || target.ServerTick <= baseline.ServerTick ||
                 baseline.SchemaFingerprint != target.SchemaFingerprint ||
-                baseline.Scope != target.Scope)
+                baseline.Scope != target.Scope ||
+                target.ByteLength <= 0 ||
+                target.ByteLength > ProtocolLimits.MaxDecodedPayloadBytes)
                 return false;
 
-            var measure = new SnapshotWriter(true);
-            if (!TryEncodeCore(baseline, target, ref measure, out var operationCount) ||
-                measure.Length > ProtocolLimits.MaxDecodedPayloadBytes)
-                return false;
-
-            var lease = pool.Rent(checked((int)measure.Length));
-            var writer = new SnapshotWriter(lease.WritableSpan);
-            if (!TryEncodeCore(baseline, target, ref writer, out var writtenOperations) ||
-                writtenOperations != operationCount || writer.Length != measure.Length)
+            NetworkBufferLease candidate = null;
+            try
             {
-                lease.Dispose();
-                return false;
-            }
+                candidate = pool.Rent(target.ByteLength);
+                try
+                {
+                    var writer = new SnapshotWriter(candidate.WritableSpan);
+                    if (!TryEncodeCore(baseline, target, ref writer, out _) ||
+                        writer.Length >= target.ByteLength)
+                        return false;
 
-            delta = lease;
-            return true;
+                    candidate.SetLength(checked((int)writer.Length));
+                    delta = candidate;
+                    candidate = null;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+            finally
+            {
+                candidate?.Dispose();
+            }
         }
 
         internal static bool TryReconstruct(NetworkBufferPool pool,

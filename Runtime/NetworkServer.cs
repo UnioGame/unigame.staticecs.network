@@ -778,8 +778,7 @@ namespace UniGame.StaticEcs.Network
             {
                 if (baseline != null &&
                     SnapshotDeltaCodec.TryEncode(_bufferPool, baseline,
-                        target, out lease) &&
-                    lease.Length < target.ByteLength)
+                        target, out lease))
                 {
                     _snapshotDeltas.Add(key, lease);
                     delta = lease;
