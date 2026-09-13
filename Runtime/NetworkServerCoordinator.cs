@@ -11,7 +11,7 @@ namespace UniGame.StaticEcs.Network
     {
         private readonly Dictionary<ConnectionId, NetworkSession<TWorld>> _sessions = new Dictionary<ConnectionId, NetworkSession<TWorld>>();
         private readonly Dictionary<ScopeId, NetworkHistory<NetworkSnapshot>> _history = new Dictionary<ScopeId, NetworkHistory<NetworkSnapshot>>();
-        private readonly List<PendingCommand> _commands = new List<PendingCommand>();
+        private readonly CommandHeap _commands;
         private readonly Dictionary<ConnectionId, ProcessedCommandCursor> _processedCommands = new Dictionary<ConnectionId, ProcessedCommandCursor>();
         private readonly Dictionary<ConnectionId, int> _pendingCommandCounts = new Dictionary<ConnectionId, int>();
         private readonly Dictionary<ConnectionId, int> _pendingCommandBytes = new Dictionary<ConnectionId, int>();
@@ -38,6 +38,7 @@ namespace UniGame.StaticEcs.Network
             _historyCapacity = historyCapacity; _historyBytes = historyBytes;
             _maxPendingCommandsPerPeer = maxPendingCommandsPerPeer;
             _maxPendingBytesPerPeer = maxPendingBytesPerPeer;
+            _commands = new CommandHeap(this);
         }
         internal int PendingCommandCount => _commands.Count;
         internal long PendingCommandBytes => _pendingCommandBytesTotal;
@@ -68,15 +69,7 @@ namespace UniGame.StaticEcs.Network
             ScopeId scope = default;
             if (_sessions.TryGetValue(connection, out var removedSession))
                 scope = removedSession.Scope;
-            for (var i = _commands.Count - 1; i >= 0; i--)
-            {
-                if (_commands[i].Session.Connection != connection)
-                    continue;
-                var envelope = _commands[i].Envelope;
-                DecrementPending(envelope);
-                envelope.Dispose();
-                _commands.RemoveAt(i);
-            }
+            _commands.RemoveAll(connection);
             _pendingCommandCounts.Remove(connection);
             _pendingCommandBytes.Remove(connection);
             _processedCommands.Remove(connection);
@@ -101,7 +94,7 @@ namespace UniGame.StaticEcs.Network
             var result = session.Validate(envelope, serverTick, pastWindow, futureWindow, out var entry);
             if (result == NetworkCommandResult.Queued)
             {
-                _commands.Add(new PendingCommand(session, entry, envelope));
+                _commands.Push(new PendingCommand(session, entry, envelope));
                 _pendingCommandCounts[envelope.Connection] = count + 1;
                 _pendingCommandBytes[envelope.Connection] = bytes + envelope.ExactLength;
                 _pendingCommandBytesTotal += envelope.ExactLength;
@@ -117,39 +110,29 @@ namespace UniGame.StaticEcs.Network
         internal NetworkDispatchSummary Dispatch(uint serverTick)
         {
             using var commandScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.Command);
-            _commands.Sort((a, b) => { var tick = a.Envelope.TargetTick.CompareTo(b.Envelope.TargetTick); if (tick != 0) return tick; var peer = a.Envelope.PeerId.CompareTo(b.Envelope.PeerId); return peer != 0 ? peer : a.Envelope.Sequence.CompareTo(b.Envelope.Sequence); });
             var summary = default(NetworkDispatchSummary);
-            var consumed = 0;
-            try
+            while (_commands.Count > 0)
             {
-                while (consumed < _commands.Count)
+                if (_commands.Peek().Envelope.TargetTick > serverTick) break;
+                var pending = _commands.Pop();
+                var envelope = pending.Envelope;
+                try
                 {
-                    if (_commands[consumed].Envelope.TargetTick > serverTick) break;
-                    var pending = _commands[consumed];
-                    var envelope = pending.Envelope;
-                    try
+                    var result = pending.Session.Dispatch(envelope, pending.Entry);
+                    summary.Add(result);
+                    if (result == NetworkCommandResult.Dispatched ||
+                        result == NetworkCommandResult.PolicyRejected)
                     {
-                        var result = pending.Session.Dispatch(envelope, pending.Entry);
-                        summary.Add(result);
-                        if (result == NetworkCommandResult.Dispatched ||
-                            result == NetworkCommandResult.PolicyRejected)
-                        {
-                            _processedCommands[pending.Session.Connection] = new ProcessedCommandCursor(
-                                envelope.TargetTick,
-                                envelope.Sequence);
-                        }
-                    }
-                    finally
-                    {
-                        DecrementPending(envelope);
-                        envelope.Dispose();
-                        consumed++;
+                        _processedCommands[pending.Session.Connection] = new ProcessedCommandCursor(
+                            envelope.TargetTick,
+                            envelope.Sequence);
                     }
                 }
-            }
-            finally
-            {
-                if (consumed > 0) _commands.RemoveRange(0, consumed);
+                finally
+                {
+                    DecrementPending(envelope);
+                    envelope.Dispose();
+                }
             }
             return summary;
         }
@@ -179,11 +162,6 @@ namespace UniGame.StaticEcs.Network
 
         internal void Clear()
         {
-            for (var i = 0; i < _commands.Count; i++)
-            {
-                var envelope = _commands[i].Envelope;
-                envelope.Dispose();
-            }
             _commands.Clear();
             _processedCommands.Clear();
             _pendingCommandCounts.Clear();
@@ -224,6 +202,129 @@ namespace UniGame.StaticEcs.Network
             internal NetworkSession<TWorld> Session { get; }
             internal NetworkSchemaEntry Entry { get; }
             internal NetworkCommandEnvelope Envelope { get; }
+        }
+
+        /// <summary>Reusable binary min-heap ordered by target tick, trusted peer, then sequence.</summary>
+        private sealed class CommandHeap
+        {
+            private readonly NetworkServerCoordinator<TWorld> _owner;
+            private PendingCommand[] _items;
+            private int _count;
+
+            internal CommandHeap(NetworkServerCoordinator<TWorld> owner)
+            {
+                _owner = owner;
+                _items = Array.Empty<PendingCommand>();
+            }
+
+            internal int Count => _count;
+
+            /// <summary>Returns the canonical minimum without removing it.</summary>
+            internal PendingCommand Peek() => _items[0];
+
+            /// <summary>Adds one pending command and restores the heap invariant.</summary>
+            internal void Push(in PendingCommand item)
+            {
+                if (_count == _items.Length)
+                    Grow();
+                _items[_count] = item;
+                SiftUp(_count);
+                _count++;
+            }
+
+            /// <summary>Removes and returns the canonical minimum.</summary>
+            internal PendingCommand Pop()
+            {
+                var root = _items[0];
+                _count--;
+                _items[0] = _items[_count];
+                _items[_count] = default;
+                if (_count > 0)
+                    SiftDown(0);
+                return root;
+            }
+
+            /// <summary>Removes and disposes every command owned by one connection, then reheapifies.</summary>
+            internal void RemoveAll(ConnectionId connection)
+            {
+                var keep = 0;
+                for (var i = 0; i < _count; i++)
+                {
+                    var item = _items[i];
+                    if (item.Envelope.Connection.Equals(connection))
+                    {
+                        _owner.DecrementPending(item.Envelope);
+                        item.Envelope.Dispose();
+                        continue;
+                    }
+                    _items[keep++] = item;
+                }
+                for (var i = keep; i < _count; i++)
+                    _items[i] = default;
+                _count = keep;
+                for (var i = (_count >> 1) - 1; i >= 0; i--)
+                    SiftDown(i);
+            }
+
+            /// <summary>Disposes every queued command and resets the heap for reuse.</summary>
+            internal void Clear()
+            {
+                for (var i = 0; i < _count; i++)
+                {
+                    _items[i].Envelope.Dispose();
+                    _items[i] = default;
+                }
+                _count = 0;
+            }
+
+            private void Grow()
+            {
+                var capacity = _items.Length == 0 ? 4 : _items.Length * 2;
+                var grown = new PendingCommand[capacity];
+                if (_count > 0)
+                    Array.Copy(_items, grown, _count);
+                _items = grown;
+            }
+
+            private void SiftUp(int index)
+            {
+                var item = _items[index];
+                while (index > 0)
+                {
+                    var parent = (index - 1) >> 1;
+                    if (Compare(item, _items[parent]) >= 0)
+                        break;
+                    _items[index] = _items[parent];
+                    index = parent;
+                }
+                _items[index] = item;
+            }
+
+            private void SiftDown(int index)
+            {
+                var item = _items[index];
+                var half = _count >> 1;
+                while (index < half)
+                {
+                    var child = (index << 1) + 1;
+                    var right = child + 1;
+                    if (right < _count && Compare(_items[right], _items[child]) < 0)
+                        child = right;
+                    if (Compare(_items[child], item) >= 0)
+                        break;
+                    _items[index] = _items[child];
+                    index = child;
+                }
+                _items[index] = item;
+            }
+
+            private static int Compare(in PendingCommand left, in PendingCommand right)
+            {
+                var tick = left.Envelope.TargetTick.CompareTo(right.Envelope.TargetTick);
+                if (tick != 0) return tick;
+                var peer = left.Envelope.PeerId.CompareTo(right.Envelope.PeerId);
+                return peer != 0 ? peer : left.Envelope.Sequence.CompareTo(right.Envelope.Sequence);
+            }
         }
     }
 
