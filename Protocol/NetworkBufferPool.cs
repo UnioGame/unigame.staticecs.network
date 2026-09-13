@@ -1,3 +1,5 @@
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("unigame.staticecs.network.tests")]
+
 namespace UniGame.StaticEcs.Network
 {
     using System;
@@ -259,14 +261,66 @@ namespace UniGame.StaticEcs.Network
                 var buffer = owner.Buffer;
                 owner.Buffer = null;
                 _owners.Push(owner);
-                if (buffer == null || _disposed ||
-                    buffer.Length > _maxRetainedBytes - _retainedBytes)
+                if (buffer == null || _disposed)
                     return;
-                _buffers[BucketFor(buffer.Length)].Push(buffer);
-                _retainedBytes += buffer.Length;
-                if (_retainedBytes > _retainedHighWaterBytes)
-                    _retainedHighWaterBytes = _retainedBytes;
+                RetainBuffer(buffer);
             }
+        }
+
+        private void RetainBuffer(byte[] buffer)
+        {
+            var capacity = buffer.Length;
+            if (!IsBucketCapacity(capacity))
+                return;
+
+            if (capacity > _maxRetainedBytes - _retainedBytes &&
+                !TryEvictSmallestSufficientVictim(capacity))
+                return;
+
+            _buffers[BucketFor(capacity)].Push(buffer);
+            _retainedBytes += capacity;
+            if (_retainedBytes > _retainedHighWaterBytes)
+                _retainedHighWaterBytes = _retainedBytes;
+        }
+
+        // A returning buffer that does not fit the remaining budget may replace a
+        // single cached buffer that is at least as large, keeping a hot bucket
+        // populated without ever evicting more than one inactive buffer.
+        private bool TryEvictSmallestSufficientVictim(int incomingCapacity)
+        {
+            var victimBucket = -1;
+            var victimCapacity = int.MaxValue;
+            for (var i = 0; i < _buffers.Length; i++)
+            {
+                var stack = _buffers[i];
+                if (stack.Count == 0)
+                    continue;
+                var capacity = stack.Peek().Length;
+                if (capacity < incomingCapacity || capacity >= victimCapacity)
+                    continue;
+                victimCapacity = capacity;
+                victimBucket = i;
+            }
+
+            if (victimBucket < 0)
+                return false;
+            _buffers[victimBucket].Pop();
+            _retainedBytes -= victimCapacity;
+            return true;
+        }
+
+        private static bool IsBucketCapacity(int capacity)
+        {
+            if (capacity < MinimumBufferBytes)
+                return false;
+            var value = MinimumBufferBytes;
+            for (var i = 0; i < BucketCount; i++)
+            {
+                if (value == capacity)
+                    return true;
+                value <<= 1;
+            }
+            return false;
         }
 
         private NetworkBufferLease CreateLease(NetworkBufferOwner owner, int offset, int length)
