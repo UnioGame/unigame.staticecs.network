@@ -11,6 +11,11 @@ namespace UniGame.StaticEcs.Network
         private const int DeltaHeaderSize = sizeof(uint) * 3;
         private const int EntityHeaderSize = sizeof(ulong) + sizeof(uint) + sizeof(byte) + sizeof(ushort);
 
+#if UNITY_INCLUDE_TESTS
+        [ThreadStatic]
+        internal static Action AfterCandidateRentForTests;
+#endif
+
         private enum EntityOperation : byte
         {
             Add = 1,
@@ -44,6 +49,9 @@ namespace UniGame.StaticEcs.Network
                 candidate = pool.Rent(target.ByteLength);
                 try
                 {
+#if UNITY_INCLUDE_TESTS
+                    AfterCandidateRentForTests?.Invoke();
+#endif
                     var writer = new SnapshotWriter(candidate.WritableSpan);
                     if (!TryEncodeCore(baseline, target, ref writer, out _) ||
                         writer.Length >= target.ByteLength)

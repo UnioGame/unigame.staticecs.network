@@ -508,8 +508,7 @@ namespace UniGame.StaticEcs.Network.Tests
             NetworkSnapshot equalTarget = null;
             NetworkSnapshot overflowTarget = null;
             NetworkSnapshot malformed = null;
-            NetworkSnapshot releasedBaseline = null;
-            NetworkBufferPool releasedProbe = null;
+            NetworkBufferPool exceptionProbe = null;
             NetworkBufferLease delta = null;
             try
             {
@@ -560,28 +559,21 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(delta, Is.Null);
                 AssertRejectedCandidate(probe, in beforeMalformed, 0);
 
-                // A released baseline lease still exposes valid scalar identity
-                // fields, but not its bytes. TryEncode therefore rents a
-                // target-sized candidate and only then fails to open the
-                // baseline. The rented candidate must be disposed by the
-                // post-rent fallback path; a fresh pool makes the rent
-                // observable as one pool miss while outstanding leases and
-                // bytes must return to their before-call values.
-                var releasedBaselineLease =
-                    content.Copy(oneBaseline.Bytes.Span);
-                releasedBaseline = new NetworkSnapshot(oneBaseline.ServerTick,
-                    oneBaseline.SchemaFingerprint, oneBaseline.Scope,
-                    releasedBaselineLease, oneBaseline.EntityCount,
-                    oneBaseline.RecordCount);
-                releasedBaselineLease.Dispose();
-                Assert.That(releasedBaseline.ByteLength, Is.Zero,
-                    "baseline lease is released after its scalars are captured");
-                releasedProbe = new NetworkBufferPool(1L << 20);
-                var beforeReleased = releasedProbe.CaptureDiagnostics();
-                Assert.That(SnapshotDeltaCodec.TryEncode(releasedProbe,
-                    releasedBaseline, equalTarget, out delta), Is.False);
-                Assert.That(delta, Is.Null);
-                AssertRejectedCandidate(releasedProbe, in beforeReleased, 1);
+                exceptionProbe = new NetworkBufferPool(1L << 20);
+                var beforeException = exceptionProbe.CaptureDiagnostics();
+                try
+                {
+                    SnapshotDeltaCodec.AfterCandidateRentForTests =
+                        static () => throw new InvalidOperationException();
+                    Assert.That(SnapshotDeltaCodec.TryEncode(exceptionProbe,
+                        oneBaseline, equalTarget, out delta), Is.False);
+                    Assert.That(delta, Is.Null);
+                }
+                finally
+                {
+                    SnapshotDeltaCodec.AfterCandidateRentForTests = null;
+                }
+                AssertRejectedCandidate(exceptionProbe, in beforeException, 1);
             }
             finally
             {
@@ -591,13 +583,12 @@ namespace UniGame.StaticEcs.Network.Tests
                 equalTarget?.Dispose();
                 oneBaseline?.Dispose();
                 emptyBaseline?.Dispose();
-                releasedBaseline?.Dispose();
                 replicator.Dispose();
                 Assert.That(content.CaptureDiagnostics().OutstandingLeases,
                     Is.Zero);
                 Assert.That(probe.CaptureDiagnostics().OutstandingLeases,
                     Is.Zero);
-                releasedProbe?.Dispose();
+                exceptionProbe?.Dispose();
                 content.Dispose();
                 probe.Dispose();
                 World<AuthorityWorld>.Destroy();
