@@ -210,7 +210,8 @@ namespace UniGame.StaticEcs.Network
                         _coordinator.StoreCapture(peer.Scope, capture);
                         peer.Session.Trace(NetworkPhase.SnapshotCapture, NetworkTraceKind.Point, NetworkResultCategory.Success, NetworkPacketKind.SnapshotChunk, serverTick, 0, capture.ByteLength, _coordinator.HistoryCount(peer.Scope), _coordinator.HistoryByteCount(peer.Scope), unchecked((int)(serverTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), capture.EntityCount, capture.RecordCount, activeConnections: ActiveConnectionCount, activePeers: ActivePeerCount);
                     }
-                    peer.Session.ReportSnapshot(capture, _coordinator.History(peer.Scope));
+                    using (NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.SnapshotDiagnostics))
+                        peer.Session.ReportSnapshot(capture, _coordinator.History(peer.Scope));
                     SendSnapshot(peer, capture);
                 }
                 ServerTick = serverTick;
@@ -793,9 +794,15 @@ namespace UniGame.StaticEcs.Network
             NetworkBufferLease lease = null;
             try
             {
-                if (baseline != null &&
-                    SnapshotDeltaCodec.TryEncode(_bufferPool, baseline,
-                        target, out lease))
+                var encoded = false;
+                if (baseline != null)
+                {
+                    using (NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.SnapshotDeltaEncode))
+                        encoded = SnapshotDeltaCodec.TryEncode(_bufferPool,
+                            baseline, target, out lease);
+                }
+
+                if (encoded)
                 {
                     _snapshotDeltas.Add(key, lease);
                     delta = lease;
@@ -824,7 +831,6 @@ namespace UniGame.StaticEcs.Network
             uint sequence, in SnapshotChunkHeader chunk,
             ReadOnlySpan<byte> body)
         {
-            using var packetScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.PacketPreparation);
             var started = Stopwatch.GetTimestamp();
             // A reliable transport may be transiently backpressured for this exact
             // encoded chunk even though it accepted the minimum probe. Reject it
@@ -835,6 +841,9 @@ namespace UniGame.StaticEcs.Network
             if (peer.Transport is INetworkReliableSendPreflight preflight &&
                 !preflight.CanAcceptReliablePacket(exactPacketBytes))
                 return false;
+            // Preparation work only starts after the exact preflight accepts, so a
+            // rejection emits none of the preparation, encode, or send scopes.
+            using var packetScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.PacketPreparation);
             var header = new PacketHeader
             {
                 Kind = PacketKind.SnapshotChunk,

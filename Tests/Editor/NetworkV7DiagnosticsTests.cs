@@ -561,7 +561,11 @@ namespace UniGame.StaticEcs.Network.Tests
                 Is.EqualTo(7));
             Assert.That((int)NetworkDiagnosticPhase.TransportTrySend,
                 Is.EqualTo(8));
-            Assert.That((int)NetworkDiagnosticPhase.Count, Is.EqualTo(9));
+            Assert.That((int)NetworkDiagnosticPhase.SnapshotDeltaEncode,
+                Is.EqualTo(9));
+            Assert.That((int)NetworkDiagnosticPhase.SnapshotDiagnostics,
+                Is.EqualTo(10));
+            Assert.That((int)NetworkDiagnosticPhase.Count, Is.EqualTo(11));
 
             CreateReplicationWorld<AuthorityWorld>(true);
             CreateReplicationWorld<ClientAWorld>(false);
@@ -717,7 +721,7 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
-        public void ExactPreflightRejectionEmitsPreparationScopeWithoutEncodeOrTransport()
+        public void ExactPreflightRejectionEmitsNoSnapshotPreparationScopes()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
             MemoryNetworkTransport.CreatePair(new ConnectionId(924),
@@ -756,27 +760,22 @@ namespace UniGame.StaticEcs.Network.Tests
                     var phases = new[]
                     {
                         NetworkDiagnosticPhase.PacketPreparation,
+                        NetworkDiagnosticPhase.SnapshotDeltaEncode,
                         NetworkDiagnosticPhase.SnapshotChunkEncode,
                         NetworkDiagnosticPhase.TransportTrySend,
                     };
-                    Assert.That(CollectPhaseEvents(sink, phases),
-                        Is.EqualTo(new[]
-                        {
-                            "begin:PacketPreparation",
-                            "end:PacketPreparation"
-                        }));
-                    Assert.That(PhaseEventCount(sink,
-                        NetworkDiagnosticPhase.SnapshotChunkEncode,
-                        begin: true), Is.Zero);
-                    Assert.That(PhaseEventCount(sink,
-                        NetworkDiagnosticPhase.SnapshotChunkEncode,
-                        begin: false), Is.Zero);
-                    Assert.That(PhaseEventCount(sink,
-                        NetworkDiagnosticPhase.TransportTrySend,
-                        begin: true), Is.Zero);
-                    Assert.That(PhaseEventCount(sink,
-                        NetworkDiagnosticPhase.TransportTrySend,
-                        begin: false), Is.Zero);
+                    Assert.That(CollectPhaseEvents(sink, phases), Is.Empty,
+                        "an exact preflight rejection must emit no " +
+                        "preparation, encode, or transport scopes");
+                    for (var i = 0; i < phases.Length; i++)
+                    {
+                        Assert.That(PhaseEventCount(sink, phases[i],
+                            begin: true), Is.Zero, "begin count for " +
+                            phases[i]);
+                        Assert.That(PhaseEventCount(sink, phases[i],
+                            begin: false), Is.Zero, "end count for " +
+                            phases[i]);
+                    }
                     Assert.That(sink.Begins, Is.EqualTo(sink.Ends));
                 }
             }
@@ -784,6 +783,355 @@ namespace UniGame.StaticEcs.Network.Tests
             {
                 NetworkDiagnosticMarkers.Sink = original;
                 World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void SnapshotDeltaEncodeScopeFollowsDeltaCacheDecision()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var scope = new ScopeId(43);
+                using var pool = new NetworkBufferPool(0);
+                using var mock = new TwoClientNetworkMock();
+                using var server = new NetworkServer<AuthorityWorld>(schema,
+                    static (_, _) => true, bufferPool: pool);
+                var original = NetworkDiagnosticMarkers.Sink;
+                var sink = new RecordingMarkerSink();
+                try
+                {
+                    server.AddConnection(mock.ServerA, 1, 11, scope);
+                    server.AddConnection(mock.ServerB, 2, 22, scope);
+                    SendPeerPacket(mock.ClientA, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    SendPeerPacket(mock.ClientB, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(mock.ClientA.TryReceive(out var readyA),
+                        Is.True);
+                    readyA.Dispose();
+                    Assert.That(mock.ClientB.TryReceive(out var readyB),
+                        Is.True);
+                    readyB.Dispose();
+
+                    var first = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    first.Set(new TestComponent { Value = 1 });
+                    var second = World<AuthorityWorld>.NewEntity<SecondEntity>();
+                    second.Set(new TestComponent { Value = 10 });
+                    server.Tick(_ => { });
+                    ReceiveChunk(mock.ClientA);
+                    ReceiveChunk(mock.ClientB);
+
+                    SendPeerPacket(mock.ClientA, schema.Fingerprint,
+                        PacketKind.Ack, 11, 2, 1);
+                    SendPeerPacket(mock.ClientB, schema.Fingerprint,
+                        PacketKind.Ack, 22, 2, 1);
+                    server.Receive();
+
+                    first.Set(new TestComponent { Value = 2 });
+                    NetworkDiagnosticMarkers.Sink = sink;
+                    server.Tick(_ => { });
+                    NetworkDiagnosticMarkers.Sink = original;
+                    ReceiveChunk(mock.ClientA);
+                    ReceiveChunk(mock.ClientB);
+                    Assert.That(PhaseEventCount(sink,
+                        NetworkDiagnosticPhase.SnapshotDeltaEncode,
+                        begin: true), Is.EqualTo(1),
+                        "one cache-miss encode serves both peers");
+                    Assert.That(PhaseEventCount(sink,
+                        NetworkDiagnosticPhase.SnapshotDeltaEncode,
+                        begin: false), Is.EqualTo(1));
+                    Assert.That(PhaseEventCount(sink,
+                        NetworkDiagnosticPhase.SnapshotDiagnostics,
+                        begin: true), Is.EqualTo(2),
+                        "one diagnostics report per peer");
+
+                    SendPeerPacket(mock.ClientA, schema.Fingerprint,
+                        PacketKind.Ack, 11, 3, 2);
+                    server.Receive();
+
+                    first.Set(new TestComponent { Value = 3 });
+                    sink.Sequence.Clear();
+                    NetworkDiagnosticMarkers.Sink = sink;
+                    server.Tick(_ => { });
+                    NetworkDiagnosticMarkers.Sink = original;
+                    ReceiveChunk(mock.ClientA);
+                    ReceiveChunk(mock.ClientB);
+                    Assert.That(PhaseEventCount(sink,
+                        NetworkDiagnosticPhase.SnapshotDeltaEncode,
+                        begin: true), Is.EqualTo(2),
+                        "different baselines encode separately");
+                    Assert.That(PhaseEventCount(sink,
+                        NetworkDiagnosticPhase.SnapshotDeltaEncode,
+                        begin: false), Is.EqualTo(2));
+                }
+                finally
+                {
+                    NetworkDiagnosticMarkers.Sink = original;
+                }
+
+                server.Dispose();
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void SnapshotDeltaEncodeScopeEmitsOnceForCachedNegativeDecision()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var scope = new ScopeId(44);
+                using var pool = new NetworkBufferPool(0);
+                using var mock = new TwoClientNetworkMock();
+                using var server = new NetworkServer<AuthorityWorld>(schema,
+                    static (_, _) => true, bufferPool: pool);
+                var original = NetworkDiagnosticMarkers.Sink;
+                var sink = new RecordingMarkerSink();
+                try
+                {
+                    server.AddConnection(mock.ServerA, 1, 11, scope);
+                    server.AddConnection(mock.ServerB, 2, 22, scope);
+                    SendPeerPacket(mock.ClientA, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    SendPeerPacket(mock.ClientB, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(mock.ClientA.TryReceive(out var readyA),
+                        Is.True);
+                    readyA.Dispose();
+                    Assert.That(mock.ClientB.TryReceive(out var readyB),
+                        Is.True);
+                    readyB.Dispose();
+
+                    // Tick 1 captures an empty scope, so the first entity add at
+                    // tick 2 grows the delta past the canonical target length and
+                    // the codec rejects the candidate.
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(mock.ClientA).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                    Assert.That(ReceiveChunk(mock.ClientB).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+
+                    SendPeerPacket(mock.ClientA, schema.Fingerprint,
+                        PacketKind.Ack, 11, 2, 1);
+                    SendPeerPacket(mock.ClientB, schema.Fingerprint,
+                        PacketKind.Ack, 22, 2, 1);
+                    server.Receive();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    NetworkDiagnosticMarkers.Sink = sink;
+                    server.Tick(_ => { });
+                    NetworkDiagnosticMarkers.Sink = original;
+                    Assert.That(ReceiveChunk(mock.ClientA).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                    Assert.That(ReceiveChunk(mock.ClientB).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                    Assert.That(PhaseEventCount(sink,
+                        NetworkDiagnosticPhase.SnapshotDeltaEncode,
+                        begin: true), Is.EqualTo(1),
+                        "a rejected candidate is cached, not re-encoded");
+                    Assert.That(PhaseEventCount(sink,
+                        NetworkDiagnosticPhase.SnapshotDeltaEncode,
+                        begin: false), Is.EqualTo(1));
+                }
+                finally
+                {
+                    NetworkDiagnosticMarkers.Sink = original;
+                }
+
+                server.Dispose();
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ExactRejectedCachedConsumerEmitsNoExtraEncodeScope()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var scope = new ScopeId(45);
+                using var pool = new NetworkBufferPool(0);
+                using var mock = new TwoClientNetworkMock();
+                using (var serverTransport =
+                       new PreflightNetworkTransport(mock.ServerA))
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                    static (_, _) => true, bufferPool: pool))
+                {
+                    var original = NetworkDiagnosticMarkers.Sink;
+                    var sink = new RecordingMarkerSink();
+                    try
+                    {
+                        // Peer B is served first, so peer A consumes the cached
+                        // delta decision before its exact preflight rejects.
+                        server.AddConnection(mock.ServerB, 2, 22, scope);
+                        server.AddConnection(serverTransport, 1, 11, scope);
+                        SendPeerPacket(mock.ClientA, schema.Fingerprint,
+                            PacketKind.Hello, 0, 1, 0);
+                        SendPeerPacket(mock.ClientB, schema.Fingerprint,
+                            PacketKind.Hello, 0, 1, 0);
+                        server.Receive();
+                        Assert.That(mock.ClientA.TryReceive(out var readyA),
+                            Is.True);
+                        readyA.Dispose();
+                        Assert.That(mock.ClientB.TryReceive(out var readyB),
+                            Is.True);
+                        readyB.Dispose();
+
+                        var first =
+                            World<AuthorityWorld>.NewEntity<TestEntity>();
+                        first.Set(new TestComponent { Value = 1 });
+                        var second =
+                            World<AuthorityWorld>.NewEntity<SecondEntity>();
+                        second.Set(new TestComponent { Value = 10 });
+                        server.Tick(_ => { });
+                        ReceiveChunk(mock.ClientA);
+                        ReceiveChunk(mock.ClientB);
+
+                        SendPeerPacket(mock.ClientA, schema.Fingerprint,
+                            PacketKind.Ack, 11, 2, 1);
+                        SendPeerPacket(mock.ClientB, schema.Fingerprint,
+                            PacketKind.Ack, 22, 2, 1);
+                        server.Receive();
+
+                        first.Set(new TestComponent { Value = 2 });
+                        serverTransport.ResetCounters();
+                        serverTransport.ProbeResults.Enqueue(true);
+                        serverTransport.ProbeResults.Enqueue(false);
+                        NetworkDiagnosticMarkers.Sink = sink;
+                        server.Tick(_ => { });
+                        NetworkDiagnosticMarkers.Sink = original;
+
+                        Assert.That(serverTransport.PreflightCalls,
+                            Is.EqualTo(2));
+                        Assert.That(serverTransport.SentPacketCount, Is.Zero,
+                            "the exact preflight must reject the cached chunk");
+                        Assert.That(mock.ClientA.TryReceive(out _), Is.False);
+                        Assert.That(ReceiveChunk(mock.ClientB).PayloadKind,
+                            Is.EqualTo(SnapshotPayloadKind.Delta));
+                        Assert.That(PhaseEventCount(sink,
+                            NetworkDiagnosticPhase.SnapshotDeltaEncode,
+                            begin: true), Is.EqualTo(1),
+                            "a cached consumer must not re-encode");
+                        Assert.That(PhaseEventCount(sink,
+                            NetworkDiagnosticPhase.SnapshotDeltaEncode,
+                            begin: false), Is.EqualTo(1));
+                    }
+                    finally
+                    {
+                        NetworkDiagnosticMarkers.Sink = original;
+                    }
+                }
+
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void SnapshotDiagnosticsScopeNestsInsideSnapshotPerPeer()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            MemoryNetworkTransport.CreatePair(new ConnectionId(925),
+                out var clientTransport, out var serverTransport);
+            var original = NetworkDiagnosticMarkers.Sink;
+            var sink = new RecordingMarkerSink();
+            try
+            {
+                using (clientTransport)
+                using (serverTransport)
+                using (var server = new NetworkServer<AuthorityWorld>(
+                    Schema<AuthorityWorld>(true), static (_, _) => true))
+                using (var client = new NetworkClient<ClientAWorld>(
+                    clientTransport, Schema<ClientAWorld>(false),
+                    new ScopeId(1)))
+                {
+                    var authority =
+                        World<AuthorityWorld>.NewEntity<TestEntity>();
+                    authority.Set(new TestComponent { Value = 1 });
+                    server.AddConnection(serverTransport, 1, 1,
+                        new ScopeId(1));
+                    client.BeginHandshake();
+                    server.Receive();
+                    NetworkDiagnosticMarkers.Sink = sink;
+                    server.BeginTick();
+                    server.CompleteTick();
+
+                    Assert.That(sink.Begins, Is.EqualTo(sink.Ends));
+                    var snapshotBegin = sink.Sequence.IndexOf(
+                        "begin:Snapshot");
+                    var diagnosticsBegin = sink.Sequence.IndexOf(
+                        "begin:SnapshotDiagnostics");
+                    var diagnosticsEnd = sink.Sequence.IndexOf(
+                        "end:SnapshotDiagnostics");
+                    var snapshotEnd = sink.Sequence.IndexOf("end:Snapshot");
+                    Assert.That(snapshotBegin,
+                        Is.GreaterThanOrEqualTo(0));
+                    Assert.That(diagnosticsBegin,
+                        Is.GreaterThan(snapshotBegin));
+                    Assert.That(diagnosticsEnd,
+                        Is.GreaterThan(diagnosticsBegin));
+                    Assert.That(snapshotEnd, Is.GreaterThan(diagnosticsEnd));
+                    Assert.That(PhaseEventCount(sink,
+                        NetworkDiagnosticPhase.SnapshotDiagnostics,
+                        begin: true), Is.EqualTo(1));
+                    Assert.That(PhaseEventCount(sink,
+                        NetworkDiagnosticPhase.SnapshotDiagnostics,
+                        begin: false), Is.EqualTo(1));
+                }
+            }
+            finally
+            {
+                NetworkDiagnosticMarkers.Sink = original;
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void DiagnosticScopeEndsWhenMeasuredBodyThrows()
+        {
+            var original = NetworkDiagnosticMarkers.Sink;
+            var sink = new RecordingMarkerSink();
+            try
+            {
+                NetworkDiagnosticMarkers.Sink = sink;
+                Assert.Throws<InvalidOperationException>(() =>
+                {
+                    using (NetworkDiagnosticMarkers.Measure(
+                               NetworkDiagnosticPhase.SnapshotDeltaEncode))
+                        throw new InvalidOperationException("measured body");
+                });
+                Assert.That(sink.Sequence, Is.EqualTo(new[]
+                {
+                    "begin:SnapshotDeltaEncode", "end:SnapshotDeltaEncode"
+                }));
+                Assert.That(sink.Begins, Is.EqualTo(sink.Ends));
+            }
+            finally
+            {
+                NetworkDiagnosticMarkers.Sink = original;
             }
         }
 

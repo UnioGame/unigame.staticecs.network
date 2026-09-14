@@ -369,8 +369,12 @@ namespace UniGame.StaticEcs.Network
         SnapshotChunkEncode = 7,
         /// <summary>Transport send attempt for one encoded snapshot chunk.</summary>
         TransportTrySend = 8,
+        /// <summary>Delta codec encode for one cache-miss baseline and target.</summary>
+        SnapshotDeltaEncode = 9,
+        /// <summary>Per-peer snapshot diagnostics report after capture.</summary>
+        SnapshotDiagnostics = 10,
         /// <summary>Number of measured phases; not a valid phase value.</summary>
-        Count = 9,
+        Count = 11,
     }
 
     /// <summary>Receives allocation-free begin/end notifications for measured server phases.</summary>
