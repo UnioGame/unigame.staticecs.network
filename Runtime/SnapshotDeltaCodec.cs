@@ -188,25 +188,33 @@ namespace UniGame.StaticEcs.Network
                 return false;
 
             var pool = SnapshotLayoutMemory.Pool;
-            var rentedEntities = pool.RentEntities(Math.Max(1,
-                snapshot.EntityCount));
-            var rentedRecords = pool.RentRecords(Math.Max(1,
-                snapshot.RecordCount));
+            SnapshotEntityLayout[] rentedEntities = null;
+            SnapshotRecordLayout[] rentedRecords = null;
             var success = false;
             try
             {
+                rentedEntities = pool.RentEntities(Math.Max(1,
+                    snapshot.EntityCount));
+                rentedRecords = pool.RentRecords(Math.Max(1,
+                    snapshot.RecordCount));
                 if (!TryFillLayout(snapshot.Bytes.Span, rentedEntities,
                         rentedRecords, snapshot.EntityCount,
                         snapshot.RecordCount))
                     return false;
                 success = true;
             }
+            catch
+            {
+                return false;
+            }
             finally
             {
                 if (!success)
                 {
-                    pool.ReturnEntities(rentedEntities);
-                    pool.ReturnRecords(rentedRecords);
+                    if (rentedEntities != null)
+                        pool.ReturnEntities(rentedEntities);
+                    if (rentedRecords != null)
+                        pool.ReturnRecords(rentedRecords);
                 }
             }
 
@@ -284,12 +292,87 @@ namespace UniGame.StaticEcs.Network
             NetworkSnapshot target, ref SnapshotWriter writer,
             out uint operationCount)
         {
-            if (baseline.TryGetLayout(out var baselineLayout) &&
-                target.TryGetLayout(out var targetLayout))
+            operationCount = 0;
+            var baselineCached = baseline.TryReadCachedLayout(
+                out var baselineLayout);
+            var targetCached = target.TryReadCachedLayout(out var targetLayout);
+            if (baselineCached && targetCached)
                 return TryEncodeCoreIndexed(baseline, baselineLayout, target,
                     targetLayout, ref writer, out operationCount);
-            return TryEncodeCore(baseline, target, ref writer,
-                out operationCount);
+
+            // Build the missing side(s) before publishing anything so a pair that
+            // cannot produce an indexed encode never leaves a lone layout behind.
+            if (baselineCached)
+            {
+                if (!target.TryBuildLayout(out var targetEntities,
+                        out var targetRecords, out var targetEntityCount,
+                        out var targetRecordCount, out var targetPool))
+                    return TryEncodeCore(baseline, target, ref writer,
+                        out operationCount);
+                target.PublishLayout(targetEntities, targetRecords,
+                    targetEntityCount, targetRecordCount, targetPool);
+                targetLayout = new SnapshotLayoutView(targetEntities,
+                    targetRecords, targetEntityCount, targetRecordCount);
+                return TryEncodeCoreIndexed(baseline, baselineLayout, target,
+                    targetLayout, ref writer, out operationCount);
+            }
+
+            if (targetCached)
+            {
+                if (!baseline.TryBuildLayout(out var baselineEntities,
+                        out var baselineRecords, out var baselineEntityCount,
+                        out var baselineRecordCount, out var baselinePool))
+                    return TryEncodeCore(baseline, target, ref writer,
+                        out operationCount);
+                baseline.PublishLayout(baselineEntities, baselineRecords,
+                    baselineEntityCount, baselineRecordCount, baselinePool);
+                baselineLayout = new SnapshotLayoutView(baselineEntities,
+                    baselineRecords, baselineEntityCount, baselineRecordCount);
+                return TryEncodeCoreIndexed(baseline, baselineLayout, target,
+                    targetLayout, ref writer, out operationCount);
+            }
+
+            if (!baseline.TryBuildLayout(out var pendingBaselineEntities,
+                    out var pendingBaselineRecords,
+                    out var pendingBaselineEntityCount,
+                    out var pendingBaselineRecordCount,
+                    out var pendingBaselinePool))
+                return TryEncodeCore(baseline, target, ref writer,
+                    out operationCount);
+            var published = false;
+            try
+            {
+                if (!target.TryBuildLayout(out var pendingTargetEntities,
+                        out var pendingTargetRecords,
+                        out var pendingTargetEntityCount,
+                        out var pendingTargetRecordCount,
+                        out var pendingTargetPool))
+                    return TryEncodeCore(baseline, target, ref writer,
+                        out operationCount);
+                baseline.PublishLayout(pendingBaselineEntities,
+                    pendingBaselineRecords, pendingBaselineEntityCount,
+                    pendingBaselineRecordCount, pendingBaselinePool);
+                target.PublishLayout(pendingTargetEntities,
+                    pendingTargetRecords, pendingTargetEntityCount,
+                    pendingTargetRecordCount, pendingTargetPool);
+                published = true;
+                baselineLayout = new SnapshotLayoutView(pendingBaselineEntities,
+                    pendingBaselineRecords, pendingBaselineEntityCount,
+                    pendingBaselineRecordCount);
+                targetLayout = new SnapshotLayoutView(pendingTargetEntities,
+                    pendingTargetRecords, pendingTargetEntityCount,
+                    pendingTargetRecordCount);
+                return TryEncodeCoreIndexed(baseline, baselineLayout, target,
+                    targetLayout, ref writer, out operationCount);
+            }
+            finally
+            {
+                if (!published)
+                {
+                    pendingBaselinePool.ReturnEntities(pendingBaselineEntities);
+                    pendingBaselinePool.ReturnRecords(pendingBaselineRecords);
+                }
+            }
         }
 
         private static bool TryEncodeCoreIndexed(NetworkSnapshot baseline,

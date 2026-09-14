@@ -169,26 +169,57 @@ namespace UniGame.StaticEcs.Network
         // Only pool-owned snapshots may lazily build and reuse the layout. Public
         // descriptors keep the parser/hash path so caller-supplied bytes are never
         // trusted without revalidation.
-        internal bool TryGetLayout(out SnapshotLayoutView layout)
+        internal bool HasLayout => _layoutEntities != null;
+
+        internal bool TryReadCachedLayout(out SnapshotLayoutView layout)
         {
-            if (_layoutEntities != null)
+            if (_layoutEntities == null)
             {
-                layout = new SnapshotLayoutView(_layoutEntities, _layoutRecords,
-                    _layoutEntityCount, _layoutRecordCount);
-                return true;
+                layout = default;
+                return false;
             }
-            layout = default;
-            if (_pool == null)
+            layout = new SnapshotLayoutView(_layoutEntities, _layoutRecords,
+                _layoutEntityCount, _layoutRecordCount);
+            return true;
+        }
+
+        // Rents a validated layout without publishing it. The caller owns the
+        // rentals and must either publish them or return them exactly once.
+        internal bool TryBuildLayout(out SnapshotEntityLayout[] entities,
+            out SnapshotRecordLayout[] records, out int entityCount,
+            out int recordCount, out ISnapshotLayoutPool layoutPool)
+        {
+            entities = null;
+            records = null;
+            entityCount = 0;
+            recordCount = 0;
+            layoutPool = null;
+            if (_pool == null || _layoutEntities != null)
                 return false;
-            if (!SnapshotDeltaCodec.TryBuildLayout(this, out var entities,
-                    out var records, out var entityCount, out var recordCount,
-                    out var layoutPool))
-                return false;
+            return SnapshotDeltaCodec.TryBuildLayout(this, out entities,
+                out records, out entityCount, out recordCount, out layoutPool);
+        }
+
+        internal void PublishLayout(SnapshotEntityLayout[] entities,
+            SnapshotRecordLayout[] records, int entityCount, int recordCount,
+            ISnapshotLayoutPool layoutPool)
+        {
             _layoutEntities = entities;
             _layoutRecords = records;
             _layoutEntityCount = entityCount;
             _layoutRecordCount = recordCount;
             _layoutPool = layoutPool;
+        }
+
+        internal bool TryGetLayout(out SnapshotLayoutView layout)
+        {
+            if (TryReadCachedLayout(out layout))
+                return true;
+            if (!TryBuildLayout(out var entities, out var records,
+                    out var entityCount, out var recordCount, out var layoutPool))
+                return false;
+            PublishLayout(entities, records, entityCount, recordCount,
+                layoutPool);
             layout = new SnapshotLayoutView(entities, records, entityCount,
                 recordCount);
             return true;
