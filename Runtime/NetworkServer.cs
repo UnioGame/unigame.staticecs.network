@@ -824,10 +824,20 @@ namespace UniGame.StaticEcs.Network
                 SimulationFingerprint = _simulationFingerprint,
                 ContentFingerprint = _contentFingerprint
             };
-            var encoded = SnapshotChunkEncoder.TryEncode(_bufferPool, header,
-                in chunk, body, out var packet);
+            NetworkBufferLease packet = null;
+            var encoded = false;
+            using (NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.SnapshotChunkEncode))
+            {
+                encoded = SnapshotChunkEncoder.TryEncode(_bufferPool, header,
+                    in chunk, body, out packet);
+            }
             var packetBytes = packet?.Length ?? 0;
-            var sent = encoded && peer.Transport.TrySend(packet);
+            var sent = false;
+            if (encoded)
+            {
+                using var transportScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.TransportTrySend);
+                sent = peer.Transport.TrySend(packet);
+            }
             peer.Session.Trace(NetworkPhase.Send, NetworkTraceKind.Point,
                 sent ? NetworkResultCategory.Success : NetworkResultCategory.Transport,
                 NetworkPacketKind.SnapshotChunk, serverTick, PacketHeader.NoneTick,

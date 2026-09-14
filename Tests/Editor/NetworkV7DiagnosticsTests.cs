@@ -543,6 +543,233 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void SnapshotPacketPreparationNestsEncodeAndTransportScopes()
+        {
+            Assert.That((int)NetworkDiagnosticPhase.Command, Is.Zero);
+            Assert.That((int)NetworkDiagnosticPhase.OwnerLookup,
+                Is.EqualTo(1));
+            Assert.That((int)NetworkDiagnosticPhase.Snapshot, Is.EqualTo(2));
+            Assert.That((int)NetworkDiagnosticPhase.PacketPreparation,
+                Is.EqualTo(3));
+            Assert.That((int)NetworkDiagnosticPhase.ReliableDrain,
+                Is.EqualTo(4));
+            Assert.That((int)NetworkDiagnosticPhase.NativeUpdate,
+                Is.EqualTo(5));
+            Assert.That((int)NetworkDiagnosticPhase.ReceiveCallback,
+                Is.EqualTo(6));
+            Assert.That((int)NetworkDiagnosticPhase.SnapshotChunkEncode,
+                Is.EqualTo(7));
+            Assert.That((int)NetworkDiagnosticPhase.TransportTrySend,
+                Is.EqualTo(8));
+            Assert.That((int)NetworkDiagnosticPhase.Count, Is.EqualTo(9));
+
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            MemoryNetworkTransport.CreatePair(new ConnectionId(921),
+                out var clientTransport, out var serverTransport);
+            var original = NetworkDiagnosticMarkers.Sink;
+            var sink = new RecordingMarkerSink();
+            try
+            {
+                NetworkDiagnosticMarkers.Sink = sink;
+                using (clientTransport)
+                using (serverTransport)
+                using (var server = new NetworkServer<AuthorityWorld>(
+                    Schema<AuthorityWorld>(true), static (_, _) => true))
+                using (var client = new NetworkClient<ClientAWorld>(
+                    clientTransport, Schema<ClientAWorld>(false),
+                    new ScopeId(1)))
+                {
+                    var authority = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    authority.Set(new TestComponent { Value = 1 });
+                    server.AddConnection(serverTransport, 1, 1,
+                        new ScopeId(1));
+                    client.BeginHandshake();
+                    server.Receive();
+                    server.BeginTick();
+                    server.CompleteTick();
+                    client.Process();
+
+                    AssertRelevantSnapshotScopes(sink,
+                        "begin:PacketPreparation",
+                        "begin:SnapshotChunkEncode",
+                        "end:SnapshotChunkEncode",
+                        "begin:TransportTrySend",
+                        "end:TransportTrySend",
+                        "end:PacketPreparation");
+                }
+            }
+            finally
+            {
+                NetworkDiagnosticMarkers.Sink = original;
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void FailedSnapshotTransportSendStillEmitsNestedTransportScope()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            MemoryNetworkTransport.CreatePair(new ConnectionId(922),
+                out var clientTransport, out var serverInner);
+            using (clientTransport)
+            using (var serverTransport = new LimitedNetworkTransport(serverInner,
+                serverInner.MaxUnreliablePayloadBytes))
+            {
+                var original = NetworkDiagnosticMarkers.Sink;
+                var sink = new RecordingMarkerSink();
+                var observer = new TraceCollector();
+                try
+                {
+                    NetworkDiagnosticMarkers.Sink = sink;
+                    using (var server = new NetworkServer<AuthorityWorld>(
+                        Schema<AuthorityWorld>(true), static (_, _) => true,
+                        observer: observer))
+                    using (var client = new NetworkClient<ClientAWorld>(
+                        clientTransport, Schema<ClientAWorld>(false),
+                        new ScopeId(1)))
+                    {
+                        var authority = World<AuthorityWorld>.NewEntity<TestEntity>();
+                        authority.Set(new TestComponent { Value = 1 });
+                        server.AddConnection(serverTransport, 1, 1,
+                            new ScopeId(1));
+                        client.BeginHandshake();
+                        server.Receive();
+                        serverTransport.ResetSentPackets();
+                        serverTransport.FailOnSendNumber = 1;
+                        server.BeginTick();
+                        server.CompleteTick();
+
+                        var send = observer.Single(NetworkPhase.Send,
+                            NetworkPacketKind.SnapshotChunk);
+                        Assert.That(send.Result,
+                            Is.EqualTo(NetworkResultCategory.Transport));
+                        AssertRelevantSnapshotScopes(sink,
+                            "begin:PacketPreparation",
+                            "begin:SnapshotChunkEncode",
+                            "end:SnapshotChunkEncode",
+                            "begin:TransportTrySend",
+                            "end:TransportTrySend",
+                            "end:PacketPreparation");
+                    }
+                }
+                finally
+                {
+                    NetworkDiagnosticMarkers.Sink = original;
+                    World<AuthorityWorld>.Destroy();
+                    World<ClientAWorld>.Destroy();
+                }
+            }
+        }
+
+        [Test]
+        public void NonSnapshotTransportSendEmitsNoSnapshotDiagnosticScopes()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            MemoryNetworkTransport.CreatePair(new ConnectionId(923),
+                out var clientTransport, out var serverInner);
+            using (clientTransport)
+            using (var serverTransport = new LimitedNetworkTransport(serverInner,
+                serverInner.MaxUnreliablePayloadBytes))
+            {
+                var original = NetworkDiagnosticMarkers.Sink;
+                var sink = new RecordingMarkerSink();
+                try
+                {
+                    NetworkDiagnosticMarkers.Sink = sink;
+                    using (var server = new NetworkServer<AuthorityWorld>(
+                        Schema<AuthorityWorld>(true), static (_, _) => true))
+                    using (var client = new NetworkClient<ClientAWorld>(
+                        clientTransport, Schema<ClientAWorld>(false),
+                        new ScopeId(1)))
+                    {
+                        server.AddConnection(serverTransport, 1, 1,
+                            new ScopeId(1));
+                        client.BeginHandshake();
+                        server.Receive();
+
+                        Assert.That(serverTransport.SentPacketCount,
+                            Is.GreaterThan(0));
+                        Assert.That(PhaseEventCount(sink,
+                            NetworkDiagnosticPhase.SnapshotChunkEncode,
+                            begin: true), Is.Zero);
+                        Assert.That(PhaseEventCount(sink,
+                            NetworkDiagnosticPhase.SnapshotChunkEncode,
+                            begin: false), Is.Zero);
+                        Assert.That(PhaseEventCount(sink,
+                            NetworkDiagnosticPhase.TransportTrySend,
+                            begin: true), Is.Zero);
+                        Assert.That(PhaseEventCount(sink,
+                            NetworkDiagnosticPhase.TransportTrySend,
+                            begin: false), Is.Zero);
+                    }
+                }
+                finally
+                {
+                    NetworkDiagnosticMarkers.Sink = original;
+                    World<AuthorityWorld>.Destroy();
+                    World<ClientAWorld>.Destroy();
+                }
+            }
+        }
+
+        private static void AssertRelevantSnapshotScopes(
+            RecordingMarkerSink sink, params string[] expected)
+        {
+            var phases = new[]
+            {
+                NetworkDiagnosticPhase.PacketPreparation,
+                NetworkDiagnosticPhase.SnapshotChunkEncode,
+                NetworkDiagnosticPhase.TransportTrySend,
+            };
+            Assert.That(CollectPhaseEvents(sink, phases),
+                Is.EqualTo(expected));
+            for (var i = 0; i < phases.Length; i++)
+            {
+                Assert.That(PhaseEventCount(sink, phases[i], begin: true),
+                    Is.EqualTo(1), "begin count for " + phases[i]);
+                Assert.That(PhaseEventCount(sink, phases[i], begin: false),
+                    Is.EqualTo(1), "end count for " + phases[i]);
+            }
+            Assert.That(sink.Begins, Is.EqualTo(sink.Ends),
+                "diagnostic scopes must remain balanced");
+        }
+
+        private static List<string> CollectPhaseEvents(
+            RecordingMarkerSink sink, NetworkDiagnosticPhase[] phases)
+        {
+            var filtered = new List<string>();
+            for (var i = 0; i < sink.Sequence.Count; i++)
+            {
+                var entry = sink.Sequence[i];
+                for (var p = 0; p < phases.Length; p++)
+                {
+                    var name = phases[p].ToString();
+                    if (entry == "begin:" + name || entry == "end:" + name)
+                    {
+                        filtered.Add(entry);
+                        break;
+                    }
+                }
+            }
+            return filtered;
+        }
+
+        private static int PhaseEventCount(RecordingMarkerSink sink,
+            NetworkDiagnosticPhase phase, bool begin)
+        {
+            var expected = (begin ? "begin:" : "end:") + phase;
+            var count = 0;
+            for (var i = 0; i < sink.Sequence.Count; i++)
+                if (sink.Sequence[i] == expected)
+                    count++;
+            return count;
+        }
+
+        [Test]
         public void DiagnosticScopeBindsOneImmutableSinkAcrossReplacement()
         {
             var original = NetworkDiagnosticMarkers.Sink;
@@ -561,6 +788,11 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(first.Ends, Is.EqualTo(1));
                 Assert.That(second.Begins, Is.Zero);
                 Assert.That(second.Ends, Is.Zero);
+                Assert.That(first.Sequence, Is.EqualTo(new[]
+                {
+                    "begin:Command", "end:Command"
+                }));
+                Assert.That(second.Sequence, Is.Empty);
                 Assert.That(NetworkDiagnosticMarkers.Sink,
                     Is.SameAs(second));
             }
@@ -586,6 +818,7 @@ namespace UniGame.StaticEcs.Network.Tests
 
                 Assert.That(installed.Begins, Is.Zero);
                 Assert.That(installed.Ends, Is.Zero);
+                Assert.That(installed.Sequence, Is.Empty);
             }
             finally
             {
@@ -597,10 +830,19 @@ namespace UniGame.StaticEcs.Network.Tests
         {
             internal int Begins { get; private set; }
             internal int Ends { get; private set; }
+            internal readonly List<string> Sequence = new List<string>();
 
-            public void Begin(NetworkDiagnosticPhase phase) => Begins++;
+            public void Begin(NetworkDiagnosticPhase phase)
+            {
+                Begins++;
+                Sequence.Add("begin:" + phase);
+            }
 
-            public void End(NetworkDiagnosticPhase phase) => Ends++;
+            public void End(NetworkDiagnosticPhase phase)
+            {
+                Ends++;
+                Sequence.Add("end:" + phase);
+            }
         }
 
         private sealed class ReentrantRemovalPeerObserver : INetworkPeerObserver

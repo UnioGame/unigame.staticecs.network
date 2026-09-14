@@ -365,8 +365,12 @@ namespace UniGame.StaticEcs.Network
         NativeUpdate = 5,
         /// <summary>Inbound transport receive callback processing.</summary>
         ReceiveCallback = 6,
+        /// <summary>Snapshot chunk wire encoding into a pooled packet lease.</summary>
+        SnapshotChunkEncode = 7,
+        /// <summary>Transport send attempt for one encoded snapshot chunk.</summary>
+        TransportTrySend = 8,
         /// <summary>Number of measured phases; not a valid phase value.</summary>
-        Count = 7,
+        Count = 9,
     }
 
     /// <summary>Receives allocation-free begin/end notifications for measured server phases.</summary>
