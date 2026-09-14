@@ -716,6 +716,77 @@ namespace UniGame.StaticEcs.Network.Tests
             }
         }
 
+        [Test]
+        public void ExactPreflightRejectionEmitsPreparationScopeWithoutEncodeOrTransport()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            MemoryNetworkTransport.CreatePair(new ConnectionId(924),
+                out var clientTransport, out var serverEndpoint);
+            var original = NetworkDiagnosticMarkers.Sink;
+            var sink = new RecordingMarkerSink();
+            try
+            {
+                using (clientTransport)
+                using (var serverTransport = new PreflightNetworkTransport(
+                           serverEndpoint))
+                using (var server = new NetworkServer<AuthorityWorld>(
+                    Schema<AuthorityWorld>(true), static (_, _) => true))
+                {
+                    var authority =
+                        World<AuthorityWorld>.NewEntity<TestEntity>();
+                    authority.Set(new TestComponent { Value = 1 });
+                    server.AddConnection(serverTransport, 1, 1,
+                        new ScopeId(1));
+                    SendPeerPacket(clientTransport,
+                        Schema<AuthorityWorld>(true).Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    NetworkDiagnosticMarkers.Sink = sink;
+                    serverTransport.ResetCounters();
+                    serverTransport.ProbeResults.Enqueue(true);
+                    serverTransport.ProbeResults.Enqueue(false);
+                    server.BeginTick();
+                    server.CompleteTick();
+
+                    Assert.That(serverTransport.SentPacketCount, Is.Zero);
+                    var phases = new[]
+                    {
+                        NetworkDiagnosticPhase.PacketPreparation,
+                        NetworkDiagnosticPhase.SnapshotChunkEncode,
+                        NetworkDiagnosticPhase.TransportTrySend,
+                    };
+                    Assert.That(CollectPhaseEvents(sink, phases),
+                        Is.EqualTo(new[]
+                        {
+                            "begin:PacketPreparation",
+                            "end:PacketPreparation"
+                        }));
+                    Assert.That(PhaseEventCount(sink,
+                        NetworkDiagnosticPhase.SnapshotChunkEncode,
+                        begin: true), Is.Zero);
+                    Assert.That(PhaseEventCount(sink,
+                        NetworkDiagnosticPhase.SnapshotChunkEncode,
+                        begin: false), Is.Zero);
+                    Assert.That(PhaseEventCount(sink,
+                        NetworkDiagnosticPhase.TransportTrySend,
+                        begin: true), Is.Zero);
+                    Assert.That(PhaseEventCount(sink,
+                        NetworkDiagnosticPhase.TransportTrySend,
+                        begin: false), Is.Zero);
+                    Assert.That(sink.Begins, Is.EqualTo(sink.Ends));
+                }
+            }
+            finally
+            {
+                NetworkDiagnosticMarkers.Sink = original;
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
         private static void AssertRelevantSnapshotScopes(
             RecordingMarkerSink sink, params string[] expected)
         {

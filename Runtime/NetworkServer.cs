@@ -826,6 +826,15 @@ namespace UniGame.StaticEcs.Network
         {
             using var packetScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.PacketPreparation);
             var started = Stopwatch.GetTimestamp();
+            // A reliable transport may be transiently backpressured for this exact
+            // encoded chunk even though it accepted the minimum probe. Reject it
+            // before renting and encoding a packet; TrySend stays authoritative
+            // after a true preflight.
+            var exactPacketBytes = checked(PacketHeader.Size +
+                SnapshotChunkHeader.Size + body.Length);
+            if (peer.Transport is INetworkReliableSendPreflight preflight &&
+                !preflight.CanAcceptReliablePacket(exactPacketBytes))
+                return false;
             var header = new PacketHeader
             {
                 Kind = PacketKind.SnapshotChunk,

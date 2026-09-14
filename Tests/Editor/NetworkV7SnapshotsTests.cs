@@ -1584,6 +1584,376 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void ExactPreflightRejectsKeyframeBeforeEncodeAndTrySend()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var scope = new ScopeId(51);
+                using var pool = new NetworkBufferPool(0);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(821),
+                    out var clientTransport, out var serverEndpoint);
+                using (clientTransport)
+                using (var serverTransport = new PreflightNetworkTransport(
+                           serverEndpoint))
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true, bufferPool: pool))
+                {
+                    server.AddConnection(serverTransport, 1, 1, scope);
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+
+                    serverTransport.ResetCounters();
+                    serverTransport.ProbeResults.Enqueue(true);
+                    serverTransport.ProbeResults.Enqueue(false);
+
+                    var before = pool.CaptureDiagnostics();
+                    server.Tick(_ => { });
+                    var after = pool.CaptureDiagnostics();
+
+                    Assert.That(serverTransport.PreflightCalls, Is.EqualTo(2));
+                    Assert.That(serverTransport.ProbeBytes[0],
+                        Is.EqualTo(PacketHeader.Size +
+                            SnapshotChunkHeader.Size + 1),
+                        "the first probe is the minimum-size preflight");
+                    Assert.That(server.TryGetCapture(scope, 1, out var capture),
+                        Is.True);
+                    Assert.That(serverTransport.ProbeBytes[1],
+                        Is.EqualTo(PacketHeader.Size +
+                            SnapshotChunkHeader.Size + capture.ByteLength),
+                        "the exact probe includes the encoded chunk body");
+                    Assert.That(serverTransport.SentPacketCount, Is.Zero,
+                        "an exact preflight rejection must not call TrySend");
+                    Assert.That(clientTransport.TryReceive(out _), Is.False);
+                    Assert.That(after.OutstandingLeases - before.OutstandingLeases,
+                        Is.EqualTo(1),
+                        "only the snapshot capture lease may remain");
+                    Assert.That(after.PoolMisses - before.PoolMisses,
+                        Is.EqualTo(1),
+                        "no packet buffer may be rented for a rejected chunk");
+
+                    serverTransport.ResetCounters();
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe),
+                        "keyframe rejection must retain recovery");
+                }
+
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ExactPreflightRejectsFirstDeltaChunkBeforeEncodeAndTrySend()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var scope = new ScopeId(52);
+                using var pool = new NetworkBufferPool(0);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(822),
+                    out var clientTransport, out var serverEndpoint);
+                using (clientTransport)
+                using (var serverTransport = new PreflightNetworkTransport(
+                           serverEndpoint))
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true, bufferPool: pool))
+                {
+                    server.AddConnection(serverTransport, 1, 1, scope);
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    var unchanged =
+                        World<AuthorityWorld>.NewEntity<SecondEntity>();
+                    unchanged.Set(new TestComponent { Value = 10 });
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 2, 1);
+                    server.Receive();
+
+                    entity.Set(new TestComponent { Value = 2 });
+                    serverTransport.ResetCounters();
+                    serverTransport.ProbeResults.Enqueue(true);
+                    serverTransport.ProbeResults.Enqueue(false);
+
+                    var before = pool.CaptureDiagnostics();
+                    server.Tick(_ => { });
+                    var after = pool.CaptureDiagnostics();
+
+                    Assert.That(serverTransport.PreflightCalls, Is.EqualTo(2));
+                    Assert.That(serverTransport.ProbeBytes[0],
+                        Is.EqualTo(PacketHeader.Size +
+                            SnapshotChunkHeader.Size + 1));
+                    Assert.That(serverTransport.ProbeBytes[1],
+                        Is.GreaterThan(serverTransport.ProbeBytes[0]),
+                        "a delta chunk body exceeds the minimum probe body");
+                    Assert.That(serverTransport.SentPacketCount, Is.Zero,
+                        "a rejected first delta chunk must not call TrySend");
+                    Assert.That(clientTransport.TryReceive(out _), Is.False);
+                    Assert.That(after.PoolMisses - before.PoolMisses,
+                        Is.EqualTo(2),
+                        "only the snapshot capture and delta encode may rent");
+
+                    serverTransport.ResetCounters();
+                    server.Tick(_ => { });
+                    var delta = ReceiveChunk(clientTransport);
+                    Assert.That(delta.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta),
+                        "a rejected first delta chunk must not force recovery");
+                    Assert.That(delta.BaselineTick, Is.EqualTo(1));
+                    Assert.That(delta.SnapshotTick, Is.EqualTo(3));
+                }
+
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ExactPreflightRejectsLaterChunkAfterAcceptedChunkKeepsRecovery()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var scope = new ScopeId(53);
+                using var pool = new NetworkBufferPool(0);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(823),
+                    out var clientTransport, out var serverEndpoint);
+                using (clientTransport)
+                using (var serverTransport = new PreflightNetworkTransport(
+                           serverEndpoint))
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true, bufferPool: pool))
+                {
+                    server.AddConnection(serverTransport, 1, 1, scope);
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    var unchanged =
+                        World<AuthorityWorld>.NewEntity<SecondEntity>();
+                    unchanged.Set(new TestComponent { Value = 10 });
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 2, 1);
+                    server.Receive();
+
+                    entity.Set(new TestComponent { Value = 2 });
+                    serverTransport.MaxReliablePayloadBytes = PacketHeader.Size +
+                        SnapshotChunkHeader.Size + 1;
+                    serverTransport.ResetCounters();
+                    serverTransport.ProbeResults.Enqueue(true);
+                    serverTransport.ProbeResults.Enqueue(true);
+                    serverTransport.ProbeResults.Enqueue(false);
+                    server.Tick(_ => { });
+
+                    Assert.That(serverTransport.PreflightCalls, Is.EqualTo(3),
+                        "minimum plus two chunk probes");
+                    Assert.That(serverTransport.ProbeBytes[0],
+                        Is.EqualTo(PacketHeader.Size +
+                            SnapshotChunkHeader.Size + 1));
+                    Assert.That(serverTransport.SentPacketCount,
+                        Is.EqualTo(1),
+                        "only the first accepted chunk may be sent");
+                    var accepted = ReceiveSnapshotChunk(clientTransport,
+                        out _, out _);
+                    Assert.That(accepted.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(accepted.ChunkIndex, Is.Zero);
+                    Assert.That(accepted.ChunkCount, Is.GreaterThan(1));
+
+                    serverTransport.MaxReliablePayloadBytes =
+                        serverEndpoint.MaxReliablePayloadBytes;
+                    serverTransport.ResetCounters();
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe),
+                        "a later rejected chunk must force keyframe recovery");
+                }
+
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ExactPreflightProbesMultiChunkKeyframeSizesIncludingShortLastChunk()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var scope = new ScopeId(54);
+                using var pool = new NetworkBufferPool(0);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(824),
+                    out var clientTransport, out var serverEndpoint);
+                using (clientTransport)
+                using (var serverTransport = new PreflightNetworkTransport(
+                           serverEndpoint))
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true, bufferPool: pool))
+                {
+                    server.AddConnection(serverTransport, 1, 1, scope);
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    for (var i = 0; i < 5; i++)
+                    {
+                        var entity =
+                            World<AuthorityWorld>.NewEntity<TestEntity>();
+                        entity.Set(new TestComponent { Value = i });
+                    }
+
+                    server.Tick(_ => { });
+                    ReceiveSnapshotChunk(clientTransport, out _, out _);
+                    Assert.That(server.TryGetCapture(scope, 1, out var first),
+                        Is.True);
+                    var bodyLength = first.ByteLength;
+                    Assert.That(bodyLength, Is.GreaterThan(2));
+
+                    var maxBody = bodyLength / 2 + 1;
+                    serverTransport.MaxReliablePayloadBytes = PacketHeader.Size +
+                        SnapshotChunkHeader.Size + maxBody;
+                    serverTransport.ResetCounters();
+                    server.Tick(_ => { });
+                    Assert.That(server.TryGetCapture(scope, 2, out var second),
+                        Is.True);
+                    Assert.That(second.ByteLength, Is.EqualTo(bodyLength));
+
+                    var expectedChunks =
+                        (int)((bodyLength + (long)maxBody - 1L) / maxBody);
+                    Assert.That(expectedChunks, Is.EqualTo(2));
+                    Assert.That(serverTransport.ProbeBytes.Count,
+                        Is.EqualTo(1 + expectedChunks));
+                    Assert.That(serverTransport.ProbeBytes[0],
+                        Is.EqualTo(PacketHeader.Size +
+                            SnapshotChunkHeader.Size + 1),
+                        "the first probe is the minimum-size preflight");
+                    var offset = 0;
+                    for (var i = 0; i < expectedChunks; i++)
+                    {
+                        var chunkBody = Math.Min(maxBody, bodyLength - offset);
+                        Assert.That(serverTransport.ProbeBytes[1 + i],
+                            Is.EqualTo(PacketHeader.Size +
+                                SnapshotChunkHeader.Size + chunkBody));
+                        offset += chunkBody;
+                    }
+                    Assert.That(offset, Is.EqualTo(bodyLength));
+                    Assert.That(bodyLength - (expectedChunks - 1) * maxBody,
+                        Is.LessThan(maxBody),
+                        "the last chunk is shorter than a full chunk body");
+
+                    var chunkOffset = 0;
+                    for (uint i = 0; i < expectedChunks; i++)
+                    {
+                        var chunk = ReceiveSnapshotChunk(clientTransport,
+                            out _, out var chunkBody);
+                        Assert.That(chunk.PayloadKind,
+                            Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                        Assert.That(chunk.ChunkIndex, Is.EqualTo(i));
+                        Assert.That(chunk.ChunkCount,
+                            Is.EqualTo((uint)expectedChunks));
+                        var expected = Math.Min(maxBody,
+                            bodyLength - chunkOffset);
+                        Assert.That(chunkBody.Length, Is.EqualTo(expected));
+                        chunkOffset += expected;
+                    }
+                }
+
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void TransportWithoutPreflightSendsSnapshotUnchanged()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var scope = new ScopeId(55);
+                using var pool = new NetworkBufferPool(0);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(825),
+                    out var clientTransport, out var serverEndpoint);
+                using (clientTransport)
+                using (serverEndpoint)
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true, bufferPool: pool))
+                {
+                    server.AddConnection(serverEndpoint, 1, 1, scope);
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                }
+
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
         public void ClientRequiresBaselineAndOnlyKeyframeClearsRecovery()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
@@ -1924,6 +2294,8 @@ namespace UniGame.StaticEcs.Network.Tests
             internal int LastRequestedBytes { get; private set; }
             internal int SentPacketCount { get; private set; }
             internal int FailOnSendNumber { get; set; }
+            internal readonly Queue<bool> ProbeResults = new Queue<bool>();
+            internal readonly List<int> ProbeBytes = new List<int>();
 
             public ConnectionId Connection => _inner.Connection;
             public int MaxReliablePayloadBytes { get; set; }
@@ -1933,6 +2305,9 @@ namespace UniGame.StaticEcs.Network.Tests
             {
                 PreflightCalls++;
                 LastRequestedBytes = packetBytes;
+                ProbeBytes.Add(packetBytes);
+                if (ProbeResults.Count > 0)
+                    return ProbeResults.Dequeue();
                 return CanAccept;
             }
 
@@ -1954,6 +2329,8 @@ namespace UniGame.StaticEcs.Network.Tests
             {
                 SentPacketCount = 0;
                 PreflightCalls = 0;
+                ProbeResults.Clear();
+                ProbeBytes.Clear();
             }
 
             public bool TryReceive(out NetworkBufferLease packet) =>
