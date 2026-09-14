@@ -1204,6 +1204,196 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void RejectedFirstDeltaChunkKeepsRecoveryDisabled()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var scope = new ScopeId(44);
+                using var pool = new NetworkBufferPool(0);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(814),
+                    out var clientTransport, out var serverEndpoint);
+                using (clientTransport)
+                using (var serverTransport = new LimitedNetworkTransport(
+                           serverEndpoint,
+                           serverEndpoint.MaxUnreliablePayloadBytes))
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true, bufferPool: pool))
+                {
+                    server.AddConnection(serverTransport, 1, 1, scope);
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    var unchanged =
+                        World<AuthorityWorld>.NewEntity<SecondEntity>();
+                    unchanged.Set(new TestComponent { Value = 10 });
+                    server.Tick(_ => { });
+                    var keyframe = ReceiveChunk(clientTransport);
+                    Assert.That(keyframe.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                    Assert.That(keyframe.SnapshotTick, Is.EqualTo(1));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 2, 1);
+                    server.Receive();
+
+                    entity.Set(new TestComponent { Value = 2 });
+                    serverTransport.ResetSentPackets();
+                    serverTransport.FailOnSendNumber = 1;
+                    server.Tick(_ => { });
+                    Assert.That(serverTransport.SentPacketCount,
+                        Is.EqualTo(1));
+
+                    serverTransport.FailOnSendNumber = 0;
+                    server.Tick(_ => { });
+                    var delta = ReceiveChunk(clientTransport);
+                    Assert.That(delta.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(delta.BaselineTick, Is.EqualTo(1));
+                    Assert.That(delta.SnapshotTick, Is.EqualTo(3));
+                }
+
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void RejectedInitialKeyframeIsRetriedAsKeyframe()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                using var pool = new NetworkBufferPool(0);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(815),
+                    out var clientTransport, out var serverEndpoint);
+                using (clientTransport)
+                using (var serverTransport = new LimitedNetworkTransport(
+                           serverEndpoint,
+                           serverEndpoint.MaxUnreliablePayloadBytes))
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true, bufferPool: pool))
+                {
+                    server.AddConnection(serverTransport, 1, 1,
+                        new ScopeId(45));
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    serverTransport.ResetSentPackets();
+                    serverTransport.FailOnSendNumber = 1;
+                    server.Tick(_ => { });
+                    Assert.That(serverTransport.SentPacketCount,
+                        Is.EqualTo(1));
+
+                    serverTransport.FailOnSendNumber = 0;
+                    server.Tick(_ => { });
+                    var retry = ReceiveChunk(clientTransport);
+                    Assert.That(retry.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                    Assert.That(retry.SnapshotTick, Is.EqualTo(2));
+                }
+
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void RejectedLaterChunkOfMultiChunkDeltaKeepsRecovery()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var scope = new ScopeId(46);
+                using var pool = new NetworkBufferPool(0);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(816),
+                    out var clientTransport, out var serverEndpoint);
+                using (clientTransport)
+                using (var serverTransport = new LimitedNetworkTransport(
+                           serverEndpoint,
+                           serverEndpoint.MaxUnreliablePayloadBytes))
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true, bufferPool: pool))
+                {
+                    server.AddConnection(serverTransport, 1, 1, scope);
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    var unchanged =
+                        World<AuthorityWorld>.NewEntity<SecondEntity>();
+                    unchanged.Set(new TestComponent { Value = 10 });
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 2, 1);
+                    server.Receive();
+
+                    entity.Set(new TestComponent { Value = 2 });
+                    serverTransport.MaxReliablePayloadBytes = PacketHeader.Size +
+                        SnapshotChunkHeader.Size + 1;
+                    serverTransport.ResetSentPackets();
+                    serverTransport.FailOnSendNumber = 2;
+                    server.Tick(_ => { });
+                    Assert.That(serverTransport.SentPacketCount,
+                        Is.EqualTo(2));
+                    var accepted = ReceiveSnapshotChunk(clientTransport,
+                        out _, out _);
+                    Assert.That(accepted.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(accepted.ChunkIndex, Is.Zero);
+                    Assert.That(accepted.ChunkCount, Is.GreaterThan(1));
+
+                    serverTransport.FailOnSendNumber = 0;
+                    serverTransport.MaxReliablePayloadBytes =
+                        serverEndpoint.MaxReliablePayloadBytes;
+                    server.Tick(_ => { });
+                    var recovery = ReceiveSnapshotChunk(clientTransport,
+                        out _, out _);
+                    Assert.That(recovery.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                }
+
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
         public void ClientRequiresBaselineAndOnlyKeyframeClearsRecovery()
         {
             CreateReplicationWorld<AuthorityWorld>(true);

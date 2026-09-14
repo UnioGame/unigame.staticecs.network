@@ -734,6 +734,7 @@ namespace UniGame.StaticEcs.Network
                 return;
             }
             var chunkCount = checked((uint)chunkCountLong);
+            var acceptedChunk = false;
             for (uint chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++)
             {
                 var bodyOffset = checked((int)((long)chunkIndex *
@@ -758,9 +759,16 @@ namespace UniGame.StaticEcs.Network
                         chunkIndex + 1, in chunk,
                         body.Slice(bodyOffset, bodyLength)))
                 {
+                    // A rejected first chunk of a normal delta carries no
+                    // recovery signal: no application chunk was accepted, so
+                    // the client is not awaiting a keyframe and the next tick
+                    // can retry the delta against the same baseline.
+                    if (!keyframe && !acceptedChunk && chunkIndex == 0)
+                        return;
                     peer.ResyncRequested = true;
                     return;
                 }
+                acceptedChunk = true;
             }
         }
 
