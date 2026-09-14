@@ -1394,6 +1394,196 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void PreflightRejectionSkipsSnapshotPreparationAndKeepsRecoveryDisabled()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                using var pool = new NetworkBufferPool(0);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(817),
+                    out var clientTransport, out var serverEndpoint);
+                using (clientTransport)
+                using (var serverTransport = new PreflightNetworkTransport(
+                           serverEndpoint))
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true, bufferPool: pool))
+                {
+                    server.AddConnection(serverTransport, 1, 1,
+                        new ScopeId(47));
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    var unchanged =
+                        World<AuthorityWorld>.NewEntity<SecondEntity>();
+                    unchanged.Set(new TestComponent { Value = 10 });
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 2, 1);
+                    server.Receive();
+
+                    entity.Set(new TestComponent { Value = 2 });
+                    serverTransport.CanAccept = false;
+                    serverTransport.ResetCounters();
+                    server.Tick(_ => { });
+
+                    Assert.That(serverTransport.PreflightCalls,
+                        Is.EqualTo(1));
+                    Assert.That(serverTransport.LastRequestedBytes,
+                        Is.EqualTo(PacketHeader.Size +
+                            SnapshotChunkHeader.Size + 1));
+                    Assert.That(serverTransport.SentPacketCount, Is.Zero);
+                    Assert.That(clientTransport.TryReceive(out _), Is.False);
+
+                    serverTransport.CanAccept = true;
+                    server.Tick(_ => { });
+                    var delta = ReceiveChunk(clientTransport);
+                    Assert.That(delta.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta),
+                        "preflight rejection must not force recovery");
+                    Assert.That(delta.BaselineTick, Is.EqualTo(1));
+                    Assert.That(delta.SnapshotTick, Is.EqualTo(3));
+                }
+
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void MaxReliableLimitIsCheckedBeforePreflight()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                using var pool = new NetworkBufferPool(0);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(819),
+                    out var clientTransport, out var serverEndpoint);
+                using (clientTransport)
+                using (var serverTransport = new PreflightNetworkTransport(
+                           serverEndpoint))
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true, bufferPool: pool))
+                {
+                    server.AddConnection(serverTransport, 1, 1,
+                        new ScopeId(49));
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    serverTransport.MaxReliablePayloadBytes =
+                        PacketHeader.Size + SnapshotChunkHeader.Size;
+                    serverTransport.ResetCounters();
+                    server.Tick(_ => { });
+                    Assert.That(serverTransport.PreflightCalls, Is.Zero,
+                        "the hard reliable limit must be checked first");
+                    Assert.That(serverTransport.SentPacketCount, Is.Zero);
+                    Assert.That(clientTransport.TryReceive(out _), Is.False);
+
+                    serverTransport.MaxReliablePayloadBytes =
+                        serverEndpoint.MaxReliablePayloadBytes;
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                }
+
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void PreflightAcceptanceDoesNotGuaranteeTrySendAdmission()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                using var pool = new NetworkBufferPool(0);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(820),
+                    out var clientTransport, out var serverEndpoint);
+                using (clientTransport)
+                using (var serverTransport = new PreflightNetworkTransport(
+                           serverEndpoint))
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true, bufferPool: pool))
+                {
+                    server.AddConnection(serverTransport, 1, 1,
+                        new ScopeId(50));
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    var unchanged =
+                        World<AuthorityWorld>.NewEntity<SecondEntity>();
+                    unchanged.Set(new TestComponent { Value = 10 });
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 2, 1);
+                    server.Receive();
+
+                    entity.Set(new TestComponent { Value = 2 });
+                    serverTransport.ResetSentPackets();
+                    serverTransport.FailOnSendNumber = 1;
+                    server.Tick(_ => { });
+                    Assert.That(serverTransport.PreflightCalls,
+                        Is.GreaterThanOrEqualTo(1));
+                    Assert.That(serverTransport.SentPacketCount,
+                        Is.EqualTo(1));
+                    Assert.That(clientTransport.TryReceive(out _), Is.False,
+                        "a raced TrySend rejection must consume its lease");
+
+                    serverTransport.FailOnSendNumber = 0;
+                    server.Tick(_ => { });
+                    var delta = ReceiveChunk(clientTransport);
+                    Assert.That(delta.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta),
+                        "a raced first delta chunk must not force recovery");
+                    Assert.That(delta.BaselineTick, Is.EqualTo(1));
+                    Assert.That(delta.SnapshotTick, Is.EqualTo(3));
+                }
+
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
         public void ClientRequiresBaselineAndOnlyKeyframeClearsRecovery()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
@@ -1715,6 +1905,61 @@ namespace UniGame.StaticEcs.Network.Tests
             {
                 World<AuthorityWorld>.Destroy();
             }
+        }
+
+        private sealed class PreflightNetworkTransport : INetworkTransport,
+            INetworkReliableSendPreflight
+        {
+            private readonly INetworkTransport _inner;
+
+            internal PreflightNetworkTransport(INetworkTransport inner)
+            {
+                _inner = inner;
+                MaxReliablePayloadBytes = inner.MaxReliablePayloadBytes;
+                MaxUnreliablePayloadBytes = inner.MaxUnreliablePayloadBytes;
+            }
+
+            internal bool CanAccept { get; set; } = true;
+            internal int PreflightCalls { get; private set; }
+            internal int LastRequestedBytes { get; private set; }
+            internal int SentPacketCount { get; private set; }
+            internal int FailOnSendNumber { get; set; }
+
+            public ConnectionId Connection => _inner.Connection;
+            public int MaxReliablePayloadBytes { get; set; }
+            public int MaxUnreliablePayloadBytes { get; set; }
+
+            public bool CanAcceptReliablePacket(int packetBytes)
+            {
+                PreflightCalls++;
+                LastRequestedBytes = packetBytes;
+                return CanAccept;
+            }
+
+            public bool TrySend(NetworkBufferLease packet)
+            {
+                SentPacketCount++;
+                if (FailOnSendNumber == SentPacketCount)
+                {
+                    packet?.Dispose();
+                    return false;
+                }
+
+                return _inner.TrySend(packet);
+            }
+
+            internal void ResetSentPackets() => SentPacketCount = 0;
+
+            internal void ResetCounters()
+            {
+                SentPacketCount = 0;
+                PreflightCalls = 0;
+            }
+
+            public bool TryReceive(out NetworkBufferLease packet) =>
+                _inner.TryReceive(out packet);
+
+            public void Dispose() => _inner.Dispose();
         }
 
         private sealed class ThrowingSendTransport : INetworkTransport

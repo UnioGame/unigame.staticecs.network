@@ -23,6 +23,18 @@ namespace UniGame.StaticEcs.Network
         bool TryReceive(out NetworkBufferLease packet);
     }
 
+    /// <summary>Allows a reliable transport to advertise whether a complete packet can currently be accepted.</summary>
+    public interface INetworkReliableSendPreflight
+    {
+        /// <summary>
+        /// Reports whether the transport can currently accept one complete reliable packet of
+        /// <paramref name="packetBytes"/> bytes, including <see cref="PacketHeader"/>.
+        /// Advisory and side-effect-free: it does not reserve capacity and <see cref="INetworkTransport.TrySend"/>
+        /// remains authoritative. A <c>false</c> result means the packet cannot currently be accepted.
+        /// </summary>
+        bool CanAcceptReliablePacket(int packetBytes);
+    }
+
     /// <summary>Provides deterministic in-memory transport for tests and editor sandboxes.</summary>
     public sealed class MemoryNetworkTransport : INetworkTransport
     {

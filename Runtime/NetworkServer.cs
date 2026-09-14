@@ -689,6 +689,21 @@ namespace UniGame.StaticEcs.Network
 
         private void SendSnapshot(Peer peer, NetworkSnapshot snapshot)
         {
+            var reliableLimit = peer.Transport.MaxReliablePayloadBytes;
+            if (reliableLimit <= PacketHeader.Size + SnapshotChunkHeader.Size)
+            {
+                peer.ResyncRequested = true;
+                return;
+            }
+            // A transport that cannot currently accept even the smallest snapshot
+            // chunk is transiently backpressured. Skip baseline lookup and delta
+            // encoding without requesting recovery: no application chunk was
+            // rejected, so the next tick can retry against the same baseline.
+            if (peer.Transport is INetworkReliableSendPreflight preflight &&
+                !preflight.CanAcceptReliablePacket(
+                    PacketHeader.Size + SnapshotChunkHeader.Size + 1))
+                return;
+
             NetworkBufferLease delta = null;
             var baselineTick = peer.AcknowledgedSnapshotTick;
             NetworkSnapshot baseline = null;
@@ -712,12 +727,6 @@ namespace UniGame.StaticEcs.Network
             }
 
             var body = keyframe ? snapshot.Bytes.Span : delta.Span;
-            var reliableLimit = peer.Transport.MaxReliablePayloadBytes;
-            if (reliableLimit <= PacketHeader.Size + SnapshotChunkHeader.Size)
-            {
-                peer.ResyncRequested = true;
-                return;
-            }
             var maxBody = Math.Min(
                 reliableLimit - PacketHeader.Size - SnapshotChunkHeader.Size,
                 ProtocolLimits.MaxWirePayloadBytes - SnapshotChunkHeader.Size);
