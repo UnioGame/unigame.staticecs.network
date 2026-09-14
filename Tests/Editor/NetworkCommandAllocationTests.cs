@@ -475,7 +475,7 @@ namespace UniGame.StaticEcs.Network.Tests
         private static void Report(string name, int iterations, long bytes)
         {
             var perOperation = iterations == 0 ? 0d : (double)bytes / iterations;
-            TestContext.Progress.WriteLine(
+            TestContext.Out.WriteLine(
                 "alloc " + name +
                 " iterations=" + iterations.ToString(CultureInfo.InvariantCulture) +
                 " bytes=" + bytes.ToString(CultureInfo.InvariantCulture) +
