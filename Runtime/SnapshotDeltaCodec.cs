@@ -10,6 +10,11 @@ namespace UniGame.StaticEcs.Network
     {
         private const int DeltaHeaderSize = sizeof(uint) * 3;
         private const int EntityHeaderSize = sizeof(ulong) + sizeof(uint) + sizeof(byte) + sizeof(ushort);
+        private const int EntityLayoutBytes =
+            sizeof(ulong) + sizeof(ushort) + sizeof(int) * 3;
+        private const int RecordLayoutBytes =
+            sizeof(uint) + sizeof(byte) + sizeof(int) * 2;
+        private const long MaxLayoutBytes = 4L << 20;
 
 #if UNITY_INCLUDE_TESTS
         [ThreadStatic]
@@ -53,7 +58,7 @@ namespace UniGame.StaticEcs.Network
                     AfterCandidateRentForTests?.Invoke();
 #endif
                     var writer = new SnapshotWriter(candidate.WritableSpan);
-                    if (!TryEncodeCore(baseline, target, ref writer, out _) ||
+                    if (!TryEncodePlan(baseline, target, ref writer, out _) ||
                         writer.Length >= target.ByteLength)
                         return false;
 
@@ -150,6 +155,301 @@ namespace UniGame.StaticEcs.Network
                 recordCount += entity.RecordCount;
             }
             return offset == bytes.Length;
+        }
+
+        // Builds a primitive-only layout index for one pool-owned snapshot. The
+        // build validates the payload hash, declared counts, ordering, bounds, and
+        // exact byte coverage before publishing; every rental is returned exactly
+        // once when validation fails.
+        internal static bool TryBuildLayout(NetworkSnapshot snapshot,
+            out SnapshotEntityLayout[] entities,
+            out SnapshotRecordLayout[] records, out int entityCount,
+            out int recordCount, out ISnapshotLayoutPool layoutPool)
+        {
+            entities = null;
+            records = null;
+            entityCount = 0;
+            recordCount = 0;
+            layoutPool = null;
+            if (snapshot == null || snapshot.ByteLength < sizeof(uint) ||
+                snapshot.ByteLength > ProtocolLimits.MaxDecodedPayloadBytes ||
+                snapshot.EntityCount < 0 ||
+                snapshot.EntityCount > ProtocolLimits.MaxEntities ||
+                snapshot.RecordCount < 0 ||
+                snapshot.RecordCount > ProtocolLimits.MaxEntities *
+                    ProtocolLimits.MaxRecordsPerEntity ||
+                Hashing.XxHash64(snapshot.Bytes.Span) != snapshot.PayloadHash)
+                return false;
+
+            var indexBytes = checked((long)snapshot.EntityCount *
+                EntityLayoutBytes + (long)snapshot.RecordCount * RecordLayoutBytes);
+            var bound = Math.Min(checked(2L * snapshot.ByteLength), MaxLayoutBytes);
+            if (indexBytes > bound)
+                return false;
+
+            var pool = SnapshotLayoutMemory.Pool;
+            var rentedEntities = pool.RentEntities(Math.Max(1,
+                snapshot.EntityCount));
+            var rentedRecords = pool.RentRecords(Math.Max(1,
+                snapshot.RecordCount));
+            var success = false;
+            try
+            {
+                if (!TryFillLayout(snapshot.Bytes.Span, rentedEntities,
+                        rentedRecords, snapshot.EntityCount,
+                        snapshot.RecordCount))
+                    return false;
+                success = true;
+            }
+            finally
+            {
+                if (!success)
+                {
+                    pool.ReturnEntities(rentedEntities);
+                    pool.ReturnRecords(rentedRecords);
+                }
+            }
+
+            entities = rentedEntities;
+            records = rentedRecords;
+            entityCount = snapshot.EntityCount;
+            recordCount = snapshot.RecordCount;
+            layoutPool = pool;
+            return true;
+        }
+
+        private static bool TryFillLayout(ReadOnlySpan<byte> bytes,
+            SnapshotEntityLayout[] entities, SnapshotRecordLayout[] records,
+            int expectedEntities, int expectedRecords)
+        {
+            var offset = 0;
+            if (!TryReadUint(bytes, ref offset, out var rawEntityCount) ||
+                rawEntityCount != (uint)expectedEntities)
+                return false;
+            var entityIndex = 0;
+            var recordIndex = 0;
+            ulong previousGid = 0;
+            var hasPrevious = false;
+            while (offset < bytes.Length)
+            {
+                if (entityIndex >= expectedEntities)
+                    return false;
+                var entityStart = offset;
+                if (!TryReadEntityHeader(bytes, ref offset, out var gid, out _,
+                        out _, out var recordCount, out _) ||
+                    hasPrevious && CompareGid(previousGid, gid) >= 0 ||
+                    recordCount > expectedRecords - recordIndex)
+                    return false;
+                var recordStart = recordIndex;
+                byte previousKind = 0;
+                uint previousType = 0;
+                var hasPreviousRecord = false;
+                for (var index = 0; index < recordCount; index++)
+                {
+                    var recordOffset = offset;
+                    if (!TryReadCanonicalRecord(bytes, ref offset,
+                            out var record) ||
+                        hasPreviousRecord && CompareRecord(previousKind,
+                            previousType, record.Kind, record.TypeId) >= 0)
+                        return false;
+                    previousKind = record.Kind;
+                    previousType = record.TypeId;
+                    hasPreviousRecord = true;
+                    records[recordIndex] = new SnapshotRecordLayout
+                    {
+                        TypeId = record.TypeId,
+                        Kind = record.Kind,
+                        RawOffset = recordOffset,
+                        RawLength = offset - recordOffset,
+                    };
+                    recordIndex++;
+                }
+                entities[entityIndex] = new SnapshotEntityLayout
+                {
+                    Gid = gid,
+                    RecordCount = recordCount,
+                    RawOffset = entityStart,
+                    RawLength = offset - entityStart,
+                    RecordStart = recordStart,
+                };
+                entityIndex++;
+                previousGid = gid;
+                hasPrevious = true;
+            }
+            return entityIndex == expectedEntities &&
+                   recordIndex == expectedRecords && offset == bytes.Length;
+        }
+
+        private static bool TryEncodePlan(NetworkSnapshot baseline,
+            NetworkSnapshot target, ref SnapshotWriter writer,
+            out uint operationCount)
+        {
+            if (baseline.TryGetLayout(out var baselineLayout) &&
+                target.TryGetLayout(out var targetLayout))
+                return TryEncodeCoreIndexed(baseline, baselineLayout, target,
+                    targetLayout, ref writer, out operationCount);
+            return TryEncodeCore(baseline, target, ref writer,
+                out operationCount);
+        }
+
+        private static bool TryEncodeCoreIndexed(NetworkSnapshot baseline,
+            SnapshotLayoutView baselineLayout, NetworkSnapshot target,
+            SnapshotLayoutView targetLayout, ref SnapshotWriter writer,
+            out uint operationCount)
+        {
+            operationCount = 0;
+            if (!writer.TryWriteUint(checked((uint)target.EntityCount)) ||
+                !writer.TryWriteUint(checked((uint)target.RecordCount)))
+                return false;
+            var countOffset = writer.Length;
+            if (!writer.TryWriteUint(0))
+                return false;
+
+            var baselineBytes = baseline.Bytes.Span;
+            var targetBytes = target.Bytes.Span;
+            var baselineEntities = baselineLayout.Entities;
+            var targetEntities = targetLayout.Entities;
+            var baselineCount = baselineLayout.EntityCount;
+            var targetCount = targetLayout.EntityCount;
+            var baselineIndex = 0;
+            var targetIndex = 0;
+            var hasBaseline = baselineIndex < baselineCount;
+            var hasTarget = targetIndex < targetCount;
+
+            while (hasBaseline || hasTarget)
+            {
+                var comparison = !hasBaseline ? 1 : !hasTarget ? -1 :
+                    CompareGid(baselineEntities[baselineIndex].Gid,
+                        targetEntities[targetIndex].Gid);
+                if (comparison < 0)
+                {
+                    if (!writer.TryWriteByte((byte)EntityOperation.Remove) ||
+                        !writer.TryWriteUlong(
+                            baselineEntities[baselineIndex].Gid))
+                        return false;
+                    operationCount++;
+                    baselineIndex++;
+                    hasBaseline = baselineIndex < baselineCount;
+                    continue;
+                }
+                if (comparison > 0)
+                {
+                    var added = targetEntities[targetIndex];
+                    if (!writer.TryWriteByte((byte)EntityOperation.Add) ||
+                        !writer.TryWrite(targetBytes.Slice(added.RawOffset,
+                            added.RawLength)))
+                        return false;
+                    operationCount++;
+                    targetIndex++;
+                    hasTarget = targetIndex < targetCount;
+                    continue;
+                }
+
+                if (!EntityRawEqual(baselineBytes, baselineEntities[baselineIndex],
+                        targetBytes, targetEntities[targetIndex]))
+                {
+                    if (!TryWritePatchIndexed(baselineBytes, baselineLayout,
+                            baselineIndex, targetBytes, targetLayout,
+                            targetIndex, ref writer))
+                        return false;
+                    operationCount++;
+                }
+                baselineIndex++;
+                targetIndex++;
+                hasBaseline = baselineIndex < baselineCount;
+                hasTarget = targetIndex < targetCount;
+            }
+
+            return writer.TryWriteUintAt(countOffset, operationCount);
+        }
+
+        private static bool EntityRawEqual(ReadOnlySpan<byte> baselineBytes,
+            in SnapshotEntityLayout baseline, ReadOnlySpan<byte> targetBytes,
+            in SnapshotEntityLayout target)
+        {
+            var left = baselineBytes.Slice(baseline.RawOffset, baseline.RawLength);
+            var right = targetBytes.Slice(target.RawOffset, target.RawLength);
+            return left.SequenceEqual(right);
+        }
+
+        private static bool TryWritePatchIndexed(ReadOnlySpan<byte> baselineBytes,
+            SnapshotLayoutView baselineLayout, int baselineEntityIndex,
+            ReadOnlySpan<byte> targetBytes, SnapshotLayoutView targetLayout,
+            int targetEntityIndex, ref SnapshotWriter writer)
+        {
+            var baselineEntity = baselineLayout.Entities[baselineEntityIndex];
+            var targetEntity = targetLayout.Entities[targetEntityIndex];
+            if (!writer.TryWriteByte((byte)EntityOperation.Patch) ||
+                !writer.TryWrite(targetBytes.Slice(targetEntity.RawOffset,
+                    EntityHeaderSize)))
+                return false;
+            var countOffset = writer.Length;
+            if (!writer.TryWriteUint(0))
+                return false;
+
+            var baselineRecords = baselineLayout.Records;
+            var targetRecords = targetLayout.Records;
+            var baselineIndex = baselineEntity.RecordStart;
+            var baselineEnd = baselineEntity.RecordStart +
+                baselineEntity.RecordCount;
+            var targetIndex = targetEntity.RecordStart;
+            var targetEnd = targetEntity.RecordStart + targetEntity.RecordCount;
+            var hasBaseline = baselineIndex < baselineEnd;
+            var hasTarget = targetIndex < targetEnd;
+            uint operationCount = 0;
+
+            while (hasBaseline || hasTarget)
+            {
+                var comparison = !hasBaseline ? 1 : !hasTarget ? -1 :
+                    CompareRecord(baselineRecords[baselineIndex].Kind,
+                        baselineRecords[baselineIndex].TypeId,
+                        targetRecords[targetIndex].Kind,
+                        targetRecords[targetIndex].TypeId);
+                if (comparison < 0)
+                {
+                    var removed = baselineRecords[baselineIndex];
+                    if (!writer.TryWriteByte((byte)RecordOperation.Remove) ||
+                        !writer.TryWriteUint(removed.TypeId) ||
+                        !writer.TryWriteByte(removed.Kind))
+                        return false;
+                    operationCount++;
+                    baselineIndex++;
+                    hasBaseline = baselineIndex < baselineEnd;
+                    continue;
+                }
+                if (comparison > 0)
+                {
+                    var added = targetRecords[targetIndex];
+                    if (!writer.TryWriteByte((byte)RecordOperation.Add) ||
+                        !writer.TryWrite(targetBytes.Slice(added.RawOffset,
+                            added.RawLength)))
+                        return false;
+                    operationCount++;
+                    targetIndex++;
+                    hasTarget = targetIndex < targetEnd;
+                    continue;
+                }
+
+                var baselineRecord = baselineRecords[baselineIndex];
+                var targetRecord = targetRecords[targetIndex];
+                var left = baselineBytes.Slice(baselineRecord.RawOffset,
+                    baselineRecord.RawLength);
+                var right = targetBytes.Slice(targetRecord.RawOffset,
+                    targetRecord.RawLength);
+                if (!left.SequenceEqual(right))
+                {
+                    if (!writer.TryWriteByte((byte)RecordOperation.Replace) ||
+                        !writer.TryWrite(right))
+                        return false;
+                    operationCount++;
+                }
+                baselineIndex++;
+                targetIndex++;
+                hasBaseline = baselineIndex < baselineEnd;
+                hasTarget = targetIndex < targetEnd;
+            }
+
+            return writer.TryWriteUintAt(countOffset, operationCount);
         }
 
         private static bool TryEncodeCore(NetworkSnapshot baseline,

@@ -40,11 +40,84 @@ namespace UniGame.StaticEcs.Network
         EntityConflict,
     }
 
+    /// <summary>Describes one validated canonical entity by primitive offsets.</summary>
+    internal struct SnapshotEntityLayout
+    {
+        internal ulong Gid;
+        internal ushort RecordCount;
+        internal int RawOffset;
+        internal int RawLength;
+        internal int RecordStart;
+    }
+
+    /// <summary>Describes one validated canonical record by primitive offsets.</summary>
+    internal struct SnapshotRecordLayout
+    {
+        internal uint TypeId;
+        internal byte Kind;
+        internal int RawOffset;
+        internal int RawLength;
+    }
+
+    /// <summary>Rents immutable primitive layout arrays for the snapshot layout index.</summary>
+    internal interface ISnapshotLayoutPool
+    {
+        SnapshotEntityLayout[] RentEntities(int length);
+        void ReturnEntities(SnapshotEntityLayout[] array);
+        SnapshotRecordLayout[] RentRecords(int length);
+        void ReturnRecords(SnapshotRecordLayout[] array);
+    }
+
+    /// <summary>Production layout-array source backed by the shared array pool.</summary>
+    internal sealed class SharedSnapshotLayoutPool : ISnapshotLayoutPool
+    {
+        internal static readonly SharedSnapshotLayoutPool Instance =
+            new SharedSnapshotLayoutPool();
+
+        public SnapshotEntityLayout[] RentEntities(int length) =>
+            ArrayPool<SnapshotEntityLayout>.Shared.Rent(length);
+        public void ReturnEntities(SnapshotEntityLayout[] array) =>
+            ArrayPool<SnapshotEntityLayout>.Shared.Return(array, false);
+        public SnapshotRecordLayout[] RentRecords(int length) =>
+            ArrayPool<SnapshotRecordLayout>.Shared.Rent(length);
+        public void ReturnRecords(SnapshotRecordLayout[] array) =>
+            ArrayPool<SnapshotRecordLayout>.Shared.Return(array, false);
+    }
+
+    /// <summary>Selects the layout-array source; tests replace the shared seam.</summary>
+    internal static class SnapshotLayoutMemory
+    {
+        internal static ISnapshotLayoutPool Pool = SharedSnapshotLayoutPool.Instance;
+    }
+
+    /// <summary>Views one immutable published layout index without allocating.</summary>
+    internal readonly struct SnapshotLayoutView
+    {
+        internal SnapshotLayoutView(SnapshotEntityLayout[] entities,
+            SnapshotRecordLayout[] records, int entityCount, int recordCount)
+        {
+            Entities = entities;
+            Records = records;
+            EntityCount = entityCount;
+            RecordCount = recordCount;
+        }
+
+        internal SnapshotEntityLayout[] Entities { get; }
+        internal SnapshotRecordLayout[] Records { get; }
+        internal int EntityCount { get; }
+        internal int RecordCount { get; }
+    }
+
     /// <summary>Owns one immutable pooled canonical full-snapshot buffer.</summary>
     public sealed class NetworkSnapshot : IDisposable
     {
         private NetworkBufferLease _bytes;
         private NetworkSnapshotPool _pool;
+        private SnapshotEntityLayout[] _layoutEntities;
+        private SnapshotRecordLayout[] _layoutRecords;
+        private ISnapshotLayoutPool _layoutPool;
+        private int _layoutEntityCount;
+        private int _layoutRecordCount;
 
         internal NetworkSnapshot()
         {
@@ -93,9 +166,50 @@ namespace UniGame.StaticEcs.Network
         internal byte[] Buffer => _bytes?.Buffer;
         internal int Offset => _bytes?.Offset ?? 0;
 
+        // Only pool-owned snapshots may lazily build and reuse the layout. Public
+        // descriptors keep the parser/hash path so caller-supplied bytes are never
+        // trusted without revalidation.
+        internal bool TryGetLayout(out SnapshotLayoutView layout)
+        {
+            if (_layoutEntities != null)
+            {
+                layout = new SnapshotLayoutView(_layoutEntities, _layoutRecords,
+                    _layoutEntityCount, _layoutRecordCount);
+                return true;
+            }
+            layout = default;
+            if (_pool == null)
+                return false;
+            if (!SnapshotDeltaCodec.TryBuildLayout(this, out var entities,
+                    out var records, out var entityCount, out var recordCount,
+                    out var layoutPool))
+                return false;
+            _layoutEntities = entities;
+            _layoutRecords = records;
+            _layoutEntityCount = entityCount;
+            _layoutRecordCount = recordCount;
+            _layoutPool = layoutPool;
+            layout = new SnapshotLayoutView(entities, records, entityCount,
+                recordCount);
+            return true;
+        }
+
         /// <inheritdoc />
         public void Dispose()
         {
+            // Detach the index first so a double dispose can never return the
+            // layout arrays twice, then release the payload and descriptor.
+            var layoutPool = _layoutPool;
+            var layoutEntities = _layoutEntities;
+            var layoutRecords = _layoutRecords;
+            _layoutPool = null;
+            _layoutEntities = null;
+            _layoutRecords = null;
+            _layoutEntityCount = 0;
+            _layoutRecordCount = 0;
+            layoutPool?.ReturnEntities(layoutEntities);
+            layoutPool?.ReturnRecords(layoutRecords);
+
             if (_bytes == null)
                 return;
             var pool = _pool;

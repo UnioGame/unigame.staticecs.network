@@ -53,6 +53,26 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void PooledSnapshotDescriptorDisposeIsIdempotentAndReusable()
+        {
+            using var pool = new NetworkBufferPool(1024);
+            var snapshots = new NetworkSnapshotPool(2);
+            var descriptor = snapshots.Rent(1, default, new ScopeId(7),
+                pool.Copy(new byte[] { 1, 2, 3, 4 }), 1, 1);
+
+            descriptor.Dispose();
+            AssertReleased(pool);
+            descriptor.Dispose();
+            AssertReleased(pool);
+
+            var reused = snapshots.Rent(2, default, new ScopeId(7),
+                pool.Copy(new byte[] { 5, 6, 7, 8 }), 1, 1);
+            Assert.That(reused, Is.SameAs(descriptor));
+            reused.Dispose();
+            AssertReleased(pool);
+        }
+
+        [Test]
         public void SimulatorLossDuplicationAndResetReleaseEveryLease()
         {
             using var pool = new NetworkBufferPool(4096);

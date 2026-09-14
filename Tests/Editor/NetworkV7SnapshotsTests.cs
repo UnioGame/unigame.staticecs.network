@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
 using FFS.Libraries.StaticEcs;
@@ -2413,6 +2414,405 @@ namespace UniGame.StaticEcs.Network.Tests
             finally
             {
                 canonical?.Dispose();
+            }
+        }
+
+        [Test]
+        public void SnapshotLayoutIndex_MatchesParserOracleAcrossOperations()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            var pool = new NetworkBufferPool(4L << 20);
+            var schema = Schema<AuthorityWorld>(true);
+            var scope = new ScopeId(61);
+            var replicator = new NetworkReplicator<AuthorityWorld>(schema,
+                static (_, _) => true, scope, bufferPool: pool);
+            NetworkSnapshot baseline = null;
+            NetworkSnapshot unchanged = null;
+            NetworkSnapshot target = null;
+            try
+            {
+                var patched = World<AuthorityWorld>.NewEntity<TestEntity>();
+                patched.Set(new TestComponent { Value = 2 });
+                patched.Set<TestTag>();
+                var removed = World<AuthorityWorld>.NewEntity<SecondEntity>();
+                removed.Set(new TestComponent { Value = 3 });
+
+                Assert.That(replicator.Capture(1, out baseline),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(replicator.Capture(2, out unchanged),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(unchanged.Bytes.Span.SequenceEqual(
+                    baseline.Bytes.Span), Is.True);
+                AssertIndexedDeltaMatchesParser(pool, baseline, unchanged);
+
+                patched.Set(new TestComponent { Value = 4 });
+                patched.Delete<TestTag>();
+                removed.Destroy();
+                var added = World<AuthorityWorld>.NewEntity<SecondEntity>();
+                added.Set(new TestComponent { Value = 5 });
+                Assert.That(replicator.Capture(3, out target),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                AssertIndexedDeltaMatchesParser(pool, baseline, target);
+                AssertIndexedDeltaMatchesParser(pool, unchanged, target);
+            }
+            finally
+            {
+                target?.Dispose();
+                unchanged?.Dispose();
+                baseline?.Dispose();
+                replicator.Dispose();
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+                pool.Dispose();
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void SnapshotLayoutIndex_NeverBuildsForPublicSnapshots()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            var pool = new NetworkBufferPool(4L << 20);
+            var schema = Schema<AuthorityWorld>(true);
+            var replicator = new NetworkReplicator<AuthorityWorld>(schema,
+                static (_, _) => true, new ScopeId(62), bufferPool: pool);
+            var recording = new RecordingLayoutPool();
+            var previous = SnapshotLayoutMemory.Pool;
+            NetworkSnapshot capturedBaseline = null;
+            NetworkSnapshot capturedTarget = null;
+            NetworkSnapshot baseline = null;
+            NetworkSnapshot target = null;
+            NetworkBufferLease baselineLease = null;
+            NetworkBufferLease targetLease = null;
+            try
+            {
+                SnapshotLayoutMemory.Pool = recording;
+                var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                entity.Set(new TestComponent { Value = 1 });
+                Assert.That(replicator.Capture(1, out capturedBaseline),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                entity.Set(new TestComponent { Value = 2 });
+                Assert.That(replicator.Capture(2, out capturedTarget),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+
+                baselineLease = pool.Copy(capturedBaseline.Bytes.Span);
+                baseline = new NetworkSnapshot(capturedBaseline.ServerTick,
+                    capturedBaseline.SchemaFingerprint, capturedBaseline.Scope,
+                    baselineLease, capturedBaseline.EntityCount,
+                    capturedBaseline.RecordCount);
+                baselineLease = null;
+                targetLease = pool.Copy(capturedTarget.Bytes.Span);
+                target = new NetworkSnapshot(capturedTarget.ServerTick,
+                    capturedTarget.SchemaFingerprint, capturedTarget.Scope,
+                    targetLease, capturedTarget.EntityCount,
+                    capturedTarget.RecordCount);
+                targetLease = null;
+
+                Assert.That(SnapshotDeltaCodec.TryEncode(pool, baseline,
+                    target, out var delta), Is.True);
+                delta.Dispose();
+                Assert.That(recording.Rented.Count, Is.Zero,
+                    "public descriptors must keep the parser/hash path");
+            }
+            finally
+            {
+                SnapshotLayoutMemory.Pool = previous;
+                baselineLease?.Dispose();
+                targetLease?.Dispose();
+                target?.Dispose();
+                baseline?.Dispose();
+                capturedTarget?.Dispose();
+                capturedBaseline?.Dispose();
+                replicator.Dispose();
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+                pool.Dispose();
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void SnapshotLayoutIndex_ReturnsEveryRentalExactlyOnce()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            var pool = new NetworkBufferPool(4L << 20);
+            var schema = Schema<AuthorityWorld>(true);
+            var replicator = new NetworkReplicator<AuthorityWorld>(schema,
+                static (_, _) => true, new ScopeId(63), bufferPool: pool);
+            var recording = new RecordingLayoutPool();
+            var previous = SnapshotLayoutMemory.Pool;
+            NetworkSnapshot baseline = null;
+            NetworkSnapshot target = null;
+            NetworkBufferLease delta = null;
+            try
+            {
+                SnapshotLayoutMemory.Pool = recording;
+                var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                entity.Set(new TestComponent { Value = 1 });
+                Assert.That(replicator.Capture(1, out baseline),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                entity.Set(new TestComponent { Value = 2 });
+                Assert.That(replicator.Capture(2, out target),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+
+                Assert.That(SnapshotDeltaCodec.TryEncode(pool, baseline,
+                    target, out delta), Is.True);
+                delta.Dispose();
+                delta = null;
+                Assert.That(recording.Rented.Count, Is.EqualTo(4),
+                    "baseline and target each rent entity and record arrays");
+                Assert.That(recording.Returned.Count, Is.Zero,
+                    "a live layout keeps its rentals until disposal");
+
+                baseline.Dispose();
+                Assert.That(recording.Returned.Count, Is.EqualTo(2));
+                target.Dispose();
+                Assert.That(recording.Returned.Count, Is.EqualTo(4));
+
+                // double dispose must detach and return exactly once
+                baseline.Dispose();
+                target.Dispose();
+                Assert.That(recording.Returned.Count, Is.EqualTo(4));
+
+                // a reused descriptor rebuilds a fresh layout for its new bytes
+                baseline = null;
+                target = null;
+                entity.Set(new TestComponent { Value = 3 });
+                Assert.That(replicator.Capture(3, out baseline),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                entity.Set(new TestComponent { Value = 4 });
+                Assert.That(replicator.Capture(4, out target),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(SnapshotDeltaCodec.TryEncode(pool, baseline,
+                    target, out delta), Is.True);
+                delta.Dispose();
+                delta = null;
+                Assert.That(recording.Rented.Count, Is.EqualTo(8),
+                    "a reused descriptor must rent a fresh layout");
+                Assert.That(recording.Returned.Count, Is.EqualTo(4));
+            }
+            finally
+            {
+                SnapshotLayoutMemory.Pool = previous;
+                delta?.Dispose();
+                baseline?.Dispose();
+                target?.Dispose();
+                AssertReturnedExactlyOnce(recording);
+                replicator.Dispose();
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+                pool.Dispose();
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void SnapshotLayoutIndex_ReturnsRentalsWhenValidationFails()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            var content = new NetworkBufferPool(4L << 20);
+            var schema = Schema<AuthorityWorld>(true);
+            var replicator = new NetworkReplicator<AuthorityWorld>(schema,
+                static (_, _) => true, new ScopeId(64), bufferPool: content);
+            var recording = new RecordingLayoutPool();
+            var previous = SnapshotLayoutMemory.Pool;
+            NetworkSnapshot good = null;
+            NetworkSnapshot malformed = null;
+            NetworkBufferLease malformedLease = null;
+            try
+            {
+                SnapshotLayoutMemory.Pool = recording;
+                var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                entity.Set(new TestComponent { Value = 1 });
+                Assert.That(replicator.Capture(1, out good),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+
+                var bytes = good.Bytes.ToArray();
+                malformedLease = content.Copy(bytes);
+                malformed = replicator.CreateSnapshot(good.ServerTick + 1,
+                    good.SchemaFingerprint, good.Scope, malformedLease,
+                    good.EntityCount, good.RecordCount + 1);
+                malformedLease = null;
+
+                Assert.That(malformed.TryGetLayout(out _), Is.False);
+                Assert.That(recording.Rented.Count, Is.EqualTo(2),
+                    "the build rents before validation completes");
+                Assert.That(recording.Returned.Count, Is.EqualTo(2),
+                    "a failed build returns both rentals immediately");
+                AssertReturnedExactlyOnce(recording);
+
+                // the parser fallback still rejects the malformed descriptor
+                Assert.That(SnapshotDeltaCodec.TryEncode(content, good,
+                    malformed, out var delta), Is.False);
+                Assert.That(delta, Is.Null);
+            }
+            finally
+            {
+                SnapshotLayoutMemory.Pool = previous;
+                malformedLease?.Dispose();
+                malformed?.Dispose();
+                good?.Dispose();
+                AssertReturnedExactlyOnce(recording);
+                replicator.Dispose();
+                Assert.That(content.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+                content.Dispose();
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void SnapshotLayoutIndex_SteadyStateEncodeAllocatesNoManagedMemory()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            var pool = new NetworkBufferPool(4L << 20);
+            var schema = Schema<AuthorityWorld>(true);
+            var replicator = new NetworkReplicator<AuthorityWorld>(schema,
+                static (_, _) => true, new ScopeId(65), bufferPool: pool);
+            NetworkSnapshot baseline = null;
+            NetworkSnapshot target = null;
+            NetworkBufferLease warm = null;
+            NetworkBufferLease delta = null;
+            try
+            {
+                var first = World<AuthorityWorld>.NewEntity<TestEntity>();
+                first.Set(new TestComponent { Value = 1 });
+                for (var i = 0; i < 8; i++)
+                {
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 100 + i });
+                }
+                Assert.That(replicator.Capture(1, out baseline),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                first.Set(new TestComponent { Value = 2 });
+                Assert.That(replicator.Capture(2, out target),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+
+                Assert.That(SnapshotDeltaCodec.TryEncode(pool, baseline,
+                    target, out warm), Is.True);
+                warm.Dispose();
+                warm = null;
+
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+                var before = GC.GetAllocatedBytesForCurrentThread();
+                var encoded = true;
+                for (var i = 0; i < 32; i++)
+                {
+                    if (!SnapshotDeltaCodec.TryEncode(pool, baseline, target,
+                            out delta))
+                        encoded = false;
+                    delta?.Dispose();
+                    delta = null;
+                }
+                var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+                Assert.That(encoded, Is.True);
+                Assert.That(allocated, Is.Zero,
+                    "steady-state indexed encode must not allocate managed memory");
+            }
+            finally
+            {
+                warm?.Dispose();
+                delta?.Dispose();
+                target?.Dispose();
+                baseline?.Dispose();
+                replicator.Dispose();
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+                pool.Dispose();
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        private static void AssertIndexedDeltaMatchesParser(
+            NetworkBufferPool pool, NetworkSnapshot baseline,
+            NetworkSnapshot target)
+        {
+            NetworkBufferLease indexed = null;
+            NetworkBufferLease parsed = null;
+            NetworkSnapshot baselineClone = null;
+            NetworkSnapshot targetClone = null;
+            try
+            {
+                Assert.That(SnapshotDeltaCodec.TryEncode(pool, baseline,
+                    target, out indexed), Is.True);
+                baselineClone = new NetworkSnapshot(baseline.ServerTick,
+                    baseline.SchemaFingerprint, baseline.Scope,
+                    pool.Copy(baseline.Bytes.Span), baseline.EntityCount,
+                    baseline.RecordCount);
+                targetClone = new NetworkSnapshot(target.ServerTick,
+                    target.SchemaFingerprint, target.Scope,
+                    pool.Copy(target.Bytes.Span), target.EntityCount,
+                    target.RecordCount);
+                Assert.That(SnapshotDeltaCodec.TryEncode(pool, baselineClone,
+                    targetClone, out parsed), Is.True);
+                Assert.That(indexed.Span.SequenceEqual(parsed.Span), Is.True,
+                    "indexed encode must be byte-identical to the parser oracle");
+            }
+            finally
+            {
+                parsed?.Dispose();
+                targetClone?.Dispose();
+                baselineClone?.Dispose();
+                indexed?.Dispose();
+            }
+        }
+
+        private static void AssertReturnedExactlyOnce(
+            RecordingLayoutPool recording)
+        {
+            Assert.That(recording.Returned.Count,
+                Is.EqualTo(recording.Rented.Count));
+            // Compare as a multiset: the array pool is free to hand the same
+            // array back out for a later rental, but each rental must return
+            // exactly one matching array.
+            for (var i = 0; i < recording.Rented.Count; i++)
+            {
+                var rented = 0;
+                var returned = 0;
+                for (var j = 0; j < recording.Rented.Count; j++)
+                    if (ReferenceEquals(recording.Rented[i],
+                            recording.Rented[j]))
+                        rented++;
+                for (var j = 0; j < recording.Returned.Count; j++)
+                    if (ReferenceEquals(recording.Rented[i],
+                            recording.Returned[j]))
+                        returned++;
+                Assert.That(returned, Is.EqualTo(rented),
+                    "every rental must be returned exactly once");
+            }
+        }
+
+        private sealed class RecordingLayoutPool : ISnapshotLayoutPool
+        {
+            internal readonly List<object> Rented = new List<object>();
+            internal readonly List<object> Returned = new List<object>();
+
+            public SnapshotEntityLayout[] RentEntities(int length)
+            {
+                var array = ArrayPool<SnapshotEntityLayout>.Shared.Rent(length);
+                Rented.Add(array);
+                return array;
+            }
+
+            public void ReturnEntities(SnapshotEntityLayout[] array)
+            {
+                Returned.Add(array);
+                ArrayPool<SnapshotEntityLayout>.Shared.Return(array);
+            }
+
+            public SnapshotRecordLayout[] RentRecords(int length)
+            {
+                var array = ArrayPool<SnapshotRecordLayout>.Shared.Rent(length);
+                Rented.Add(array);
+                return array;
+            }
+
+            public void ReturnRecords(SnapshotRecordLayout[] array)
+            {
+                Returned.Add(array);
+                ArrayPool<SnapshotRecordLayout>.Shared.Return(array);
             }
         }
 
