@@ -201,12 +201,13 @@ namespace UniGame.StaticEcs.Network
                     // counted until their receipt is actually accepted by transport.
                     if (peer.HasPendingReceiptWork)
                         continue;
-                    // Snapshots are state, so an unacknowledged snapshot already
-                    // represents the newest reliable state in flight. Waiting for
-                    // its application prevents reliable ordered backlog from
-                    // growing while preserving eventual convergence.
+                    // Snapshots are state, so only one snapshot batch should
+                    // be in flight. Waiting for the native reliable backlog to drain
+                    // prevents a fast ACK from immediately replacing a packet
+                    // whose delivery callback and fragments are still pending.
+                    // This keeps ordered delivery bounded without changing the
+                    // snapshot baseline or transaction guarantees.
                     if (peer.LastSnapshotSentTick != 0 &&
-                        peer.AcknowledgedSnapshotTick < peer.LastSnapshotSentTick &&
                         peer.Transport is INetworkReliableSendState reliableState &&
                         reliableState.HasPendingReliablePackets)
                         continue;
