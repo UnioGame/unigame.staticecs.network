@@ -201,6 +201,15 @@ namespace UniGame.StaticEcs.Network
                     // counted until their receipt is actually accepted by transport.
                     if (peer.HasPendingReceiptWork)
                         continue;
+                    // Snapshots are state, so an unacknowledged snapshot already
+                    // represents the newest reliable state in flight. Waiting for
+                    // its application prevents reliable ordered backlog from
+                    // growing while preserving eventual convergence.
+                    if (peer.LastSnapshotSentTick != 0 &&
+                        peer.AcknowledgedSnapshotTick < peer.LastSnapshotSentTick &&
+                        peer.Transport is INetworkReliableSendState reliableState &&
+                        reliableState.HasPendingReliablePackets)
+                        continue;
                     using var snapshotScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.Snapshot);
                     if (!_captures.TryGetValue(peer.Scope, out var capture))
                     {
@@ -780,6 +789,8 @@ namespace UniGame.StaticEcs.Network
                 }
                 acceptedChunk = true;
             }
+            if (acceptedChunk)
+                peer.LastSnapshotSentTick = snapshot.ServerTick;
         }
 
         private bool TryGetSnapshotDelta(ScopeId scope, uint baselineTick,
@@ -1214,6 +1225,7 @@ namespace UniGame.StaticEcs.Network
             internal readonly ScopeId Scope;
             internal uint PacketSequence;
             internal uint AcknowledgedSnapshotTick;
+            internal uint LastSnapshotSentTick;
             internal uint ServerProcessedCommandTick;
             internal uint ServerProcessedCommandSequence;
             internal bool ResyncRequested;

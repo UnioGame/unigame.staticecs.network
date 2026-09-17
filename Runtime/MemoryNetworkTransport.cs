@@ -23,6 +23,13 @@ namespace UniGame.StaticEcs.Network
         bool TryReceive(out NetworkBufferLease packet);
     }
 
+    /// <summary>Reports whether reliable packets remain queued or in flight in the transport.</summary>
+    public interface INetworkReliableSendState
+    {
+        /// <summary>Gets whether at least one reliable packet is pending delivery.</summary>
+        bool HasPendingReliablePackets { get; }
+    }
+
     /// <summary>Allows a reliable transport to advertise whether a complete packet can currently be accepted.</summary>
     public interface INetworkReliableSendPreflight
     {
