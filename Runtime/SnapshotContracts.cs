@@ -3,6 +3,7 @@ namespace UniGame.StaticEcs.Network
     using System;
     using System.Buffers;
     using System.Collections.Generic;
+    using System.Runtime.InteropServices;
     using FFS.Libraries.StaticEcs;
     using FFS.Libraries.StaticPack;
 
@@ -41,6 +42,7 @@ namespace UniGame.StaticEcs.Network
     }
 
     /// <summary>Describes one validated canonical entity by primitive offsets.</summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
     internal struct SnapshotEntityLayout
     {
         internal ulong Gid;
@@ -51,6 +53,7 @@ namespace UniGame.StaticEcs.Network
     }
 
     /// <summary>Describes one validated canonical record by primitive offsets.</summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
     internal struct SnapshotRecordLayout
     {
         internal uint TypeId;

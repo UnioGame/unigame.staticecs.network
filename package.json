@@ -9,6 +9,7 @@
   "keywords": ["unigame", "ecs", "network", "replication"],
   "dependencies": {
     "com.unigame.staticecs": "2026.1.0",
-    "com.felid-force-studios.static-pack": "1.2.6"
+    "com.felid-force-studios.static-pack": "1.2.6",
+    "com.unity.burst": "2.0.0"
   }
 }

@@ -5,15 +5,16 @@
     "unigame.staticecs.network.protocol",
     "unigame.staticecs",
     "FFS.StaticEcs",
-    "FFS.StaticPack"
+    "FFS.StaticPack",
+    "Unity.Burst"
   ],
   "includePlatforms": [],
   "excludePlatforms": [],
-  "allowUnsafeCode": false,
+  "allowUnsafeCode": true,
   "overrideReferences": false,
   "precompiledReferences": [],
   "autoReferenced": true,
   "defineConstraints": [],
   "versionDefines": [],
-  "noEngineReferences": true
+  "noEngineReferences": false
 }

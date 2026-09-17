@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
@@ -267,6 +268,111 @@ namespace UniGame.StaticEcs.Network.Tests
             finally { World<AuthorityWorld>.Destroy(); World<ClientAWorld>.Destroy(); }
         }
 
+#if UNITY_2022_2_OR_NEWER
+        [Test]
+        public void SnapshotDeltaCodec_BurstBackendIsCompiled()
+        {
+            Assert.That(SnapshotDeltaBurstBackend.IsAvailableForTests, Is.True);
+        }
+
+#endif
+#if UNITY_2022_2_OR_NEWER
+        [Test]
+        public void SnapshotDeltaCodec_BurstMatchesPortableAndReportsBatchTiming()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            var pool = new NetworkBufferPool(4L << 20);
+            var replicator = new NetworkReplicator<AuthorityWorld>(
+                Schema<AuthorityWorld>(true), static (_, _) => true,
+                new ScopeId(19), bufferPool: pool);
+            var snapshots = new List<NetworkSnapshot>();
+            var actor = World<AuthorityWorld>.NewEntity<TestEntity>();
+            for (var ballastIndex = 0; ballastIndex < 256; ballastIndex++)
+            {
+                var ballast = World<AuthorityWorld>.NewEntity<TestEntity>();
+                ballast.Set(new TestComponent { Value = 1000 + ballastIndex });
+            }
+            try
+            {
+                for (var tick = 0; tick <= 31; tick++)
+                {
+                    actor.Set(new TestComponent { Value = tick * 7 + 3 });
+                    Assert.That(replicator.Capture((uint)(tick + 1), out var snapshot),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    snapshots.Add(snapshot);
+                }
+
+                var expected = new byte[31][];
+                SnapshotDeltaBurstBackend.ForcePortableForTests = true;
+                for (var index = 0; index < 31; index++)
+                {
+                    Assert.That(SnapshotDeltaCodec.TryEncode(pool, snapshots[index],
+                        snapshots[index + 1], out var delta), Is.True);
+                    expected[index] = delta.Span.ToArray();
+                    delta.Dispose();
+                }
+
+                SnapshotDeltaBurstBackend.ForcePortableForTests = false;
+                for (var index = 0; index < 31; index++)
+                {
+                    Assert.That(SnapshotDeltaCodec.TryEncode(pool, snapshots[index],
+                        snapshots[index + 1], out var delta), Is.True);
+                    using (delta)
+                    {
+                        Assert.That(delta.Span.SequenceEqual(expected[index]), Is.True,
+                            $"Burst delta differs at pair {index}");
+                    }
+                }
+
+                long Measure(bool burst)
+                {
+                    SnapshotDeltaBurstBackend.ForcePortableForTests = !burst;
+                    var start = Stopwatch.GetTimestamp();
+                    for (var index = 0; index < 31; index++)
+                    {
+                        Assert.That(SnapshotDeltaCodec.TryEncode(pool, snapshots[index],
+                            snapshots[index + 1], out var delta), Is.True);
+                        delta.Dispose();
+                    }
+                    return Stopwatch.GetTimestamp() - start;
+                }
+
+                var portableSamples = new long[5];
+                var burstSamples = new long[5];
+                for (var warmup = 0; warmup < 2; warmup++)
+                {
+                    Measure(false);
+                    Measure(true);
+                }
+                for (var sample = 0; sample < portableSamples.Length; sample++)
+                {
+                    portableSamples[sample] = Measure(false);
+                    burstSamples[sample] = Measure(true);
+                }
+                Array.Sort(portableSamples);
+                Array.Sort(burstSamples);
+                var portableMedian = portableSamples[portableSamples.Length / 2];
+                var burstMedian = burstSamples[burstSamples.Length / 2];
+                var portableMs = portableMedian * 1000d / Stopwatch.Frequency;
+                var burstMs = burstMedian * 1000d / Stopwatch.Frequency;
+                TestContext.Progress.WriteLine(
+                    $"SnapshotDeltaCodec 31-pair median portable={portableMs:F3}ms burst={burstMs:F3}ms speedup={(portableMs - burstMs) / portableMs:P1}");
+                Assert.That(burstMedian, Is.LessThan(portableMedian * 0.8),
+                    $"Burst median must improve by at least 20% (portable={portableMs:F3}ms, burst={burstMs:F3}ms)");
+            }
+            finally
+            {
+                SnapshotDeltaBurstBackend.ForcePortableForTests = false;
+                foreach (var snapshot in snapshots)
+                    snapshot.Dispose();
+                replicator.Dispose();
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                pool.Dispose();
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+#endif
         [Test]
         public void SnapshotDeltaCodec_ReconstructsNoOpAndCanonicalChanges()
         {

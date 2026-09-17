@@ -58,7 +58,7 @@ namespace UniGame.StaticEcs.Network
                     AfterCandidateRentForTests?.Invoke();
 #endif
                     var writer = new SnapshotWriter(candidate.WritableSpan);
-                    if (!TryEncodePlan(baseline, target, ref writer, out _) ||
+                    if (!TryEncodePlan(baseline, target, candidate, ref writer, out _) ||
                         writer.Length >= target.ByteLength)
                         return false;
 
@@ -289,8 +289,8 @@ namespace UniGame.StaticEcs.Network
         }
 
         private static bool TryEncodePlan(NetworkSnapshot baseline,
-            NetworkSnapshot target, ref SnapshotWriter writer,
-            out uint operationCount)
+            NetworkSnapshot target, NetworkBufferLease candidate,
+            ref SnapshotWriter writer, out uint operationCount)
         {
             operationCount = 0;
             var baselineCached = baseline.TryReadCachedLayout(
@@ -298,7 +298,7 @@ namespace UniGame.StaticEcs.Network
             var targetCached = target.TryReadCachedLayout(out var targetLayout);
             if (baselineCached && targetCached)
                 return TryEncodeCoreIndexed(baseline, baselineLayout, target,
-                    targetLayout, ref writer, out operationCount);
+                    targetLayout, candidate, ref writer, out operationCount);
 
             // Build the missing side(s) before publishing anything so a pair that
             // cannot produce an indexed encode never leaves a lone layout behind.
@@ -314,7 +314,7 @@ namespace UniGame.StaticEcs.Network
                 targetLayout = new SnapshotLayoutView(targetEntities,
                     targetRecords, targetEntityCount, targetRecordCount);
                 return TryEncodeCoreIndexed(baseline, baselineLayout, target,
-                    targetLayout, ref writer, out operationCount);
+                    targetLayout, candidate, ref writer, out operationCount);
             }
 
             if (targetCached)
@@ -329,7 +329,7 @@ namespace UniGame.StaticEcs.Network
                 baselineLayout = new SnapshotLayoutView(baselineEntities,
                     baselineRecords, baselineEntityCount, baselineRecordCount);
                 return TryEncodeCoreIndexed(baseline, baselineLayout, target,
-                    targetLayout, ref writer, out operationCount);
+                    targetLayout, candidate, ref writer, out operationCount);
             }
 
             if (!baseline.TryBuildLayout(out var pendingBaselineEntities,
@@ -363,7 +363,7 @@ namespace UniGame.StaticEcs.Network
                     pendingTargetRecords, pendingTargetEntityCount,
                     pendingTargetRecordCount);
                 return TryEncodeCoreIndexed(baseline, baselineLayout, target,
-                    targetLayout, ref writer, out operationCount);
+                    targetLayout, candidate, ref writer, out operationCount);
             }
             finally
             {
@@ -376,6 +376,27 @@ namespace UniGame.StaticEcs.Network
         }
 
         private static bool TryEncodeCoreIndexed(NetworkSnapshot baseline,
+            SnapshotLayoutView baselineLayout, NetworkSnapshot target,
+            SnapshotLayoutView targetLayout, NetworkBufferLease candidate,
+            ref SnapshotWriter writer, out uint operationCount)
+        {
+#if UNITY_2022_2_OR_NEWER
+            var burstResult = SnapshotDeltaBurstBackend.TryEncode(baseline,
+                baselineLayout, target, targetLayout, candidate,
+                out var burstLength, out operationCount);
+            if (burstResult == SnapshotDeltaBurstResult.Success)
+                return writer.TrySetLength(burstLength);
+            if (burstResult == SnapshotDeltaBurstResult.Failed)
+            {
+                operationCount = 0;
+                return false;
+            }
+#endif
+            return TryEncodeCoreIndexedPortable(baseline, baselineLayout, target,
+                targetLayout, ref writer, out operationCount);
+        }
+
+        private static bool TryEncodeCoreIndexedPortable(NetworkSnapshot baseline,
             SnapshotLayoutView baselineLayout, NetworkSnapshot target,
             SnapshotLayoutView targetLayout, ref SnapshotWriter writer,
             out uint operationCount)
@@ -1035,6 +1056,15 @@ namespace UniGame.StaticEcs.Network
             }
 
             internal long Length => _length;
+
+            internal bool TrySetLength(int length)
+            {
+                if (length < 0 || length > int.MaxValue ||
+                    !_measure && length > _destination.Length)
+                    return false;
+                _length = length;
+                return true;
+            }
 
             internal bool TryWriteByte(byte value)
             {
