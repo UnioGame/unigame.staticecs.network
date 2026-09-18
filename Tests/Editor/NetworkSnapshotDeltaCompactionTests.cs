@@ -114,7 +114,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     using (noOpDelta)
                     {
                         var marginalBytes = delta.Length - noOpDelta.Length;
-                        TestContext.Progress.WriteLine(
+                        TestContext.WriteLine(
                             "NCORE-13 moving-entity single 12B record patch = " +
                             marginalBytes + " marginal bytes (" + delta.Length +
                             " total among " + (ballastCount + 1) +
@@ -178,7 +178,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     using (noOpDelta)
                     {
                         var marginalBytes = delta.Length - noOpDelta.Length;
-                        TestContext.Progress.WriteLine(
+                        TestContext.WriteLine(
                             "NCORE-13 position-only patch on a position+" +
                             "animation entity = " + marginalBytes +
                             " marginal bytes (" + delta.Length + " total)");
@@ -302,7 +302,7 @@ namespace UniGame.StaticEcs.Network.Tests
                         baseline, target, out var delta), Is.True);
                     using (delta)
                     {
-                        TestContext.Progress.WriteLine(
+                        TestContext.WriteLine(
                             "NCORE-13 3000-entity baseline, 50 add/50 remove/" +
                             "400 patch delta = " + delta.Length + " bytes");
                         AssertRoundTrips(bufferPool, baseline, target, delta);
@@ -372,7 +372,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 bufferPool.Dispose();
             }
 
-            TestContext.Progress.WriteLine(
+            TestContext.WriteLine(
                 $"NCORE-13 property sweep: {reconstructed} delta round-trips, " +
                 $"{fellBackToKeyframe} keyframe fallbacks");
             Assert.That(reconstructed, Is.GreaterThan(300),
@@ -570,7 +570,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 bufferPool.Dispose();
             }
 
-            TestContext.Progress.WriteLine(
+            TestContext.WriteLine(
                 $"NCORE-13b Burst/portable differential: {compared} pairs " +
                 "compared byte-identical");
             Assert.That(compared, Is.GreaterThan(30),
@@ -682,7 +682,7 @@ namespace UniGame.StaticEcs.Network.Tests
                         1000d / Stopwatch.Frequency;
                     var burstMs = burstSamples[burstSamples.Length / 2] *
                         1000d / Stopwatch.Frequency;
-                    TestContext.Progress.WriteLine(
+                    TestContext.WriteLine(
                         $"NCORE-13b {entityCount} entities, {movingFraction:P0} " +
                         $"moving, {pairs.Count} ticks: portable={portableMs:F3}ms " +
                         $"burst={burstMs:F3}ms " +
