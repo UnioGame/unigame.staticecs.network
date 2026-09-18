@@ -248,6 +248,9 @@ namespace UniGame.StaticEcs.Network
 
         internal void Close() => State = NetworkSessionState.Closed;
 
+        /// <summary>Gets whether an observer is attached, so callers can skip building trace-only diagnostics that <see cref="Trace"/> would otherwise discard.</summary>
+        internal bool IsTraceEnabled => _observer != null;
+
         internal uint LastReceivedPacketSequence =>
             _nextReceivePacketSequence == 0 ? uint.MaxValue :
             _nextReceivePacketSequence - 1;

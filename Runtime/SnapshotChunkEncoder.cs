@@ -34,5 +34,51 @@ namespace UniGame.StaticEcs.Network
             packet = lease;
             return true;
         }
+
+        /// <summary>Frames the fixed chunk header and body into one pooled lease and returns its hash, for reuse across peers that share the identical chunk content.</summary>
+        internal static bool TryEncodePayload(NetworkBufferPool pool,
+            in SnapshotChunkHeader chunk, ReadOnlySpan<byte> body,
+            out NetworkBufferLease payload, out ulong payloadHash)
+        {
+            payload = null;
+            payloadHash = 0;
+            if (pool == null ||
+                body.Length > ProtocolLimits.MaxWirePayloadBytes - SnapshotChunkHeader.Size)
+                return false;
+            var payloadLength = SnapshotChunkHeader.Size + body.Length;
+            var lease = pool.Rent(payloadLength);
+            var destination = lease.WritableSpan;
+            if (!chunk.TryWrite(destination))
+            {
+                lease.Dispose();
+                return false;
+            }
+            body.CopyTo(destination.Slice(SnapshotChunkHeader.Size));
+            payloadHash = Hashing.XxHash64(destination);
+            payload = lease;
+            return true;
+        }
+
+        /// <summary>Wraps a previously framed chunk payload with one peer-specific packet header, reusing its precomputed hash instead of rehashing identical bytes.</summary>
+        internal static bool TryEncodeFromPayload(NetworkBufferPool pool,
+            PacketHeader header, ReadOnlyMemory<byte> payload,
+            ulong payloadHash, out NetworkBufferLease packet)
+        {
+            packet = null;
+            if (pool == null)
+                return false;
+            var lease = pool.Rent(checked(PacketHeader.Size + payload.Length));
+            var destination = lease.WritableSpan;
+            payload.Span.CopyTo(destination.Slice(PacketHeader.Size));
+            header.PayloadLength = (uint)payload.Length;
+            header.PayloadHash = payloadHash;
+            if (!header.TryWrite(destination))
+            {
+                lease.Dispose();
+                return false;
+            }
+            packet = lease;
+            return true;
+        }
     }
 }

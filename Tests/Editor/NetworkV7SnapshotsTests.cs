@@ -2267,6 +2267,19 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(sharedPacketA.SessionEpoch,
                         Is.Not.EqualTo(sharedPacketB.SessionEpoch));
                     Assert.That(sharedMisses, Is.GreaterThan(0));
+                    // NCORE-17a: peers acknowledging the same baseline reuse one
+                    // framed chunk (header + body) and its xxHash64, so the whole
+                    // chunk header and the packet-level payload hash must be
+                    // byte-for-byte identical even though each peer still gets its
+                    // own packet header (different session epoch/sequence above).
+                    Assert.That(sharedA.TotalHash, Is.EqualTo(sharedB.TotalHash));
+                    Assert.That(sharedA.TotalLength, Is.EqualTo(sharedB.TotalLength));
+                    Assert.That(sharedA.ChunkIndex, Is.EqualTo(sharedB.ChunkIndex));
+                    Assert.That(sharedA.ChunkCount, Is.EqualTo(sharedB.ChunkCount));
+                    Assert.That(sharedA.ResyncCorrelationId,
+                        Is.EqualTo(sharedB.ResyncCorrelationId));
+                    Assert.That(sharedPacketA.PayloadHash,
+                        Is.EqualTo(sharedPacketB.PayloadHash));
 
                     Assert.That(server.TryGetCapture(scope, 1,
                         out var baselineOne), Is.True);
@@ -2298,8 +2311,21 @@ namespace UniGame.StaticEcs.Network.Tests
                         Is.EqualTo(11));
                     Assert.That(differentPacketB.SessionEpoch,
                         Is.EqualTo(22));
+                    // The peers no longer share a baseline, so their chunk
+                    // headers (and packet-level payload hash) must diverge too.
+                    Assert.That(differentPacketA.PayloadHash,
+                        Is.Not.EqualTo(differentPacketB.PayloadHash));
+                    // NCORE-17a adds one pooled rent per unique (scope, baseline,
+                    // chunk) framed payload, shared by every peer that sends it.
+                    // "shared" collapses both peers onto one delta and one framed
+                    // chunk payload (2 misses) plus one packet-header wrap each
+                    // (2 misses) = 4. "different" has no baseline shared between
+                    // the peers, so it pays for two distinct deltas and two
+                    // distinct framed chunk payloads instead of one of each -
+                    // one delta miss and one framed-payload miss more than
+                    // "shared" - while the two per-peer wraps stay unchanged.
                     Assert.That(differentMisses,
-                        Is.EqualTo(sharedMisses + 1));
+                        Is.EqualTo(sharedMisses + 2));
                     Assert.That(server.TryGetCapture(scope, 3,
                         out var targetThree), Is.True);
                     AssertReconstructedSnapshot(pool,

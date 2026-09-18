@@ -25,6 +25,8 @@ namespace UniGame.StaticEcs.Network
             new Dictionary<ScopeId, NetworkSnapshot>();
         private readonly Dictionary<SnapshotDeltaKey, NetworkBufferLease> _snapshotDeltas =
             new Dictionary<SnapshotDeltaKey, NetworkBufferLease>();
+        private readonly Dictionary<ChunkPayloadKey, ChunkPayloadEntry> _chunkPayloads =
+            new Dictionary<ChunkPayloadKey, ChunkPayloadEntry>();
         private uint _activeTick;
         private int _activeConnectionCount;
         private int _activePeerCount;
@@ -72,6 +74,7 @@ namespace UniGame.StaticEcs.Network
                 return;
             _disposed = true;
             ClearSnapshotDeltas();
+            ClearChunkPayloads();
             while (_peers.Count > 0)
                 CleanupPeer(_peers[_peers.Count - 1]);
             _peers.Clear();
@@ -234,6 +237,7 @@ namespace UniGame.StaticEcs.Network
                 }
                 finally
                 {
+                    ClearChunkPayloads();
                     _activeTick = 0;
                 }
             }
@@ -839,11 +843,57 @@ namespace UniGame.StaticEcs.Network
             _snapshotDeltas.Clear();
         }
 
+        // Peers acknowledging the same baseline tick for the same scope produce a
+        // byte-identical chunk payload (header + body). Framing and hashing it once
+        // per tick and reusing the result across those peers turns an O(peers) cost
+        // into O(distinct baselines): every later peer only pays for the per-peer
+        // packet header wrap and a body copy, not another chunk-header write or a
+        // full-payload xxHash64 pass. The cache is keyed on every field that can
+        // change the framed bytes, so peers on different baselines, chunks, or
+        // resync correlations never share an entry.
+        private bool TryGetChunkPayload(ScopeId scope, in SnapshotChunkHeader chunk,
+            ReadOnlySpan<byte> body, out ReadOnlyMemory<byte> payload,
+            out ulong payloadHash)
+        {
+            var key = new ChunkPayloadKey(scope, chunk);
+            if (_chunkPayloads.TryGetValue(key, out var cached))
+            {
+                payload = cached.Payload.Memory;
+                payloadHash = cached.PayloadHash;
+                return true;
+            }
+
+            if (!SnapshotChunkEncoder.TryEncodePayload(_bufferPool, in chunk, body,
+                    out var lease, out var hash))
+            {
+                payload = default;
+                payloadHash = 0;
+                return false;
+            }
+
+            _chunkPayloads.Add(key, new ChunkPayloadEntry(lease, hash));
+            payload = lease.Memory;
+            payloadHash = hash;
+            return true;
+        }
+
+        private void ClearChunkPayloads()
+        {
+            foreach (var entry in _chunkPayloads.Values)
+                entry.Payload?.Dispose();
+            _chunkPayloads.Clear();
+        }
+
         private bool SendSnapshotChunk(Peer peer, uint serverTick,
             uint sequence, in SnapshotChunkHeader chunk,
             ReadOnlySpan<byte> body)
         {
-            var started = Stopwatch.GetTimestamp();
+            // History lookups and the elapsed-time sample only feed the observer
+            // trace event below; Trace itself is a no-op without one. Skipping
+            // them when untraced avoids four scope-history dictionary lookups and
+            // a Stopwatch sample on every peer send.
+            var traceEnabled = peer.Session.IsTraceEnabled;
+            var started = traceEnabled ? Stopwatch.GetTimestamp() : 0L;
             // A reliable transport may be transiently backpressured for this exact
             // encoded chunk even though it accepted the minimum probe. Reject it
             // before renting and encoding a packet; TrySend stays authoritative
@@ -875,8 +925,14 @@ namespace UniGame.StaticEcs.Network
             var encoded = false;
             using (NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.SnapshotChunkEncode))
             {
-                encoded = SnapshotChunkEncoder.TryEncode(_bufferPool, header,
-                    in chunk, body, out packet);
+                // Peers acknowledging the same baseline share byte-identical chunk
+                // framing (header + body). Encode and hash it once per tick and
+                // reuse that result here; only the per-peer packet header and a
+                // plain body copy are produced for every additional peer.
+                encoded = TryGetChunkPayload(peer.Scope, in chunk, body,
+                              out var payload, out var payloadHash) &&
+                          SnapshotChunkEncoder.TryEncodeFromPayload(_bufferPool,
+                              header, payload, payloadHash, out packet);
             }
             var packetBytes = packet?.Length ?? 0;
             var sent = false;
@@ -885,19 +941,20 @@ namespace UniGame.StaticEcs.Network
                 using var transportScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.TransportTrySend);
                 sent = peer.Transport.TrySend(packet);
             }
-            peer.Session.Trace(NetworkPhase.Send, NetworkTraceKind.Point,
-                sent ? NetworkResultCategory.Success : NetworkResultCategory.Transport,
-                NetworkPacketKind.SnapshotChunk, serverTick, PacketHeader.NoneTick,
-                packetBytes, _coordinator.HistoryCount(peer.Scope),
-                _coordinator.HistoryByteCount(peer.Scope),
-                unchecked((int)(serverTick - peer.AcknowledgedSnapshotTick)),
-                ElapsedNanoseconds(started), activeConnections: ActiveConnectionCount,
-                activePeers: ActivePeerCount,
-                resyncCorrelationId: peer.ResyncCorrelationId,
-                sequence: sequence,
-                acknowledgedSnapshotTick: peer.AcknowledgedSnapshotTick,
-                oldestHistoryTick: _coordinator.OldestHistoryTick(peer.Scope),
-                newestHistoryTick: _coordinator.NewestHistoryTick(peer.Scope));
+            if (traceEnabled)
+                peer.Session.Trace(NetworkPhase.Send, NetworkTraceKind.Point,
+                    sent ? NetworkResultCategory.Success : NetworkResultCategory.Transport,
+                    NetworkPacketKind.SnapshotChunk, serverTick, PacketHeader.NoneTick,
+                    packetBytes, _coordinator.HistoryCount(peer.Scope),
+                    _coordinator.HistoryByteCount(peer.Scope),
+                    unchecked((int)(serverTick - peer.AcknowledgedSnapshotTick)),
+                    ElapsedNanoseconds(started), activeConnections: ActiveConnectionCount,
+                    activePeers: ActivePeerCount,
+                    resyncCorrelationId: peer.ResyncCorrelationId,
+                    sequence: sequence,
+                    acknowledgedSnapshotTick: peer.AcknowledgedSnapshotTick,
+                    oldestHistoryTick: _coordinator.OldestHistoryTick(peer.Scope),
+                    newestHistoryTick: _coordinator.NewestHistoryTick(peer.Scope));
             return sent;
         }
 
@@ -1213,6 +1270,74 @@ namespace UniGame.StaticEcs.Network
             public override int GetHashCode() => unchecked(
                 (Scope.GetHashCode() * 397) ^ (int)BaselineTick ^
                 ((int)TargetTick * 397));
+        }
+
+        // Every field that participates in SnapshotChunkHeader.TryWrite (plus the
+        // scope, since the header itself carries no scope) is included, so two
+        // peers only ever share a cache entry when TryGetChunkPayload would have
+        // framed identical bytes for both of them.
+        private readonly struct ChunkPayloadKey : IEquatable<ChunkPayloadKey>
+        {
+            internal ChunkPayloadKey(ScopeId scope, in SnapshotChunkHeader chunk)
+            {
+                Scope = scope;
+                PayloadKind = chunk.PayloadKind;
+                SnapshotTick = chunk.SnapshotTick;
+                BaselineTick = chunk.BaselineTick;
+                TotalHash = chunk.TotalHash;
+                ChunkIndex = chunk.ChunkIndex;
+                ChunkCount = chunk.ChunkCount;
+                ResyncCorrelationId = chunk.ResyncCorrelationId;
+            }
+
+            private ScopeId Scope { get; }
+            private SnapshotPayloadKind PayloadKind { get; }
+            private uint SnapshotTick { get; }
+            private uint BaselineTick { get; }
+            private ulong TotalHash { get; }
+            private uint ChunkIndex { get; }
+            private uint ChunkCount { get; }
+            private uint ResyncCorrelationId { get; }
+
+            public bool Equals(ChunkPayloadKey other) => Scope == other.Scope &&
+                PayloadKind == other.PayloadKind &&
+                SnapshotTick == other.SnapshotTick &&
+                BaselineTick == other.BaselineTick &&
+                TotalHash == other.TotalHash &&
+                ChunkIndex == other.ChunkIndex &&
+                ChunkCount == other.ChunkCount &&
+                ResyncCorrelationId == other.ResyncCorrelationId;
+
+            public override bool Equals(object obj) =>
+                obj is ChunkPayloadKey other && Equals(other);
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    var hash = Scope.GetHashCode();
+                    hash = (hash * 397) ^ (int)PayloadKind;
+                    hash = (hash * 397) ^ (int)SnapshotTick;
+                    hash = (hash * 397) ^ (int)BaselineTick;
+                    hash = (hash * 397) ^ TotalHash.GetHashCode();
+                    hash = (hash * 397) ^ (int)ChunkIndex;
+                    hash = (hash * 397) ^ (int)ChunkCount;
+                    hash = (hash * 397) ^ (int)ResyncCorrelationId;
+                    return hash;
+                }
+            }
+        }
+
+        private readonly struct ChunkPayloadEntry
+        {
+            internal ChunkPayloadEntry(NetworkBufferLease payload, ulong payloadHash)
+            {
+                Payload = payload;
+                PayloadHash = payloadHash;
+            }
+
+            internal readonly NetworkBufferLease Payload;
+            internal readonly ulong PayloadHash;
         }
 
         private sealed class Peer
