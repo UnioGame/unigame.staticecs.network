@@ -865,7 +865,8 @@ namespace UniGame.StaticEcs.Network.Tests
             TotalLength = checked((uint)target.ByteLength),
             TotalHash = target.PayloadHash,
             ChunkIndex = 0,
-            ChunkCount = 1
+            ChunkCount = 1,
+            ScopeValue = target.Scope.Value
         };
 
         private static SnapshotChunkHeader KeyframeHeader(
@@ -877,7 +878,8 @@ namespace UniGame.StaticEcs.Network.Tests
             TotalLength = checked((uint)snapshot.ByteLength),
             TotalHash = snapshot.PayloadHash,
             ChunkIndex = 0,
-            ChunkCount = 1
+            ChunkCount = 1,
+            ScopeValue = snapshot.Scope.Value
         };
 
         private static void SendPeerPacket(INetworkTransport transport,
