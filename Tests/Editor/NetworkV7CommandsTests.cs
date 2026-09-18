@@ -328,6 +328,190 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void RedundantOnlyCommandBatchSkipsRetainAndDispatchesNothing()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            var receiver = World<AuthorityWorld>
+                .RegisterEventReceiver<NetworkCommandAcceptedEvent<TestCommand>>();
+            try
+            {
+                using var pool = new NetworkBufferPool(1 << 20);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(99),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    var observer = new TraceCollector();
+                    var serverSchema = Schema<AuthorityWorld>(true);
+                    var clientSchema = Schema<ClientAWorld>(false);
+                    using var server = new NetworkServer<AuthorityWorld>(
+                        serverSchema, static (_, _) => false,
+                        observer: observer, bufferPool: pool);
+                    server.AddConnection(serverTransport, 7, 1,
+                        new ScopeId(1), observer);
+                    SendHello(clientTransport, pool, clientSchema.Fingerprint);
+                    server.Receive();
+
+                    var clientSession = new NetworkSession<ClientAWorld>(
+                        clientTransport.Connection, NetworkRole.Client,
+                        clientSchema, pool);
+                    Assert.That(clientSession.Admit(serverSchema.Fingerprint, 7, 1,
+                        new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
+                    Assert.That(clientSession.CreateCommand(
+                        new TestCommand { Value = 1 }, 1, out var command),
+                        Is.EqualTo(NetworkCommandResult.Queued));
+                    // Build both wire payloads for this one command up front and dispose its
+                    // client-side envelope immediately after, so neither buffer-diagnostics
+                    // snapshot below is skewed by when that unrelated client-side lease happens
+                    // to close.
+                    var payload = EncodeCommandBatch(command);
+                    var redundantPayload = EncodeCommandBatch(command);
+                    command.Dispose();
+
+                    SendCommandBatch(clientTransport, pool,
+                        serverSchema.Fingerprint, 1, 1, payload);
+                    server.Receive();
+                    server.Tick(_ => { });
+
+                    var accepted = new List<int>();
+                    foreach (World<AuthorityWorld>
+                                 .Event<NetworkCommandAcceptedEvent<TestCommand>> item in receiver)
+                        accepted.Add(item.Value.Command.Value);
+                    CollectionAssert.AreEqual(new[] { 1 }, accepted);
+
+                    // Drain every packet the server has sent back to the client so far (Ready,
+                    // the first snapshot) so the baseline below reflects only what is still
+                    // outstanding once this exchange settles, not an artifact of nothing having
+                    // read the client's inbox yet.
+                    DrainTransport(clientTransport);
+                    var baseline = pool.CaptureDiagnostics();
+
+                    // Repeat the exact same command sequence in a fresh packet, exactly as a
+                    // client's redundancy window resends an already-acknowledged tick's command
+                    // to survive a dropped packet. The server already dispatched sequence 1, so
+                    // this whole batch is now redundant.
+                    SendCommandBatch(clientTransport, pool,
+                        serverSchema.Fingerprint, 1, 2, redundantPayload);
+
+                    server.Receive();
+
+                    var afterRedundant = pool.CaptureDiagnostics();
+                    Assert.That(afterRedundant.OutstandingLeases,
+                        Is.EqualTo(baseline.OutstandingLeases),
+                        "a fully redundant batch must not retain a buffer slice for its command");
+                    Assert.That(afterRedundant.OutstandingBytes,
+                        Is.EqualTo(baseline.OutstandingBytes));
+
+                    accepted.Clear();
+                    foreach (World<AuthorityWorld>
+                                 .Event<NetworkCommandAcceptedEvent<TestCommand>> item in receiver)
+                        accepted.Add(item.Value.Command.Value);
+                    Assert.That(accepted, Is.Empty);
+                    Assert.That(observer.Count(NetworkPhase.Send,
+                        NetworkPacketKind.Disconnect), Is.Zero);
+                    Assert.That(server.ConnectionCount, Is.EqualTo(1));
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.DeleteEventReceiver(ref receiver);
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void StalePrefixWithMalformedTailStillDisconnectsPeer()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            var receiver = World<AuthorityWorld>
+                .RegisterEventReceiver<NetworkCommandAcceptedEvent<TestCommand>>();
+            try
+            {
+                using var pool = new NetworkBufferPool(1 << 20);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(100),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    var serverSchema = Schema<AuthorityWorld>(true);
+                    var clientSchema = Schema<ClientAWorld>(false);
+                    var server = new NetworkServer<AuthorityWorld>(serverSchema,
+                        static (_, _) => false);
+                    server.AddConnection(serverTransport, 7, 1, new ScopeId(1));
+                    SendHello(clientTransport, pool, clientSchema.Fingerprint);
+                    server.Receive();
+
+                    var clientSession = new NetworkSession<ClientAWorld>(
+                        clientTransport.Connection, NetworkRole.Client,
+                        clientSchema, pool);
+                    Assert.That(clientSession.Admit(serverSchema.Fingerprint, 7, 1,
+                        new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
+                    Assert.That(clientSession.CreateCommand(
+                        new TestCommand { Value = 1 }, 1, out var command),
+                        Is.EqualTo(NetworkCommandResult.Queued));
+                    var singlePayload = EncodeCommandBatch(command);
+                    SendCommandBatch(clientTransport, pool,
+                        serverSchema.Fingerprint, 1, 1, singlePayload);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    foreach (World<AuthorityWorld>
+                                 .Event<NetworkCommandAcceptedEvent<TestCommand>> _ in receiver)
+                    {
+                        // Drain the first command's own accepted event so the check below only
+                        // reflects the second (redundant + malformed) batch.
+                    }
+
+                    // Sequence 1 is now already processed. Build a second batch whose first
+                    // entry repeats it (skipped without retaining a buffer slice, per this
+                    // method's optimization) followed by a second entry that declares a
+                    // payload length overrunning the buffer. The decode loop must still walk
+                    // past the skipped entry at its exact byte width and catch the malformed
+                    // one that follows.
+                    var redundantEntry = EncodeCommandBatch(command);
+                    command.Dispose();
+                    // redundantEntry[0] is the batch's declared command count; strip it so the
+                    // remaining bytes are exactly one 17-byte header plus payload.
+                    var staleEntryBytes = redundantEntry.AsSpan(1).ToArray();
+
+                    var malformedEntry = new byte[17];
+                    Write32(malformedEntry, 0, 2);
+                    Write32(malformedEntry, 4, 5);
+                    Write32(malformedEntry, 8, 10);
+                    malformedEntry[12] = 0;
+                    Write32(malformedEntry, 13, ProtocolLimits.MaxCommandBytes);
+
+                    var combined = new byte[1 + staleEntryBytes.Length +
+                        malformedEntry.Length];
+                    combined[0] = 2;
+                    staleEntryBytes.CopyTo(combined.AsSpan(1));
+                    malformedEntry.CopyTo(
+                        combined.AsSpan(1 + staleEntryBytes.Length));
+
+                    SendCommandBatch(clientTransport, pool,
+                        serverSchema.Fingerprint, 1, 2, combined);
+                    server.Receive();
+
+                    var accepted = 0;
+                    foreach (World<AuthorityWorld>
+                                 .Event<NetworkCommandAcceptedEvent<TestCommand>> _ in receiver)
+                        accepted++;
+                    Assert.That(accepted, Is.Zero);
+                    Assert.That(server.ConnectionCount, Is.Zero,
+                        "a malformed entry after a skipped-stale one must still disconnect the peer");
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.DeleteEventReceiver(ref receiver);
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
         public void MixedCommandBatchSkipsStaleInputAndDispatchesFreshTail()
         {
             CreateReplicationWorld<AuthorityWorld>(true);

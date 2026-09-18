@@ -122,6 +122,16 @@ namespace UniGame.StaticEcs.Network
             return NetworkCommandResult.SchemaMismatch;
         }
 
+        /// <summary>
+        /// Gets the lowest command sequence this session has not yet seen; any sequence below it
+        /// is guaranteed to be rejected by <see cref="Validate"/> as <see cref="NetworkCommandResult.Duplicate"/>.
+        /// Command redundancy resends the same sequence across more than one batch so it survives
+        /// a dropped packet, so a decoder walking a batch's raw bytes can use this cursor to skip
+        /// retaining a buffer slice and building an envelope for an already-processed command
+        /// before paying for either, instead of discovering the same outcome only after both.
+        /// </summary>
+        internal uint NextCommandSequence => _nextReceiveSequence;
+
         internal NetworkCommandResult Validate(NetworkCommandEnvelope envelope, uint serverTick, uint pastWindow, uint futureWindow, out NetworkSchemaEntry entry)
         {
             entry = null;

@@ -620,6 +620,17 @@ namespace UniGame.StaticEcs.Network
             if (count < 1 || count > ProtocolLimits.MaxCommandsPerBatch)
                 return NetworkCommandResult.Malformed;
 
+            // Command redundancy resends the same sequence across more than one batch so it
+            // survives a dropped packet, so most batches on a healthy link carry mostly commands
+            // this session has already queued. NextCommandSequence only advances while this method
+            // and the dispatch loop below run, so any sequence at or below the value read here is
+            // guaranteed to still be a duplicate once Queue -> Validate would see it. Skipping the
+            // pooled-buffer retain (a locked ref-count bump) and envelope slot for that guaranteed
+            // outcome, while still walking its structural fields so framing errors are still
+            // caught, is the only behavior change: every genuinely new command is decoded, sorted,
+            // and validated exactly as before.
+            var nextReceiveSequence = peer.Session.NextCommandSequence;
+
             int offset = 1;
             var commands = peer.DecodedCommands;
             var decoded = 0;
@@ -646,6 +657,14 @@ namespace UniGame.StaticEcs.Network
                 }
 
                 var exactLength = checked((int)payloadLength);
+                if (sequence < nextReceiveSequence)
+                {
+                    // Already queued in an earlier tick: Queue -> Validate would report
+                    // Duplicate for this exact sequence no matter where in the batch it sorts,
+                    // so skip retaining its payload and only step past it.
+                    offset += exactLength;
+                    continue;
+                }
                 var exact = packet.RetainSlice(PacketHeader.Size + offset, exactLength);
                 offset += exactLength;
                 commands[decoded++] = new NetworkCommandEnvelope(
@@ -664,6 +683,13 @@ namespace UniGame.StaticEcs.Network
                 DisposeCommands(commands, decoded);
                 return NetworkCommandResult.Malformed;
             }
+
+            // A batch made entirely of already-processed sequences decoded above without
+            // retaining or queuing anything; matches the pre-existing outcome for an
+            // all-duplicate batch, which fell through the loop below untouched to this same
+            // result.
+            if (decoded == 0)
+                return NetworkCommandResult.Queued;
 
             Array.Sort(commands, 0, decoded, NetworkCommandEnvelopeComparer.Instance);
             for (var i = 0; i < decoded; i++)

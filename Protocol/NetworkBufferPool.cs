@@ -35,6 +35,9 @@ namespace UniGame.StaticEcs.Network
         private NetworkBufferOwner _owner;
         private int _offset;
         private int _length;
+        private bool _decodeCached;
+        private bool _decodeValid;
+        private PacketHeader _decodedHeader;
 
         internal NetworkBufferLease()
         {
@@ -101,6 +104,7 @@ namespace UniGame.StaticEcs.Network
             _owner = owner;
             _offset = offset;
             _length = length;
+            ResetCachedDecode();
         }
 
         internal void SetLength(int length)
@@ -108,6 +112,37 @@ namespace UniGame.StaticEcs.Network
             if (_owner == null || length < 0 || length > _owner.Buffer.Length - _offset)
                 throw new ArgumentOutOfRangeException(nameof(length));
             _length = length;
+            ResetCachedDecode();
+        }
+
+        // A lease's bytes never change after Initialize (or SetLength, while a packet is still
+        // being written) settles them, so NetworkPacket.TryDecode's framing and payload-hash
+        // verification can only ever produce the same result for the same lease instance. Caching
+        // that result here lets a later TryDecode call on the very same instance -- e.g. a
+        // transport's own receive-time framing check followed by NetworkServer/NetworkClient's
+        // processing decode of the packet it just queued -- reuse it instead of repeating the
+        // CRC32 and xxHash64 passes. Every path that could make the cache stale (Initialize
+        // handing this lease object to a new owner/offset/length, and SetLength changing the
+        // visible bytes while a packet is being built) clears it first.
+        internal bool TryGetCachedDecode(out bool valid, out PacketHeader header)
+        {
+            valid = _decodeValid;
+            header = _decodedHeader;
+            return _decodeCached;
+        }
+
+        internal void CacheDecode(bool valid, PacketHeader header)
+        {
+            _decodeCached = true;
+            _decodeValid = valid;
+            _decodedHeader = valid ? header : default;
+        }
+
+        private void ResetCachedDecode()
+        {
+            _decodeCached = false;
+            _decodeValid = false;
+            _decodedHeader = default;
         }
     }
 

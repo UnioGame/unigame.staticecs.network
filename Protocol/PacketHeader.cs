@@ -186,11 +186,34 @@ namespace UniGame.StaticEcs.Network
         {
             header = default;
             payload = default;
-            if (packet == null || packet.Length < PacketHeader.Size ||
+            if (packet == null) return false;
+            // The same received packet is commonly decoded twice: once by a transport's own
+            // receive-time framing check, and again by NetworkServer/NetworkClient when it
+            // actually processes the packet it queued. A lease's bytes are immutable once framed,
+            // so the second call cannot see a different result -- reuse the first call's outcome
+            // instead of repeating the CRC32 and xxHash64 passes over untrusted bytes that were
+            // already fully verified a moment ago on this exact instance.
+            if (packet.TryGetCachedDecode(out var cachedValid, out var cachedHeader))
+            {
+                if (!cachedValid) return false;
+                header = cachedHeader;
+                payload = packet.Memory.Slice(PacketHeader.Size, (int)header.PayloadLength);
+                return true;
+            }
+            if (packet.Length < PacketHeader.Size ||
                 !PacketHeader.TryRead(packet.Span, out header) ||
-                packet.Length != PacketHeader.Size + header.PayloadLength) return false;
+                packet.Length != PacketHeader.Size + header.PayloadLength)
+            {
+                packet.CacheDecode(false, default);
+                return false;
+            }
             var body = packet.Span.Slice(PacketHeader.Size, (int)header.PayloadLength);
-            if (Hashing.XxHash64(body) != header.PayloadHash) return false;
+            if (Hashing.XxHash64(body) != header.PayloadHash)
+            {
+                packet.CacheDecode(false, default);
+                return false;
+            }
+            packet.CacheDecode(true, header);
             payload = packet.Memory.Slice(PacketHeader.Size, (int)header.PayloadLength);
             return true;
         }
