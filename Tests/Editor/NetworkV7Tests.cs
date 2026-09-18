@@ -32,7 +32,7 @@ namespace UniGame.StaticEcs.Network.Tests
             var bytes = new byte[PacketHeader.Size];
             Assert.That(header.TryWrite(bytes), Is.True);
             Assert.That(PacketHeader.TryRead(bytes, out var decoded), Is.True);
-            Assert.That(ProtocolLimits.Version, Is.EqualTo(8));
+            Assert.That(ProtocolLimits.Version, Is.EqualTo(9));
             Assert.That(decoded.SchemaFingerprint, Is.EqualTo(header.SchemaFingerprint));
             Assert.That(decoded.SimulationFingerprint,
                 Is.EqualTo(header.SimulationFingerprint));

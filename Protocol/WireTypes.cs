@@ -180,8 +180,14 @@ namespace UniGame.StaticEcs.Network
         /// <see cref="PacketHeader.HasForeignProtocolVersion"/> /
         /// <see cref="PacketHeader.IsProtocolVersionMismatch"/>) instead of
         /// misparsing an incompatible delta payload.
+        /// Bumped 8 -&gt; 9 by NCORE-14: PatchFast's per-changed-record length varint
+        /// changed meaning for record types with a value-delta hook (see
+        /// <see cref="INetworkComponentDelta"/> / <see cref="NetworkComponentDeltaHooks"/>)
+        /// -- it now carries <c>(length &lt;&lt; 1) | isDelta</c> instead of a plain byte
+        /// count for those types. Canonical snapshot bytes are unaffected, and record
+        /// types without a hook keep the exact NCORE-13 encoding.
         /// </remarks>
-        public const ushort Version = 8;
+        public const ushort Version = 9;
         /// <summary>Maximum encoded payload length.</summary>
         public const int MaxWirePayloadBytes = 8 * 1024 * 1024;
         /// <summary>Maximum decoded payload length.</summary>

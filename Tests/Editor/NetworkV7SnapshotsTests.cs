@@ -423,7 +423,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     unchanged, out delta), Is.True);
                 Assert.That(delta.Length, Is.EqualTo(13));
                 var expectedDelta = new byte[13];
-                expectedDelta[0] = 1; // delta format version
+                expectedDelta[0] = 2; // delta format version (NCORE-14 bumped 1 -> 2)
                 Write32(expectedDelta, 1,
                     checked((uint)unchanged.EntityCount));
                 Write32(expectedDelta, 5,

@@ -30,8 +30,8 @@ namespace UniGame.StaticEcs.Network
     /// <summary>Describes one immutable generated manifest record.</summary>
     public sealed class NetworkSchemaEntry
     {
-        internal NetworkSchemaEntry(NetworkSchemaKind kind, NetworkTypeId id, byte version, uint maxBytes, uint maxCount, Type type, object invoker)
-        { Kind = kind; TypeId = id; Version = version; MaxBytes = maxBytes; MaxCount = maxCount; RuntimeType = type; Invoker = invoker; }
+        internal NetworkSchemaEntry(NetworkSchemaKind kind, NetworkTypeId id, byte version, uint maxBytes, uint maxCount, Type type, object invoker, INetworkComponentDelta deltaHook = null)
+        { Kind = kind; TypeId = id; Version = version; MaxBytes = maxBytes; MaxCount = maxCount; RuntimeType = type; Invoker = invoker; DeltaHook = deltaHook; }
         /// <summary>Gets the wire shape.</summary>
         public NetworkSchemaKind Kind { get; }
         /// <summary>Gets the generated xxHash32 identifier.</summary>
@@ -44,6 +44,8 @@ namespace UniGame.StaticEcs.Network
         public uint MaxCount { get; }
         /// <summary>Gets the retained diagnostic type.</summary>
         public Type RuntimeType { get; }
+        /// <summary>Gets the optional NCORE-14 value-delta hook, or null when the type does not implement <see cref="INetworkComponentDelta"/>.</summary>
+        public INetworkComponentDelta DeltaHook { get; }
         internal object Invoker { get; }
     }
 
@@ -51,11 +53,14 @@ namespace UniGame.StaticEcs.Network
     public sealed class NetworkSchema<TWorld> where TWorld : struct, IWorldType
     {
         private readonly NetworkSchemaEntry[] _entries;
-        internal NetworkSchema(SchemaFingerprint fingerprint, NetworkSchemaEntry[] entries) { Fingerprint = fingerprint; _entries = entries; }
+        internal NetworkSchema(SchemaFingerprint fingerprint, NetworkSchemaEntry[] entries, NetworkComponentDeltaHooks deltaHooks)
+        { Fingerprint = fingerprint; _entries = entries; DeltaHooks = deltaHooks; }
         /// <summary>Gets the first 128 bits of SHA-256 over the canonical sorted manifest.</summary>
         public SchemaFingerprint Fingerprint { get; }
         /// <summary>Gets canonical records ordered by kind and identifier.</summary>
         public IReadOnlyList<NetworkSchemaEntry> Entries => _entries;
+        /// <summary>Gets the NCORE-14 value-delta hook lookup for this schema's records.</summary>
+        public NetworkComponentDeltaHooks DeltaHooks { get; }
         /// <summary>Finds one generated manifest record.</summary>
         public bool TryGet(NetworkTypeId id, out NetworkSchemaEntry entry)
         {
@@ -110,10 +115,21 @@ namespace UniGame.StaticEcs.Network
         public void Entity<TEntity>(NetworkTypeId id) where TEntity : struct, IEntityType, INetworkType => Add(NetworkSchemaKind.Entity, id, 0, 0, 0, typeof(TEntity), new EntityNetworkInvoker<TWorld, TEntity>());
         /// <summary>Adds a generated component type.</summary>
         [EditorBrowsable(EditorBrowsableState.Never)]
-        public void Component<T>(NetworkTypeId id, byte version = 0, uint maxBytes = ProtocolLimits.MaxComponentBytes) where T : struct, FFS.Libraries.StaticEcs.IComponent, INetworkType => Add(NetworkSchemaKind.Component, id, version, maxBytes, 1, typeof(T), new ComponentNetworkInvoker<TWorld, T>());
+        public void Component<T>(NetworkTypeId id, byte version = 0, uint maxBytes = ProtocolLimits.MaxComponentBytes) where T : struct, FFS.Libraries.StaticEcs.IComponent, INetworkType => Add(NetworkSchemaKind.Component, id, version, maxBytes, 1, typeof(T), new ComponentNetworkInvoker<TWorld, T>(), DetectDeltaHook<T>());
         /// <summary>Adds a generated disableable component type.</summary>
         [EditorBrowsable(EditorBrowsableState.Never)]
-        public void DisableableComponent<T>(NetworkTypeId id, byte version = 0, uint maxBytes = ProtocolLimits.MaxComponentBytes) where T : struct, FFS.Libraries.StaticEcs.IComponent, IDisableable, INetworkType => Add(NetworkSchemaKind.Component, id, version, maxBytes, 1, typeof(T), new DisableableComponentNetworkInvoker<TWorld, T>());
+        public void DisableableComponent<T>(NetworkTypeId id, byte version = 0, uint maxBytes = ProtocolLimits.MaxComponentBytes) where T : struct, FFS.Libraries.StaticEcs.IComponent, IDisableable, INetworkType => Add(NetworkSchemaKind.Component, id, version, maxBytes, 1, typeof(T), new DisableableComponentNetworkInvoker<TWorld, T>(), DetectDeltaHook<T>());
+
+        // NCORE-14: a value-delta hook is detected here, at the same hand-written factory
+        // call the source generator has always emitted (`factory.Component<T>(id, ...)` /
+        // `factory.DisableableComponent<T>(id, ...)`), by testing the boxed default value of
+        // T against the public INetworkComponentDelta interface. This needs no change to the
+        // generator: it keeps emitting the exact same call it always has, and the capability
+        // is entirely opt-in on the component type itself (implement the interface next to
+        // the existing hand-written Write/Read hooks). The boxing happens once per component
+        // type at schema-build time (process startup), never on the hot path.
+        private static INetworkComponentDelta DetectDeltaHook<T>() where T : struct =>
+            default(T) is INetworkComponentDelta hook ? hook : null;
         /// <summary>Adds a generated tag type.</summary>
         [EditorBrowsable(EditorBrowsableState.Never)]
         public void Tag<T>(NetworkTypeId id, byte version = 0) where T : struct, ITag, INetworkType => Add(NetworkSchemaKind.Tag, id, version, 0, 0, typeof(T), new TagNetworkInvoker<TWorld, T>());
@@ -158,9 +174,16 @@ namespace UniGame.StaticEcs.Network
             if (_frozen) throw new InvalidOperationException("The compiler schema factory is already frozen.");
             _frozen = true;
             _entries.Sort((a, b) => { var kind = a.Kind.CompareTo(b.Kind); return kind != 0 ? kind : a.TypeId.CompareTo(b.TypeId); });
-            var canonical = new byte[11 + _entries.Count * 14];
-            System.Text.Encoding.ASCII.GetBytes("SECS-NET-V2").CopyTo(canonical, 0);
+            // NCORE-14: the canonical manifest tag and per-entry stride changed (one extra
+            // byte carries whether the entry has a value-delta hook) so two schemas that
+            // differ only in delta-hook capability never collide on the same fingerprint --
+            // both sides must agree on which records the PatchFast length field encodes as
+            // length-with-flag (see SnapshotDeltaCodec) rather than a plain byte count.
+            var canonical = new byte[11 + _entries.Count * 15];
+            System.Text.Encoding.ASCII.GetBytes("SECS-NET-V3").CopyTo(canonical, 0);
             var offset = 11;
+            var deltaTypeIds = new List<uint>();
+            var deltaHooks = new List<INetworkComponentDelta>();
             for (var i = 0; i < _entries.Count; i++)
             {
                 var entry = _entries[i];
@@ -169,17 +192,39 @@ namespace UniGame.StaticEcs.Network
                 Hashing.Write32(canonical, offset, entry.TypeId.Value); offset += 4;
                 Hashing.Write32(canonical, offset, entry.MaxBytes); offset += 4;
                 Hashing.Write32(canonical, offset, entry.MaxCount); offset += 4;
+                canonical[offset++] = entry.DeltaHook != null ? (byte)1 : (byte)0;
+                if (entry.DeltaHook != null)
+                {
+                    deltaTypeIds.Add(entry.TypeId.Value);
+                    deltaHooks.Add(entry.DeltaHook);
+                }
             }
             using var sha = SHA256.Create();
             var digest = sha.ComputeHash(canonical);
-            return new NetworkSchema<TWorld>(SchemaFingerprint.ReadBytes(digest), _entries.ToArray());
+            NetworkComponentDeltaHooks hooks;
+            if (deltaTypeIds.Count == 0)
+            {
+                hooks = NetworkComponentDeltaHooks.Empty;
+            }
+            else
+            {
+                // Entries are sorted by (Kind, TypeId), not TypeId alone, so the collected
+                // pairs must be re-sorted by TypeId for NetworkComponentDeltaHooks' binary
+                // search (kept correct even if a future kind besides Component ever carries
+                // a delta hook).
+                var typeIdArray = deltaTypeIds.ToArray();
+                var hookArray = deltaHooks.ToArray();
+                Array.Sort(typeIdArray, hookArray);
+                hooks = new NetworkComponentDeltaHooks(typeIdArray, hookArray);
+            }
+            return new NetworkSchema<TWorld>(SchemaFingerprint.ReadBytes(digest), _entries.ToArray(), hooks);
         }
 
-        private void Add(NetworkSchemaKind kind, NetworkTypeId id, byte version, uint maxBytes, uint maxCount, Type type, object invoker)
+        private void Add(NetworkSchemaKind kind, NetworkTypeId id, byte version, uint maxBytes, uint maxCount, Type type, object invoker, INetworkComponentDelta deltaHook = null)
         {
             if (_frozen) throw new InvalidOperationException("The compiler schema factory is frozen.");
             if (!_ids.Add(id.Value)) throw new InvalidOperationException($"Duplicate network type id `{id}`.");
-            _entries.Add(new NetworkSchemaEntry(kind, id, version, maxBytes, maxCount, type, invoker));
+            _entries.Add(new NetworkSchemaEntry(kind, id, version, maxBytes, maxCount, type, invoker, deltaHook));
         }
     }
 

@@ -801,8 +801,8 @@ namespace UniGame.StaticEcs.Network
                         return SnapshotApplyResult.Malformed;
                     if (!SnapshotDeltaCodec.TryReconstruct(_bufferPool, baseline,
                             body.Span, in chunk, header.SchemaFingerprint,
-                            _session.Scope, out canonical, out entities,
-                            out records))
+                            _session.Scope, out canonical, out entities, out records,
+                            _schema.DeltaHooks))
                     {
                         discardRejectedTick = true;
                         return SnapshotApplyResult.Malformed;

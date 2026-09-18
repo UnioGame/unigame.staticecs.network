@@ -815,7 +815,7 @@ namespace UniGame.StaticEcs.Network
                 {
                     using (NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.SnapshotDeltaEncode))
                         encoded = SnapshotDeltaCodec.TryEncode(_bufferPool,
-                            baseline, target, out lease);
+                            baseline, target, out lease, _schema.DeltaHooks);
                 }
 
                 if (encoded)

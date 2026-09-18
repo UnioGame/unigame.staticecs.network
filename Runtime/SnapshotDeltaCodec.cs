@@ -40,7 +40,16 @@ namespace UniGame.StaticEcs.Network
     // it keeps the old, self-describing per-record Add/Remove/Replace encoding.
     internal static class SnapshotDeltaCodec
     {
-        private const byte DeltaFormatVersion = 1;
+        // NCORE-14 bumped the format version 1 -> 2: PatchFast's per-changed-record length
+        // varint changed meaning for records whose type has a value-delta hook (see
+        // NetworkComponentDeltaHooks). It now carries `(length << 1) | isDelta` instead of a
+        // plain byte count; isDelta selects between a hook-produced value delta (decoded
+        // against the baseline record's payload) and the NCORE-13 raw-payload encoding.
+        // Records of hook-less types are completely unaffected (their length field is still a
+        // plain byte count, byte-for-byte identical to format version 1). ProtocolLimits was
+        // bumped 8 -> 9 alongside this so mismatched peers fail fast at the packet-framing
+        // layer instead of misparsing the shifted length field.
+        private const byte DeltaFormatVersion = 2;
         private const int DeltaHeaderSize = sizeof(byte) + sizeof(uint) * 3;
         private const int EntityHeaderSize =
             sizeof(ulong) + sizeof(uint) + sizeof(byte) + sizeof(ushort);
@@ -78,9 +87,10 @@ namespace UniGame.StaticEcs.Network
 
         internal static bool TryEncode(NetworkBufferPool pool,
             NetworkSnapshot baseline, NetworkSnapshot target,
-            out NetworkBufferLease delta)
+            out NetworkBufferLease delta, NetworkComponentDeltaHooks hooks = null)
         {
             delta = null;
+            hooks = hooks ?? NetworkComponentDeltaHooks.Empty;
             if (pool == null || baseline == null || target == null ||
                 baseline.ServerTick == 0 || target.ServerTick <= baseline.ServerTick ||
                 baseline.SchemaFingerprint != target.SchemaFingerprint ||
@@ -99,7 +109,7 @@ namespace UniGame.StaticEcs.Network
                     AfterCandidateRentForTests?.Invoke();
 #endif
                     var writer = new SnapshotWriter(candidate.WritableSpan);
-                    if (!TryEncodePlan(baseline, target, candidate, ref writer, out _) ||
+                    if (!TryEncodePlan(baseline, target, hooks, candidate, ref writer, out _) ||
                         writer.Length >= target.ByteLength)
                         return false;
 
@@ -122,12 +132,13 @@ namespace UniGame.StaticEcs.Network
         internal static bool TryReconstruct(NetworkBufferPool pool,
             NetworkSnapshot baseline, ReadOnlySpan<byte> delta,
             in SnapshotChunkHeader header, SchemaFingerprint schema, ScopeId scope,
-            out NetworkBufferLease canonical, out int entityCount,
-            out int recordCount)
+            out NetworkBufferLease canonical, out int entityCount, out int recordCount,
+            NetworkComponentDeltaHooks hooks = null)
         {
             canonical = null;
             entityCount = 0;
             recordCount = 0;
+            hooks = hooks ?? NetworkComponentDeltaHooks.Empty;
             if (pool == null || baseline == null ||
                 header.PayloadKind != SnapshotPayloadKind.Delta ||
                 baseline.ServerTick == 0 || header.BaselineTick != baseline.ServerTick ||
@@ -140,7 +151,7 @@ namespace UniGame.StaticEcs.Network
                 return false;
 
             var measure = new SnapshotWriter(true);
-            if (!TryReconstructCore(baseline, delta, ref measure,
+            if (!TryReconstructCore(baseline, delta, hooks, ref measure,
                     out var measuredEntities, out var measuredRecords) ||
                 measure.Length != header.TotalLength)
                 return false;
@@ -149,7 +160,7 @@ namespace UniGame.StaticEcs.Network
             try
             {
                 var writer = new SnapshotWriter(lease.WritableSpan);
-                if (!TryReconstructCore(baseline, delta, ref writer,
+                if (!TryReconstructCore(baseline, delta, hooks, ref writer,
                         out var writtenEntities, out var writtenRecords) ||
                     writtenEntities != measuredEntities ||
                     writtenRecords != measuredRecords ||
@@ -330,7 +341,8 @@ namespace UniGame.StaticEcs.Network
         }
 
         private static bool TryEncodePlan(NetworkSnapshot baseline,
-            NetworkSnapshot target, NetworkBufferLease candidate,
+            NetworkSnapshot target, NetworkComponentDeltaHooks hooks,
+            NetworkBufferLease candidate,
             ref SnapshotWriter writer, out uint operationCount)
         {
             operationCount = 0;
@@ -339,7 +351,7 @@ namespace UniGame.StaticEcs.Network
             var targetCached = target.TryReadCachedLayout(out var targetLayout);
             if (baselineCached && targetCached)
                 return TryEncodeCoreIndexed(baseline, baselineLayout, target,
-                    targetLayout, candidate, ref writer, out operationCount);
+                    targetLayout, hooks, candidate, ref writer, out operationCount);
 
             // Build the missing side(s) before publishing anything so a pair that
             // cannot produce an indexed encode never leaves a lone layout behind.
@@ -355,7 +367,7 @@ namespace UniGame.StaticEcs.Network
                 targetLayout = new SnapshotLayoutView(targetEntities,
                     targetRecords, targetEntityCount, targetRecordCount);
                 return TryEncodeCoreIndexed(baseline, baselineLayout, target,
-                    targetLayout, candidate, ref writer, out operationCount);
+                    targetLayout, hooks, candidate, ref writer, out operationCount);
             }
 
             if (targetCached)
@@ -370,7 +382,7 @@ namespace UniGame.StaticEcs.Network
                 baselineLayout = new SnapshotLayoutView(baselineEntities,
                     baselineRecords, baselineEntityCount, baselineRecordCount);
                 return TryEncodeCoreIndexed(baseline, baselineLayout, target,
-                    targetLayout, candidate, ref writer, out operationCount);
+                    targetLayout, hooks, candidate, ref writer, out operationCount);
             }
 
             if (!baseline.TryBuildLayout(out var pendingBaselineEntities,
@@ -404,7 +416,7 @@ namespace UniGame.StaticEcs.Network
                     pendingTargetRecords, pendingTargetEntityCount,
                     pendingTargetRecordCount);
                 return TryEncodeCoreIndexed(baseline, baselineLayout, target,
-                    targetLayout, candidate, ref writer, out operationCount);
+                    targetLayout, hooks, candidate, ref writer, out operationCount);
             }
             finally
             {
@@ -418,7 +430,8 @@ namespace UniGame.StaticEcs.Network
 
         private static bool TryEncodeCoreIndexed(NetworkSnapshot baseline,
             SnapshotLayoutView baselineLayout, NetworkSnapshot target,
-            SnapshotLayoutView targetLayout, NetworkBufferLease candidate,
+            SnapshotLayoutView targetLayout, NetworkComponentDeltaHooks hooks,
+            NetworkBufferLease candidate,
             ref SnapshotWriter writer, out uint operationCount)
         {
             // NCORE-13 replaced the delta wire format (compact varint/bitmask
@@ -433,12 +446,13 @@ namespace UniGame.StaticEcs.Network
             // it. SnapshotDeltaBurstBackend itself is left compiling and unused.
             _ = candidate;
             return TryEncodeCoreIndexedPortable(baseline, baselineLayout, target,
-                targetLayout, ref writer, out operationCount);
+                targetLayout, hooks, ref writer, out operationCount);
         }
 
         private static bool TryEncodeCoreIndexedPortable(NetworkSnapshot baseline,
             SnapshotLayoutView baselineLayout, NetworkSnapshot target,
-            SnapshotLayoutView targetLayout, ref SnapshotWriter writer,
+            SnapshotLayoutView targetLayout, NetworkComponentDeltaHooks hooks,
+            ref SnapshotWriter writer,
             out uint operationCount)
         {
             operationCount = 0;
@@ -501,7 +515,7 @@ namespace UniGame.StaticEcs.Network
                     pendingSkip = 0;
                     if (!TryWritePatchIndexed(baselineBytes, baselineLayout,
                             baselineIndex, targetBytes, targetLayout,
-                            targetIndex, ref writer))
+                            targetIndex, hooks, ref writer))
                         return false;
                     operationCount++;
                 }
@@ -533,7 +547,8 @@ namespace UniGame.StaticEcs.Network
         private static bool TryWritePatchIndexed(ReadOnlySpan<byte> baselineBytes,
             SnapshotLayoutView baselineLayout, int baselineEntityIndex,
             ReadOnlySpan<byte> targetBytes, SnapshotLayoutView targetLayout,
-            int targetEntityIndex, ref SnapshotWriter writer)
+            int targetEntityIndex, NetworkComponentDeltaHooks hooks,
+            ref SnapshotWriter writer)
         {
             var baselineEntity = baselineLayout.Entities[baselineEntityIndex];
             var targetEntity = targetLayout.Entities[targetEntityIndex];
@@ -542,7 +557,7 @@ namespace UniGame.StaticEcs.Network
                 return writer.TryWriteByte((byte)EntityOperation.PatchFast) &&
                        TryWritePatchFastIndexed(baselineBytes, baselineLayout,
                            in baselineEntity, targetBytes, targetLayout,
-                           in targetEntity, ref writer);
+                           in targetEntity, hooks, ref writer);
             return writer.TryWriteByte((byte)EntityOperation.PatchFull) &&
                    TryWritePatchFullIndexed(baselineBytes, baselineLayout,
                        in baselineEntity, targetBytes, targetLayout,
@@ -577,7 +592,7 @@ namespace UniGame.StaticEcs.Network
             ReadOnlySpan<byte> baselineBytes, SnapshotLayoutView baselineLayout,
             in SnapshotEntityLayout baselineEntity, ReadOnlySpan<byte> targetBytes,
             SnapshotLayoutView targetLayout, in SnapshotEntityLayout targetEntity,
-            ref SnapshotWriter writer)
+            NetworkComponentDeltaHooks hooks, ref SnapshotWriter writer)
         {
             var count = baselineEntity.RecordCount;
             var maskBytes = MaskByteCount(count);
@@ -627,15 +642,58 @@ namespace UniGame.StaticEcs.Network
             {
                 if (!GetBit(mask, 2 * (i + 1)))
                     continue;
+                var b = baselineRecords[bStart + i];
                 var t = targetRecords[tStart + i];
                 var payloadLength = t.RawLength - RecordHeaderSize;
                 var payload = targetBytes.Slice(t.RawOffset + RecordHeaderSize,
                     payloadLength);
-                if (!TryWriteVarUInt(ref writer, (uint)payloadLength) ||
-                    !writer.TryWrite(payload))
+                if (!TryWritePatchFastRecordPayload(baselineBytes, b, payload,
+                        hooks, ref writer))
                     return false;
             }
             return true;
+        }
+
+        // Writes one changed record's payload in PatchFast. Record types absent from
+        // `hooks` (the common case pre-NCORE-14) keep the exact NCORE-13 wire encoding: a
+        // plain varint byte count followed by the full payload. Record types present in
+        // `hooks` (regardless of whether this particular value benefits) always use the
+        // tagged NCORE-14 encoding instead, `(length << 1) | isDelta`: isDelta=1 selects a
+        // hook-produced value delta (decoded against the baseline record's payload),
+        // isDelta=0 falls back to the full payload when the hook declined or did not shrink
+        // it. Both sides agree on which typeIds are tagged because both build `hooks` from
+        // the same frozen schema (its fingerprint changes if that set differs).
+        private static bool TryWritePatchFastRecordPayload(
+            ReadOnlySpan<byte> baselineBytes, in SnapshotRecordLayout baselineRecord,
+            ReadOnlySpan<byte> targetPayload, NetworkComponentDeltaHooks hooks,
+            ref SnapshotWriter writer)
+        {
+            if (!hooks.TryGet(baselineRecord.TypeId, out var hook))
+                return TryWriteVarUInt(ref writer, (uint)targetPayload.Length) &&
+                       writer.TryWrite(targetPayload);
+
+            if (baselineRecord.RawLength >= RecordHeaderSize)
+            {
+                var baselinePayload = baselineBytes.Slice(
+                    baselineRecord.RawOffset + RecordHeaderSize,
+                    baselineRecord.RawLength - RecordHeaderSize);
+                var scratch = ArrayPool<byte>.Shared.Rent(targetPayload.Length);
+                try
+                {
+                    var deltaLength = hook.TryWriteValueDelta(baselinePayload,
+                        targetPayload, scratch.AsSpan(0, targetPayload.Length));
+                    if (deltaLength >= 0 && deltaLength < targetPayload.Length)
+                        return TryWriteVarUInt(ref writer,
+                                   ((uint)deltaLength << 1) | 1u) &&
+                               writer.TryWrite(scratch.AsSpan(0, deltaLength));
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(scratch);
+                }
+            }
+            return TryWriteVarUInt(ref writer, (uint)targetPayload.Length << 1) &&
+                   writer.TryWrite(targetPayload);
         }
 
         private static bool TryWritePatchFullIndexed(
@@ -882,7 +940,8 @@ namespace UniGame.StaticEcs.Network
         }
 
         private static bool TryReconstructCore(NetworkSnapshot baseline,
-            ReadOnlySpan<byte> delta, ref SnapshotWriter writer,
+            ReadOnlySpan<byte> delta, NetworkComponentDeltaHooks hooks,
+            ref SnapshotWriter writer,
             out int entityCount, out int recordCount)
         {
             entityCount = 0;
@@ -927,7 +986,7 @@ namespace UniGame.StaticEcs.Network
                 {
                     if (!TryMoveNext(ref baselineCursor, out var current,
                             out var hasValue) || !hasValue ||
-                        !TryReconstructPatchFast(in current, delta, ref offset,
+                        !TryReconstructPatchFast(in current, delta, hooks, ref offset,
                             ref writer, out var patchedRecords) ||
                         !TryAdd(ref entityCount, 1) ||
                         !TryAdd(ref recordCount, patchedRecords))
@@ -965,7 +1024,8 @@ namespace UniGame.StaticEcs.Network
         }
 
         private static bool TryReconstructPatchFast(in CanonicalEntity baseline,
-            ReadOnlySpan<byte> delta, ref int offset, ref SnapshotWriter writer,
+            ReadOnlySpan<byte> delta, NetworkComponentDeltaHooks hooks,
+            ref int offset, ref SnapshotWriter writer,
             out int recordCount)
         {
             recordCount = 0;
@@ -1003,18 +1063,52 @@ namespace UniGame.StaticEcs.Network
                 {
                     var newDisabled = GetBit(mask, bit + 1) ? (byte)1 : (byte)0;
                     var version = record.Raw[RecordDisabledOffset - 1];
-                    if (!TryReadVarUInt(delta, ref offset, out var length) ||
-                        length > ProtocolLimits.MaxComponentBytes ||
+                    var tagged = hooks.TryGet(record.TypeId, out var hook);
+                    if (!TryReadVarUInt(delta, ref offset, out var raw))
+                        return false;
+                    var isDelta = tagged && (raw & 1u) != 0;
+                    var length = tagged ? raw >> 1 : raw;
+                    if (length > ProtocolLimits.MaxComponentBytes ||
                         length > (uint)(delta.Length - offset))
                         return false;
-                    if (!writer.TryWriteUint(record.TypeId) ||
-                        !writer.TryWriteByte(record.Kind) ||
-                        !writer.TryWriteByte(version) ||
-                        !writer.TryWriteByte(newDisabled) ||
-                        !writer.TryWriteUint(length) ||
-                        !writer.TryWrite(delta.Slice(offset,
-                            checked((int)length))))
-                        return false;
+                    if (isDelta)
+                    {
+                        if (record.Raw.Length < RecordHeaderSize)
+                            return false;
+                        var baselinePayload = record.Raw.Slice(RecordHeaderSize);
+                        var deltaBytes = delta.Slice(offset, checked((int)length));
+                        var scratch = ArrayPool<byte>.Shared.Rent(
+                            ProtocolLimits.MaxComponentBytes);
+                        try
+                        {
+                            if (!hook.TryReadValueDelta(baselinePayload, deltaBytes,
+                                    scratch, out var written) ||
+                                written < 0 || written > ProtocolLimits.MaxComponentBytes)
+                                return false;
+                            if (!writer.TryWriteUint(record.TypeId) ||
+                                !writer.TryWriteByte(record.Kind) ||
+                                !writer.TryWriteByte(version) ||
+                                !writer.TryWriteByte(newDisabled) ||
+                                !writer.TryWriteUint((uint)written) ||
+                                !writer.TryWrite(scratch.AsSpan(0, written)))
+                                return false;
+                        }
+                        finally
+                        {
+                            ArrayPool<byte>.Shared.Return(scratch);
+                        }
+                    }
+                    else
+                    {
+                        if (!writer.TryWriteUint(record.TypeId) ||
+                            !writer.TryWriteByte(record.Kind) ||
+                            !writer.TryWriteByte(version) ||
+                            !writer.TryWriteByte(newDisabled) ||
+                            !writer.TryWriteUint(length) ||
+                            !writer.TryWrite(delta.Slice(offset,
+                                checked((int)length))))
+                            return false;
+                    }
                     offset += checked((int)length);
                 }
                 recordCount++;
