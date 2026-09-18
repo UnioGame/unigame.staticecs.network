@@ -26,8 +26,14 @@ namespace UniGame.StaticEcs.Network
         private readonly NetworkScopeSelector<TWorld> _scopeSelector;
         private readonly INetworkScopeProvider<TWorld> _scopeProvider;
         private readonly NetworkReplicaSkipPolicy<TWorld> _skipPolicy;
+        private readonly INetworkUpdatePolicy<TWorld> _updatePolicy;
+        private readonly Dictionary<ScopeId, ScopeCaptureCache> _updateCache =
+            new Dictionary<ScopeId, ScopeCaptureCache>();
         private readonly NetworkSnapshotPool _snapshotPool;
         private int _captureCapacity = 4096;
+        // NCORE-16: 4 (typeId) + 1 (schema kind) + 1 (version) + 1 (disabled) + 4 (payload length),
+        // exactly the fixed record header Capture() itself writes below, before the payload bytes.
+        private const int RecordHeaderSize = 11;
 
         /// <summary>Creates a client-side snapshot apply replicator.</summary>
         /// <param name="skipPolicy">
@@ -63,17 +69,36 @@ namespace UniGame.StaticEcs.Network
         /// not consulted while a provider is present. Leaving this null keeps capture behavior and
         /// cost byte-for-byte identical to before this parameter existed.
         /// </param>
+        /// <param name="updatePolicy">
+        /// Opt-in, off by default (NCORE-16). See <see cref="INetworkUpdatePolicy{TWorld}"/> for the
+        /// exact contract. When supplied, <see cref="Capture"/> consults it once per entity and, for
+        /// a "hold" answer on an entity this scope already captured previously, reuses that entity's
+        /// previously captured record bytes verbatim instead of invoking
+        /// <see cref="IRecordNetworkInvoker{TWorld}.Write"/> again. Leaving this null keeps capture
+        /// behavior and cost byte-for-byte identical to before this parameter existed.
+        /// </param>
         public NetworkReplicator(NetworkSchema<TWorld> schema,
             NetworkScopeSelector<TWorld> scopeSelector, ScopeId scope = default,
             int historyTicks = 64, long historyBytes = 32 * 1024 * 1024,
             NetworkBufferPool bufferPool = null,
-            INetworkScopeProvider<TWorld> scopeProvider = null)
+            INetworkScopeProvider<TWorld> scopeProvider = null,
+            INetworkUpdatePolicy<TWorld> updatePolicy = null)
             : this(schema, scope, historyTicks, historyBytes, bufferPool)
         {
             _scopeSelector = scopeSelector ??
                 throw new ArgumentNullException(nameof(scopeSelector));
             _scopeProvider = scopeProvider;
+            _updatePolicy = updatePolicy;
         }
+
+        /// <summary>
+        /// Drops any cached previous-capture bytes/index this scope holds for the NCORE-16 update
+        /// policy (a no-op when no policy is in use or the scope was never captured with one).
+        /// Callers should invoke this once a scope has no established peer left, mirroring how its
+        /// shared capture history is dropped, so an abandoned scope's held-entity cache does not
+        /// linger for the life of the server.
+        /// </summary>
+        internal void ForgetScope(ScopeId scope) => _updateCache.Remove(scope);
 
         /// <summary>Gets the isolated replication scope.</summary>
         public ScopeId Scope { get; private set; }
@@ -138,6 +163,30 @@ namespace UniGame.StaticEcs.Network
             var buffer = _bufferPool.Rent(_captureCapacity);
             var writer = BinaryPackWriter.Create(buffer.Buffer);
             var records = 0;
+
+            // NCORE-16: read side of the update-policy hold cache. `previousBytes`/`previousIndex`
+            // are this scope's own last successful capture, untouched for the rest of this call, so
+            // reading them while building this tick's `freshIndex` below is always safe -- the cache
+            // object itself is only overwritten once, in bulk, after this entire loop finishes.
+            ScopeCaptureCache updateCache = null;
+            byte[] previousBytes = null;
+            Dictionary<EntityGID, HeldRecordRange> previousIndex = null;
+            Dictionary<EntityGID, HeldRecordRange> freshIndex = null;
+            if (_updatePolicy != null)
+            {
+                if (!_updateCache.TryGetValue(scope, out updateCache))
+                {
+                    updateCache = new ScopeCaptureCache();
+                    _updateCache.Add(scope, updateCache);
+                }
+                else
+                {
+                    previousBytes = updateCache.Bytes;
+                    previousIndex = updateCache.Index;
+                }
+                freshIndex = new Dictionary<EntityGID, HeldRecordRange>(_captureEntities.Count);
+            }
+
             try
             {
                 writer.WriteInt(_captureEntities.Count);
@@ -165,7 +214,28 @@ namespace UniGame.StaticEcs.Network
                     writer.WriteUint(kind.TypeId.Value);
                     writer.WriteBool(entity.IsDisabled);
                     var recordCountPosition = writer.MakePoint(sizeof(ushort));
+                    var recordsStart = writer.Position;
                     var entityRecords = 0;
+
+                    // NCORE-16: an entity the policy asks to hold, that this scope's previous
+                    // capture already knows about under the same schema kind, becomes a candidate
+                    // for reusing previously captured record bytes below. Anything else (no
+                    // previous capture yet for this scope, entity new to it, kind mismatch, or the
+                    // policy itself saying "refresh") always falls through to a fresh write per
+                    // record, exactly like before this feature existed.
+                    var holdCandidate = false;
+                    var previousRecordCursor = 0;
+                    var previousRecordsRemaining = 0;
+                    if (previousIndex != null &&
+                        previousIndex.TryGetValue(entity.GID, out var previousRange) &&
+                        previousRange.Kind == kind.TypeId &&
+                        _updatePolicy.ShouldHold(serverTick, scope, entity, entity.GID))
+                    {
+                        holdCandidate = true;
+                        previousRecordCursor = previousRange.RecordsOffset;
+                        previousRecordsRemaining = previousRange.RecordCount;
+                    }
+
                     for (var j = 0; j < entries.Length; j++)
                     {
                         if (entries[j].Invoker is not IRecordNetworkInvoker<TWorld> invoker ||
@@ -175,6 +245,43 @@ namespace UniGame.StaticEcs.Network
                             return FailCapture(buffer, writer.Buffer,
                                 SnapshotCaptureResult.LimitExceeded);
                         var entry = entries[j];
+
+                        // Both this loop and the one that captured `previousBytes` walk `entries`
+                        // in the same fixed schema order, filtered by Has(); advancing a single
+                        // forward cursor over the previous capture's records is therefore a plain
+                        // merge join keyed by TypeId, never a re-scan from the start.
+                        if (holdCandidate)
+                        {
+                            while (previousRecordsRemaining > 0 &&
+                                   Hashing.Read32(previousBytes, previousRecordCursor) <
+                                   entry.TypeId.Value)
+                            {
+                                var skipLength = unchecked((int)Hashing.Read32(previousBytes,
+                                    previousRecordCursor + 7));
+                                previousRecordCursor += RecordHeaderSize + skipLength;
+                                previousRecordsRemaining--;
+                            }
+                            if (previousRecordsRemaining > 0 &&
+                                Hashing.Read32(previousBytes, previousRecordCursor) ==
+                                entry.TypeId.Value &&
+                                previousBytes[previousRecordCursor + 4] == (byte)entry.Kind &&
+                                previousBytes[previousRecordCursor + 5] == entry.Version)
+                            {
+                                var heldLength = unchecked((int)Hashing.Read32(previousBytes,
+                                    previousRecordCursor + 7));
+                                var blockLength = RecordHeaderSize + heldLength;
+                                writer.EnsureSize((uint)blockLength);
+                                Array.Copy(previousBytes, previousRecordCursor, writer.Buffer,
+                                    (int)writer.Position, blockLength);
+                                writer.Position += (uint)blockLength;
+                                previousRecordCursor += blockLength;
+                                previousRecordsRemaining--;
+                                entityRecords++;
+                                records++;
+                                continue;
+                            }
+                        }
+
                         writer.WriteUint(entry.TypeId.Value);
                         writer.WriteByte((byte)entry.Kind);
                         writer.WriteByte(entry.Version);
@@ -188,6 +295,11 @@ namespace UniGame.StaticEcs.Network
                     }
                     writer.WriteUshortAt(recordCountPosition,
                         checked((ushort)entityRecords));
+
+                    if (freshIndex != null)
+                        freshIndex[entity.GID] = new HeldRecordRange(kind.TypeId,
+                            checked((int)recordsStart),
+                            checked((ushort)entityRecords));
                 }
             }
             catch
@@ -199,6 +311,20 @@ namespace UniGame.StaticEcs.Network
             if (writer.Position > ProtocolLimits.MaxDecodedPayloadBytes)
                 return FailCapture(buffer, writer.Buffer,
                     SnapshotCaptureResult.LimitExceeded);
+
+            // NCORE-16: publish this tick's bytes/index as the next capture's "previous" state.
+            // `previousBytes`/`previousIndex` are never read again after this point, so reusing the
+            // same backing array in place (growing it only when this tick's payload is larger) is
+            // safe and avoids a per-tick allocation once a scope's capture size stabilizes.
+            if (freshIndex != null)
+            {
+                var finalLength = checked((int)writer.Position);
+                if (updateCache.Bytes.Length < finalLength)
+                    updateCache.Bytes = new byte[finalLength];
+                Array.Copy(writer.Buffer, 0, updateCache.Bytes, 0, finalLength);
+                updateCache.Length = finalLength;
+                updateCache.Index = freshIndex;
+            }
             if (!ReferenceEquals(writer.Buffer, buffer.Buffer))
             {
                 buffer.Dispose();
@@ -648,6 +774,37 @@ namespace UniGame.StaticEcs.Network
             public int Compare(World<TWorld>.Entity left,
                 World<TWorld>.Entity right) =>
                 NetworkReplicator<TWorld>.Compare(left.GID, right.GID);
+        }
+
+        // NCORE-16: one scope's held-entity cache for the update-policy hold path. `Bytes[0..Length)`
+        // is that scope's last successfully captured canonical buffer (the same wire format Capture
+        // itself writes); `Index` locates each entity's record block within it. Both are replaced
+        // wholesale at the end of every successful Capture call for this scope, so an entity that
+        // left the scope is dropped from `Index` within one tick instead of accumulating forever.
+        private sealed class ScopeCaptureCache
+        {
+            internal byte[] Bytes = Array.Empty<byte>();
+            internal int Length;
+            internal Dictionary<EntityGID, HeldRecordRange> Index =
+                new Dictionary<EntityGID, HeldRecordRange>();
+        }
+
+        // Locates one entity's record block (the bytes starting right after its 2-byte record-count
+        // field) inside a ScopeCaptureCache's Bytes. RecordCount lets the merge scan in Capture know
+        // when it has consumed every one of this entity's previously captured records without
+        // reading past them into the next entity's header.
+        private readonly struct HeldRecordRange
+        {
+            internal HeldRecordRange(NetworkTypeId kind, int recordsOffset, ushort recordCount)
+            {
+                Kind = kind;
+                RecordsOffset = recordsOffset;
+                RecordCount = recordCount;
+            }
+
+            internal readonly NetworkTypeId Kind;
+            internal readonly int RecordsOffset;
+            internal readonly ushort RecordCount;
         }
     }
 }

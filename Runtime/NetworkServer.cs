@@ -60,7 +60,14 @@ namespace UniGame.StaticEcs.Network
         /// entities from the provider's index instead of the whole world. Leaving this null keeps
         /// every peer on its admission-time scope forever, matching today's behavior exactly.
         /// </param>
-        public NetworkServer(NetworkSchema<TWorld> schema, NetworkScopeSelector<TWorld> scopeSelector, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024, INetworkObserver observer = null, INetworkPeerObserver peerObserver = null, INetworkPeerAdmissionPolicy admissionPolicy = null, ulong simulationFingerprint = 0, ulong contentFingerprint = 0, NetworkBufferPool bufferPool = null, INetworkScopeProvider<TWorld> scopeProvider = null)
+        /// <param name="updatePolicy">
+        /// Opt-in, off by default (NCORE-16). See <see cref="INetworkUpdatePolicy{TWorld}"/> for the
+        /// exact contract. When supplied, every scope's capture consults it per entity and reuses
+        /// previously captured record bytes for a "hold" answer instead of paying for a fresh write.
+        /// Leaving this null keeps capture behavior and cost byte-for-byte identical to before this
+        /// parameter existed.
+        /// </param>
+        public NetworkServer(NetworkSchema<TWorld> schema, NetworkScopeSelector<TWorld> scopeSelector, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024, INetworkObserver observer = null, INetworkPeerObserver peerObserver = null, INetworkPeerAdmissionPolicy admissionPolicy = null, ulong simulationFingerprint = 0, ulong contentFingerprint = 0, NetworkBufferPool bufferPool = null, INetworkScopeProvider<TWorld> scopeProvider = null, INetworkUpdatePolicy<TWorld> updatePolicy = null)
         {
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
             if (scopeSelector == null) throw new ArgumentNullException(nameof(scopeSelector));
@@ -69,7 +76,7 @@ namespace UniGame.StaticEcs.Network
             _ownsBufferPool = bufferPool == null;
             _coordinator = new NetworkServerCoordinator<TWorld>(historyTicks, historyBytes);
             _replicator = new NetworkReplicator<TWorld>(schema, scopeSelector,
-                bufferPool: _bufferPool, scopeProvider: scopeProvider);
+                bufferPool: _bufferPool, scopeProvider: scopeProvider, updatePolicy: updatePolicy);
             _observer = observer;
             _peerObserver = peerObserver;
             _admissionPolicy = admissionPolicy;
@@ -1268,6 +1275,13 @@ namespace UniGame.StaticEcs.Network
                 peer.ReceiptOrder.Clear();
                 peer.CompletedTransactionIds.Clear();
                 _coordinator.Remove(peer.Transport.Connection);
+                // NCORE-16: mirrors the shared capture history's own scope cleanup (Remove() above
+                // clears it the same way once no established peer references the scope anymore).
+                // Checking HistoryCount is always safe here: a scope some other peer still uses has
+                // already accumulated history by the time any peer disconnects from it, so this can
+                // only ever drop a cache entry no capture will read again.
+                if (_coordinator.HistoryCount(peer.Scope) == 0)
+                    _replicator.ForgetScope(peer.Scope);
             }
         }
 
