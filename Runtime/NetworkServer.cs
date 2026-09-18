@@ -17,6 +17,7 @@ namespace UniGame.StaticEcs.Network
         private readonly INetworkObserver _observer;
         private readonly INetworkPeerObserver _peerObserver;
         private readonly INetworkPeerAdmissionPolicy _admissionPolicy;
+        private readonly INetworkScopeProvider<TWorld> _scopeProvider;
         private readonly ulong _simulationFingerprint;
         private readonly ulong _contentFingerprint;
         private readonly NetworkBufferPool _bufferPool;
@@ -51,7 +52,15 @@ namespace UniGame.StaticEcs.Network
             PendingCommandBytesHighWater = _coordinator.PendingCommandBytesHighWater,
         };
 
-        public NetworkServer(NetworkSchema<TWorld> schema, NetworkScopeSelector<TWorld> scopeSelector, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024, INetworkObserver observer = null, INetworkPeerObserver peerObserver = null, INetworkPeerAdmissionPolicy admissionPolicy = null, ulong simulationFingerprint = 0, ulong contentFingerprint = 0, NetworkBufferPool bufferPool = null)
+        /// <param name="scopeProvider">
+        /// Opt-in, off by default (NCORE-15). See <see cref="INetworkScopeProvider{TWorld}"/> for the
+        /// exact contract. When supplied, this server reassigns each established peer's scope every
+        /// tick via <see cref="INetworkScopeProvider{TWorld}.TryUpdateScope"/> and forces a keyframe
+        /// on any change, and <see cref="NetworkReplicator{TWorld}.Capture"/> collects each scope's
+        /// entities from the provider's index instead of the whole world. Leaving this null keeps
+        /// every peer on its admission-time scope forever, matching today's behavior exactly.
+        /// </param>
+        public NetworkServer(NetworkSchema<TWorld> schema, NetworkScopeSelector<TWorld> scopeSelector, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024, INetworkObserver observer = null, INetworkPeerObserver peerObserver = null, INetworkPeerAdmissionPolicy admissionPolicy = null, ulong simulationFingerprint = 0, ulong contentFingerprint = 0, NetworkBufferPool bufferPool = null, INetworkScopeProvider<TWorld> scopeProvider = null)
         {
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
             if (scopeSelector == null) throw new ArgumentNullException(nameof(scopeSelector));
@@ -60,10 +69,11 @@ namespace UniGame.StaticEcs.Network
             _ownsBufferPool = bufferPool == null;
             _coordinator = new NetworkServerCoordinator<TWorld>(historyTicks, historyBytes);
             _replicator = new NetworkReplicator<TWorld>(schema, scopeSelector,
-                bufferPool: _bufferPool);
+                bufferPool: _bufferPool, scopeProvider: scopeProvider);
             _observer = observer;
             _peerObserver = peerObserver;
             _admissionPolicy = admissionPolicy;
+            _scopeProvider = scopeProvider;
             _simulationFingerprint = simulationFingerprint;
             _contentFingerprint = contentFingerprint;
         }
@@ -195,6 +205,27 @@ namespace UniGame.StaticEcs.Network
                     FlushTransactionReceipts(_peers[i]);
                 }
                 _captures.Clear();
+                // NCORE-15: rebuild the provider's spatial index once per tick, after gameplay has
+                // moved every entity, then let it reassign each established peer's scope with
+                // whatever hysteresis it implements. A reassignment always forces a keyframe: the
+                // peer's existing baseline history belongs to its old scope and a delta against it
+                // would be meaningless (or outright rejected) for the new one.
+                if (_scopeProvider != null)
+                {
+                    _scopeProvider.RefreshTick(serverTick);
+                    for (var i = 0; i < _peers.Count; i++)
+                    {
+                        var peer = _peers[i];
+                        if (peer.Session.State != NetworkSessionState.Established) continue;
+                        var scope = peer.Scope;
+                        if (_scopeProvider.TryUpdateScope(peer.PeerId, ref scope) &&
+                            scope != peer.Scope)
+                        {
+                            peer.SetScope(scope);
+                            peer.ResyncRequested = true;
+                        }
+                    }
+                }
                 for (var i = 0; i < _peers.Count; i++)
                 {
                     var peer = _peers[i];
@@ -771,6 +802,7 @@ namespace UniGame.StaticEcs.Network
                         : SnapshotPayloadKind.Delta,
                     SnapshotTick = snapshot.ServerTick,
                     BaselineTick = keyframe ? 0 : baselineTick,
+                    ScopeValue = peer.Scope.Value,
                     TotalLength = checked((uint)snapshot.ByteLength),
                     TotalHash = snapshot.PayloadHash,
                     ChunkIndex = chunkIndex,
@@ -1348,7 +1380,9 @@ namespace UniGame.StaticEcs.Network
             internal readonly NetworkSession<TWorld> Session;
             internal readonly uint PeerId;
             internal readonly uint Epoch;
-            internal readonly ScopeId Scope;
+            internal ScopeId Scope { get; private set; }
+            /// <summary>Reassigns this peer's scope (NCORE-15) and keeps its session in sync.</summary>
+            internal void SetScope(ScopeId scope) { Scope = scope; Session.SetScope(scope); }
             internal uint PacketSequence;
             internal uint AcknowledgedSnapshotTick;
             internal uint LastSnapshotSentTick;

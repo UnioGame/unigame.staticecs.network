@@ -17,6 +17,18 @@ namespace UniGame.StaticEcs.Network
         private readonly Dictionary<ConnectionId, int> _pendingCommandBytes = new Dictionary<ConnectionId, int>();
         private readonly int _historyCapacity;
         private readonly long _historyBytes;
+        // NCORE-15: many small per-scope histories must not multiply worst-case history memory by
+        // the number of active scopes. Every active scope's history shares this one configured
+        // budget, divided evenly, floored at this minimum so a scope with only a handful of ticks
+        // still keeps a usable few keyframes' worth of headroom. With exactly one active scope
+        // (interest cells disabled, or a dense hub that never splits) the divisor is 1 and every
+        // history keeps its full configured cap -- byte-identical to before this budget existed.
+        // The floor is chosen so the target 500-client spread scenario (default 32 MiB budget)
+        // stays within its original total even in the degenerate case of one peer per scope
+        // (32 MiB / 64 KiB = 512 concurrent scopes); a smaller configured budget or a larger
+        // degenerate scope count still trades total memory growth for keeping delta history usable
+        // rather than silently evicting every stored tick.
+        private const long MinimumPerScopeHistoryBytes = 64 * 1024;
         private readonly int _maxPendingCommandsPerPeer;
         private readonly int _maxPendingBytesPerPeer;
         private long _pendingCommandBytesTotal;
@@ -78,6 +90,7 @@ namespace UniGame.StaticEcs.Network
             {
                 history.Clear();
                 _history.Remove(scope);
+                RebudgetHistories();
             }
             return removed;
         }
@@ -142,8 +155,27 @@ namespace UniGame.StaticEcs.Network
         {
             if (snapshot == null) throw new ArgumentNullException(nameof(snapshot));
             if (snapshot.Scope != scope) throw new InvalidOperationException("Snapshot scope does not match its history key.");
-            if (!_history.TryGetValue(scope, out var history)) { history = new NetworkHistory<NetworkSnapshot>(_historyCapacity, _historyBytes, value => value.ByteLength, value => value.Dispose()); _history.Add(scope, history); }
+            if (!_history.TryGetValue(scope, out var history))
+            {
+                history = new NetworkHistory<NetworkSnapshot>(_historyCapacity, _historyBytes, value => value.ByteLength, value => value.Dispose());
+                _history.Add(scope, history);
+                RebudgetHistories();
+            }
             history.Store(snapshot.ServerTick, snapshot);
+        }
+
+        // NCORE-15: recomputes and applies the shared per-scope history byte budget across every
+        // currently active scope history. Called only when the active-scope count changes (a scope
+        // history is created or dropped), not every tick, since the divided cap only depends on that
+        // count. See MinimumPerScopeHistoryBytes for why the divisor is floored.
+        private void RebudgetHistories()
+        {
+            if (_history.Count == 0)
+                return;
+            var perScopeBytes = Math.Max(MinimumPerScopeHistoryBytes,
+                _historyBytes / _history.Count);
+            foreach (var history in _history.Values)
+                history.Rebudget(perScopeBytes);
         }
 
         /// <summary>Finds one scope-and-tick capture. Per-peer acknowledgement state is never shared here.</summary>

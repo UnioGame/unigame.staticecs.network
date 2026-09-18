@@ -817,6 +817,16 @@ namespace UniGame.StaticEcs.Network
                         discardRejectedTick = true;
                         return SnapshotApplyResult.Malformed;
                     }
+                    // NCORE-15: a keyframe is the only packet a client ever adopts a new
+                    // replication scope from (a spatial-cell hand-off always forces one). Adopt it
+                    // before creating the snapshot below, so the snapshot, the session, and the
+                    // replicator all agree on the scope that Stage/AcceptCanonical validate against.
+                    if (chunk.ScopeValue != _session.Scope.Value)
+                    {
+                        var newScope = new ScopeId(chunk.ScopeValue);
+                        _session.SetScope(newScope);
+                        _replicator.SetScope(newScope);
+                    }
                     snapshot = _replicator.CreateSnapshot(chunk.SnapshotTick,
                         header.SchemaFingerprint, _session.Scope, body,
                         entities, records);
@@ -825,7 +835,12 @@ namespace UniGame.StaticEcs.Network
                 else
                 {
                     NetworkBufferLease canonical = null;
-                    if (!History.TryGet(chunk.BaselineTick, out var baseline) ||
+                    // A delta always carries the sender's current scope; the server only ever
+                    // sends a delta once the peer has already adopted its scope via an accepted
+                    // keyframe (NCORE-15), so a mismatch here means a stale or out-of-order packet
+                    // that must not be reconstructed against the wrong baseline history.
+                    if (chunk.ScopeValue != _session.Scope.Value ||
+                        !History.TryGet(chunk.BaselineTick, out var baseline) ||
                         baseline.SchemaFingerprint != header.SchemaFingerprint ||
                         baseline.Scope != _session.Scope)
                         return SnapshotApplyResult.Malformed;

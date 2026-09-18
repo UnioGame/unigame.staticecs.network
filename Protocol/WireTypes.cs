@@ -186,8 +186,14 @@ namespace UniGame.StaticEcs.Network
         /// -- it now carries <c>(length &lt;&lt; 1) | isDelta</c> instead of a plain byte
         /// count for those types. Canonical snapshot bytes are unaffected, and record
         /// types without a hook keep the exact NCORE-13 encoding.
+        /// Bumped 9 -&gt; 10 by NCORE-15: <see cref="SnapshotChunkHeader"/> grew an
+        /// explicit <see cref="SnapshotChunkHeader.Scope"/> field so a client can
+        /// learn and adopt a new replication scope directly from a keyframe chunk
+        /// (spatial-cell interest management). The field is fixed length and only
+        /// ever populated on a keyframe; a delta chunk always carries the sender's
+        /// current scope, which must already match the client's session scope.
         /// </remarks>
-        public const ushort Version = 9;
+        public const ushort Version = 10;
         /// <summary>Maximum encoded payload length.</summary>
         public const int MaxWirePayloadBytes = 8 * 1024 * 1024;
         /// <summary>Maximum decoded payload length.</summary>

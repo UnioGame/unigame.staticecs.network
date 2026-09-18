@@ -15,7 +15,7 @@ namespace UniGame.StaticEcs.Network
     public struct SnapshotChunkHeader
     {
         /// <summary>Fixed encoded header length.</summary>
-        public const int Size = 33;
+        public const int Size = 41;
 
         /// <summary>Gets or sets the snapshot payload encoding.</summary>
         public SnapshotPayloadKind PayloadKind;
@@ -33,6 +33,17 @@ namespace UniGame.StaticEcs.Network
         public uint ChunkCount;
         /// <summary>Gets or sets the recovery correlation identifier, or zero outside recovery.</summary>
         public uint ResyncCorrelationId;
+        /// <summary>
+        /// Gets or sets the raw wire value of the replication scope this payload was captured for
+        /// (NCORE-15; see <c>ScopeId.Value</c> in the Runtime assembly, which this Protocol-level
+        /// struct cannot reference directly). Always the sender's current scope. A client accepts a
+        /// value that differs from its own session scope only from a
+        /// <see cref="SnapshotPayloadKind.Keyframe"/> chunk, and adopts it as its new session and
+        /// replicator scope before staging that snapshot; a <see cref="SnapshotPayloadKind.Delta"/>
+        /// chunk must always carry the client's current scope, since a scope change is always
+        /// accompanied by a forced keyframe.
+        /// </summary>
+        public ulong ScopeValue;
 
         /// <summary>Writes a complete validated header in little-endian order.</summary>
         public bool TryWrite(Span<byte> destination)
@@ -47,6 +58,7 @@ namespace UniGame.StaticEcs.Network
             Hashing.Write32(bytes, 21, ChunkIndex);
             Hashing.Write32(bytes, 25, ChunkCount);
             Hashing.Write32(bytes, 29, ResyncCorrelationId);
+            Hashing.Write64(bytes, 33, ScopeValue);
             return true;
         }
 
@@ -65,7 +77,8 @@ namespace UniGame.StaticEcs.Network
                 TotalHash = Hashing.Read64(source, 13),
                 ChunkIndex = Hashing.Read32(source, 21),
                 ChunkCount = Hashing.Read32(source, 25),
-                ResyncCorrelationId = Hashing.Read32(source, 29)
+                ResyncCorrelationId = Hashing.Read32(source, 29),
+                ScopeValue = Hashing.Read64(source, 33)
             };
             if (!IsValid(value)) return false;
             header = value;

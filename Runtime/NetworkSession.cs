@@ -36,6 +36,13 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Gets caller-selected replication scope.</summary>
         public ScopeId Scope { get; private set; }
 
+        /// <summary>
+        /// Updates the replication scope outside admission (NCORE-15). On the server this tracks a
+        /// peer's spatial-cell reassignment; on the client this adopts the scope carried by an
+        /// accepted keyframe. Does not otherwise touch session state.
+        /// </summary>
+        internal void SetScope(ScopeId scope) => Scope = scope;
+
         /// <summary>Completes the v7 handshake after exact shared-manifest fingerprint comparison.</summary>
         internal NetworkAdmissionResult Admit(SchemaFingerprint remoteFingerprint, uint peerId, uint epoch, ScopeId scope)
         {

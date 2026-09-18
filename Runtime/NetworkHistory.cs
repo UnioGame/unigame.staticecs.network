@@ -6,7 +6,7 @@ namespace UniGame.StaticEcs.Network
     public sealed class NetworkHistory<T>
     {
         private readonly int _capacity;
-        private readonly long _maxBytes;
+        private long _maxBytes;
         private readonly Func<T, int> _sizeOf;
         private readonly Action<T> _release;
         private readonly uint[] _ticks;
@@ -40,6 +40,20 @@ namespace UniGame.StaticEcs.Network
         public int Capacity => _capacity;
         /// <summary>Gets the configured maximum retained byte count.</summary>
         public long MaxBytes => _maxBytes;
+
+        /// <summary>
+        /// Lowers or raises this history's own byte cap (NCORE-15) and immediately evicts oldest
+        /// ticks until the new cap holds. Used to share one overall history byte budget across many
+        /// small per-scope histories instead of letting each one independently reach its original
+        /// cap, which would multiply worst-case memory by the number of active scopes.
+        /// </summary>
+        internal void Rebudget(long maxBytes)
+        {
+            if (maxBytes < 1) throw new ArgumentOutOfRangeException(nameof(maxBytes));
+            _maxBytes = maxBytes;
+            while (_bytes > _maxBytes && _count > 0)
+                Evict((int)(FindBoundary(false) % (uint)_capacity));
+        }
         /// <summary>Gets the oldest retained tick, or zero when empty.</summary>
         public uint OldestTick => BoundaryTick(false);
         /// <summary>Gets the newest retained tick, or zero when empty.</summary>

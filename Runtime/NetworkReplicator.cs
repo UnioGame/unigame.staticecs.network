@@ -24,6 +24,7 @@ namespace UniGame.StaticEcs.Network
             new List<NetworkReplicaEntry>();
         private readonly object _owner = new object();
         private readonly NetworkScopeSelector<TWorld> _scopeSelector;
+        private readonly INetworkScopeProvider<TWorld> _scopeProvider;
         private readonly NetworkReplicaSkipPolicy<TWorld> _skipPolicy;
         private readonly NetworkSnapshotPool _snapshotPool;
         private int _captureCapacity = 4096;
@@ -54,18 +55,37 @@ namespace UniGame.StaticEcs.Network
         }
 
         /// <summary>Creates an authority replicator with an active-scope selector.</summary>
+        /// <param name="scopeProvider">
+        /// Opt-in, off by default (NCORE-15). When supplied, <see cref="Capture"/> collects a
+        /// scope's entities directly from <see cref="INetworkScopeProvider{TWorld}.CollectEntities"/>
+        /// instead of collecting every generated entity and filtering it through
+        /// <paramref name="scopeSelector"/>; <paramref name="scopeSelector"/> is still required but is
+        /// not consulted while a provider is present. Leaving this null keeps capture behavior and
+        /// cost byte-for-byte identical to before this parameter existed.
+        /// </param>
         public NetworkReplicator(NetworkSchema<TWorld> schema,
             NetworkScopeSelector<TWorld> scopeSelector, ScopeId scope = default,
             int historyTicks = 64, long historyBytes = 32 * 1024 * 1024,
-            NetworkBufferPool bufferPool = null)
+            NetworkBufferPool bufferPool = null,
+            INetworkScopeProvider<TWorld> scopeProvider = null)
             : this(schema, scope, historyTicks, historyBytes, bufferPool)
         {
             _scopeSelector = scopeSelector ??
                 throw new ArgumentNullException(nameof(scopeSelector));
+            _scopeProvider = scopeProvider;
         }
 
         /// <summary>Gets the isolated replication scope.</summary>
-        public ScopeId Scope { get; }
+        public ScopeId Scope { get; private set; }
+
+        /// <summary>
+        /// Adopts a new replication scope outside construction (NCORE-15). Used by
+        /// <see cref="NetworkClient{TWorld}"/> to accept a scope carried by an incoming keyframe.
+        /// Does not touch replica bookkeeping: the next <see cref="Apply"/> call's incoming/removed
+        /// diff naturally destroys replicas absent from the new scope's keyframe and creates
+        /// whatever is newly present, exactly like an entity leaving and re-entering relevance.
+        /// </summary>
+        internal void SetScope(ScopeId scope) => Scope = scope;
         /// <summary>Gets bounded snapshots successfully applied by this client.</summary>
         public NetworkHistory<NetworkSnapshot> History { get; }
 
@@ -95,12 +115,22 @@ namespace UniGame.StaticEcs.Network
             _captureEntities.Clear();
             _captureSeen.Clear();
             var entries = _schema.RetainedEntries;
-            for (var i = 0; i < entries.Length; i++)
-                if (entries[i].Invoker is IEntityNetworkInvoker<TWorld> invoker)
-                    invoker.Collect(_captureEntities, _captureSeen);
-            for (var i = _captureEntities.Count - 1; i >= 0; i--)
-                if (!_scopeSelector(scope, _captureEntities[i]))
-                    _captureEntities.RemoveAt(i);
+            if (_scopeProvider != null)
+            {
+                // NCORE-15: a spatial (or otherwise position-aware) provider enumerates only this
+                // scope's entities from its own index, so capture cost scales with one scope's
+                // population instead of the whole world. The selector is not consulted here.
+                _scopeProvider.CollectEntities(scope, _captureEntities, _captureSeen);
+            }
+            else
+            {
+                for (var i = 0; i < entries.Length; i++)
+                    if (entries[i].Invoker is IEntityNetworkInvoker<TWorld> invoker)
+                        invoker.Collect(_captureEntities, _captureSeen);
+                for (var i = _captureEntities.Count - 1; i >= 0; i--)
+                    if (!_scopeSelector(scope, _captureEntities[i]))
+                        _captureEntities.RemoveAt(i);
+            }
             if (_captureEntities.Count > ProtocolLimits.MaxEntities)
                 return SnapshotCaptureResult.LimitExceeded;
             _captureEntities.Sort(EntityComparer.Instance);
