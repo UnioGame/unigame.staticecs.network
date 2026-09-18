@@ -189,6 +189,39 @@ namespace UniGame.StaticEcs.Network
             int entities, int records) => _snapshotPool.Rent(serverTick, fingerprint,
             scope, bytes, entities, records);
 
+        /// <summary>
+        /// Accepts an already schema-matched, hash-verified canonical snapshot as this
+        /// replicator's new baseline without parsing a single entity or record, and without
+        /// creating, mutating, destroying, or even requiring <c>World&lt;TWorld&gt;</c> to exist.
+        /// Opt-in substitute for <see cref="Stage"/> + <see cref="Apply"/> for a caller that only
+        /// needs ACK/baseline progression identical to a full client — e.g. NCORE-26b's light
+        /// load-generator client, which must ACK every snapshot exactly when a full client would,
+        /// but never needs gameplay state. The snapshot is stored in <see cref="History"/> exactly
+        /// like <see cref="Apply"/> stores it at the end of a successful call (see its final
+        /// <c>History.Store</c>), so it is a valid baseline for the next delta this replicator's
+        /// owning <see cref="NetworkClient{TWorld}"/> receives.
+        /// <para>
+        /// Every replica-tracking invariant <see cref="Apply"/> maintains (the incoming/removed
+        /// diff, per-entity <c>AppliedBytes</c>) exists only for entities this replicator actually
+        /// created in an ECS world through <see cref="Apply"/>; a caller that only ever calls
+        /// <see cref="AcceptCanonical"/> on this replicator has no such entities, so skipping that
+        /// bookkeeping here changes nothing observable. Mixing <see cref="Apply"/> and
+        /// <see cref="AcceptCanonical"/> calls on the same replicator instance is unsupported and
+        /// not exercised by any caller in this package: <see cref="NetworkClient{TWorld}"/> only
+        /// ever picks one apply mode for its whole lifetime (see its <c>canonicalOnlyApply</c>
+        /// constructor parameter).
+        /// </para>
+        /// </summary>
+        public SnapshotApplyResult AcceptCanonical(NetworkSnapshot snapshot)
+        {
+            if (snapshot == null || snapshot.ByteLength > ProtocolLimits.MaxDecodedPayloadBytes)
+                return SnapshotApplyResult.LimitExceeded;
+            if (snapshot.SchemaFingerprint != _schema.Fingerprint || snapshot.Scope != Scope)
+                return SnapshotApplyResult.SchemaMismatch;
+            History.Store(snapshot.ServerTick, snapshot);
+            return SnapshotApplyResult.Success;
+        }
+
         /// <summary>Validates bounds and schema without mutating ECS.</summary>
         public SnapshotApplyResult Stage(NetworkSnapshot snapshot,
             out StagedNetworkSnapshot staged)

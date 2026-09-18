@@ -19,6 +19,7 @@ namespace UniGame.StaticEcs.Network
         private readonly NetworkBufferPool _bufferPool;
         private readonly bool _ownsBufferPool;
         private readonly NetworkReconstructionCache _reconstructionCache;
+        private readonly bool _canonicalOnlyApply;
         private readonly List<NetworkCommandEnvelope> _recentCommands = new List<NetworkCommandEnvelope>();
         private readonly Dictionary<NetworkTransactionId, NetworkClientTransaction> _transactions =
             new Dictionary<NetworkTransactionId, NetworkClientTransaction>();
@@ -66,6 +67,23 @@ namespace UniGame.StaticEcs.Network
         /// many client slots) to reuse identical delta reconstructions instead of repeating the
         /// same O(canonical snapshot) work and hash verification per client.
         /// </param>
+        /// <param name="canonicalOnlyApply">
+        /// Opt-in, off by default (matching every other opt-in parameter above, this keeps default
+        /// behaviour byte-for-byte and allocation-for-allocation identical to before this
+        /// parameter existed). When true, every received snapshot that passes wire/hash
+        /// verification is accepted through <see cref="NetworkReplicator{TWorld}.AcceptCanonical"/>
+        /// instead of <see cref="NetworkReplicator{TWorld}.Stage"/> +
+        /// <see cref="NetworkReplicator{TWorld}.Apply"/>: this client still advances
+        /// <see cref="AcknowledgedSnapshotTick"/>, still keeps <see cref="History"/> populated as
+        /// the baseline for the next delta, and still ACKs on the exact same schedule as a full
+        /// client — but it never parses a single entity/record and never touches
+        /// <c>World&lt;TWorld&gt;</c>, so the caller does not need to create, initialize, or
+        /// destroy that world at all. This is NCORE-26b's "light client": a thin load-generator
+        /// peer whose server-observable behaviour (ACKs, baselines, resync-on-corruption) is
+        /// indistinguishable from a full client's, but that carries no gameplay state. Do not set
+        /// this for a real game client: it has no ECS-side effect from a received snapshot, so
+        /// nothing would ever read the replicated world.
+        /// </param>
         public NetworkClient(INetworkTransport transport, NetworkSchema<TWorld> schema,
             ScopeId scope = default, INetworkObserver observer = null,
             int ticksPerSecond = 20, int predictionLeadTicks = 1,
@@ -73,7 +91,8 @@ namespace UniGame.StaticEcs.Network
             ulong simulationFingerprint = 0,
             ulong contentFingerprint = 0, NetworkBufferPool bufferPool = null,
             NetworkReplicaSkipPolicy<TWorld> unchangedApplySkipPolicy = null,
-            NetworkReconstructionCache reconstructionCache = null)
+            NetworkReconstructionCache reconstructionCache = null,
+            bool canonicalOnlyApply = false)
         {
             _transport = transport ?? throw new ArgumentNullException(nameof(transport));
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
@@ -91,6 +110,7 @@ namespace UniGame.StaticEcs.Network
                 new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes);
             _ownsBufferPool = bufferPool == null;
             _reconstructionCache = reconstructionCache;
+            _canonicalOnlyApply = canonicalOnlyApply;
             _replicator = new NetworkReplicator<TWorld>(schema, scope,
                 bufferPool: _bufferPool, skipPolicy: unchangedApplySkipPolicy);
             _session = new NetworkSession<TWorld>(transport.Connection,
@@ -829,11 +849,21 @@ namespace UniGame.StaticEcs.Network
                     }
                 }
                 decodedBytes = snapshot.ByteLength;
-                var result = _replicator.Stage(snapshot, out staged);
+                // NCORE-26b: a light client never needs the per-entity/record parse Stage()
+                // performs (that work only exists to feed Apply()'s ECS mutation), so it commits
+                // straight to AcceptCanonical, which is the only replicator call this client mode
+                // ever makes — see the canonicalOnlyApply constructor parameter doc comment.
+                var result = _canonicalOnlyApply
+                    ? _replicator.AcceptCanonical(snapshot)
+                    : _replicator.Stage(snapshot, out staged);
                 if (result != SnapshotApplyResult.Success)
                 {
                     discardRejectedTick = true;
                     snapshot.Dispose();
+                }
+                else if (_canonicalOnlyApply)
+                {
+                    staged = new StagedNetworkSnapshot { Snapshot = snapshot };
                 }
                 return result;
             }
@@ -1025,17 +1055,29 @@ namespace UniGame.StaticEcs.Network
         {
             var started = Stopwatch.GetTimestamp();
             SnapshotApplyResult result;
-            try
+            if (_canonicalOnlyApply)
             {
-                result = _replicator.Apply(in staged);
+                // TryStageSnapshot already committed this snapshot through
+                // NetworkReplicator.AcceptCanonical (including History.Store); reaching here with
+                // staged.Snapshot set means that already succeeded, so this path only performs the
+                // same tick/session/ACK bookkeeping below that a full client performs after
+                // NetworkReplicator.Apply succeeds. No ECS work happens on this path.
+                result = SnapshotApplyResult.Success;
             }
-            catch (Exception)
+            else
             {
-                RequestRecovery(NetworkRecoveryPhase.RecreateReplicaWorld,
-                    NetworkRecoveryReason.SnapshotApplyFailed, staged.ServerTick);
-                staged.Snapshot.Dispose();
-                staged.Dispose();
-                return false;
+                try
+                {
+                    result = _replicator.Apply(in staged);
+                }
+                catch (Exception)
+                {
+                    RequestRecovery(NetworkRecoveryPhase.RecreateReplicaWorld,
+                        NetworkRecoveryReason.SnapshotApplyFailed, staged.ServerTick);
+                    staged.Snapshot.Dispose();
+                    staged.Dispose();
+                    return false;
+                }
             }
             _session.Trace(NetworkPhase.SnapshotApply, NetworkTraceKind.Point, DiagnosticResult(result), NetworkPacketKind.SnapshotChunk, staged.ServerTick, 0, staged.Snapshot.ByteLength, History.Count, History.Bytes, unchecked((int)(staged.ServerTick - AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), entities, records, resyncCorrelationId: resyncCorrelationId, snapshotResult: result, sequence: header.PacketSequence, acknowledgedSnapshotTick: AcknowledgedSnapshotTick, oldestHistoryTick: History.OldestTick, newestHistoryTick: History.NewestTick);
             if (result != SnapshotApplyResult.Success)
