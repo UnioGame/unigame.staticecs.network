@@ -405,8 +405,16 @@ namespace UniGame.StaticEcs.Network
         SnapshotDeltaEncode = 9,
         /// <summary>Per-peer snapshot diagnostics report after capture.</summary>
         SnapshotDiagnostics = 10,
+        /// <summary>
+        /// NCORE-15b: the actual per-scope capture call (<see cref="NetworkReplicator{TWorld}.Capture"/>),
+        /// as opposed to <see cref="Snapshot"/>, which also covers packet preparation and send for
+        /// every peer sharing that scope's already-cached capture. Added because a spatial-cell
+        /// scope provider's capture cost scales with occupied cells, not peers, and needs its own
+        /// measurement to attribute that cost separately from send-side work.
+        /// </summary>
+        SnapshotCapture = 11,
         /// <summary>Number of measured phases; not a valid phase value.</summary>
-        Count = 11,
+        Count = 12,
     }
 
     /// <summary>Receives allocation-free begin/end notifications for measured server phases.</summary>

@@ -25,12 +25,30 @@ namespace UniGame.StaticEcs.Network
         private readonly object _owner = new object();
         private readonly NetworkScopeSelector<TWorld> _scopeSelector;
         private readonly INetworkScopeProvider<TWorld> _scopeProvider;
+        private readonly INetworkCellularScopeProvider<TWorld> _cellularProvider;
         private readonly NetworkReplicaSkipPolicy<TWorld> _skipPolicy;
         private readonly INetworkUpdatePolicy<TWorld> _updatePolicy;
         private readonly Dictionary<ScopeId, ScopeCaptureCache> _updateCache =
             new Dictionary<ScopeId, ScopeCaptureCache>();
+        // NCORE-15b: cell-level capture cache for the merge-capture path (see CaptureViaCells).
+        // Reuses ScopeCaptureCache's shape (bytes + per-entity index for the NCORE-16 hold
+        // policy) keyed by cell id instead of by peer scope id; CapturedTick lets a scope built
+        // later in the same tick from an already-captured cell skip re-serializing it entirely.
+        private readonly Dictionary<ScopeId, ScopeCaptureCache> _cellCache =
+            new Dictionary<ScopeId, ScopeCaptureCache>();
+        private readonly int[] _cellCursors = new int[NetworkCellularScopeLimits.MaxCellsPerScope];
+        // Resolved once per cell per Capture call (see CaptureViaCells) so the k-way merge below
+        // indexes a plain array instead of repeating a Dictionary<ScopeId, _> lookup (hash +
+        // bucket walk) for every single entity it merges.
+        private readonly ScopeCaptureCache[] _cellCacheRefs =
+            new ScopeCaptureCache[NetworkCellularScopeLimits.MaxCellsPerScope];
+        private readonly List<ScopeId> _staleCellIds = new List<ScopeId>();
+        // Cells not touched by any scope for this many ticks are evicted from _cellCache so a
+        // world with many transient cells (players passing through) does not grow it forever.
+        private const uint CellCacheStaleAfterTicks = 64;
         private readonly NetworkSnapshotPool _snapshotPool;
         private int _captureCapacity = 4096;
+        private int _cellCaptureCapacity = 4096;
         // NCORE-16: 4 (typeId) + 1 (schema kind) + 1 (version) + 1 (disabled) + 4 (payload length),
         // exactly the fixed record header Capture() itself writes below, before the payload bytes.
         private const int RecordHeaderSize = 11;
@@ -88,6 +106,7 @@ namespace UniGame.StaticEcs.Network
             _scopeSelector = scopeSelector ??
                 throw new ArgumentNullException(nameof(scopeSelector));
             _scopeProvider = scopeProvider;
+            _cellularProvider = scopeProvider as INetworkCellularScopeProvider<TWorld>;
             _updatePolicy = updatePolicy;
         }
 
@@ -136,6 +155,13 @@ namespace UniGame.StaticEcs.Network
             snapshot = null;
             if (World<TWorld>.Status != WorldStatus.Initialized)
                 return SnapshotCaptureResult.WorldUnavailable;
+
+            // NCORE-15b: a provider that can decompose a scope into its member cells lets
+            // capture cost scale with occupied *cells* rather than occupied *scopes* -- see
+            // CaptureViaCells's doc comment. Every other provider (or none) keeps the exact
+            // capture path and cost that existed before this optimization.
+            if (_cellularProvider != null)
+                return CaptureViaCells(serverTick, scope, out snapshot);
 
             _captureEntities.Clear();
             _captureSeen.Clear();
@@ -338,6 +364,333 @@ namespace UniGame.StaticEcs.Network
             snapshot = _snapshotPool.Rent(serverTick, _schema.Fingerprint, scope,
                 buffer, _captureEntities.Count, records);
             return SnapshotCaptureResult.Success;
+        }
+
+        // NCORE-15b: builds one scope's canonical snapshot by k-way merging its neighbourhood
+        // cells' already-encoded entity blocks, instead of re-collecting and re-serializing
+        // every entity of every one of those cells on every single scope's capture. Cells
+        // overlap between neighbouring scopes by construction (NCORE-15's 3x3 neighbourhood), so
+        // in a spread population capture cost used to scale with occupied scopes times 9; here it
+        // scales with occupied cells once, plus a cheap byte-copy merge per scope.
+        //
+        // Each occupied cell is serialized exactly once per tick, the first time any scope that
+        // touches it is captured this tick (tracked by ScopeCaptureCache.CapturedTick); every
+        // other scope sharing that cell this same tick reuses its bytes verbatim. The NCORE-16
+        // update-hold policy still applies underneath -- CaptureCellInto consults it exactly like
+        // the plain per-scope path used to, just keyed by cell instead of by scope, which is
+        // strictly finer-grained (a cell is, at most, as large as a scope was before cells
+        // existed) so held entities keep reusing their previously captured bytes.
+        private SnapshotCaptureResult CaptureViaCells(uint serverTick, ScopeId scope,
+            out NetworkSnapshot snapshot)
+        {
+            snapshot = null;
+            Span<ScopeId> cellIds = stackalloc ScopeId[NetworkCellularScopeLimits.MaxCellsPerScope];
+            var cellCount = _cellularProvider.CollectScopeCells(scope, cellIds);
+            if ((uint)cellCount > (uint)NetworkCellularScopeLimits.MaxCellsPerScope)
+                return SnapshotCaptureResult.LimitExceeded;
+
+            EvictStaleCellCache(serverTick);
+
+            var totalEntities = 0;
+            var totalRecords = 0;
+            for (var i = 0; i < cellCount; i++)
+            {
+                if (!_cellCache.TryGetValue(cellIds[i], out var cache))
+                {
+                    cache = new ScopeCaptureCache();
+                    _cellCache.Add(cellIds[i], cache);
+                }
+                if (!cache.HasCapturedTick || cache.CapturedTick != serverTick)
+                {
+                    var cellResult = CaptureCellInto(serverTick, cellIds[i], cache);
+                    if (cellResult != SnapshotCaptureResult.Success)
+                        return cellResult;
+                }
+                _cellCacheRefs[i] = cache;
+                totalEntities += cache.Blocks.Count;
+                totalRecords += cache.RecordCount;
+                _cellCursors[i] = 0;
+            }
+            if (totalEntities > ProtocolLimits.MaxEntities)
+                return SnapshotCaptureResult.LimitExceeded;
+
+            var buffer = _bufferPool.Rent(_captureCapacity);
+            var writer = BinaryPackWriter.Create(buffer.Buffer);
+            var merged = 0;
+            try
+            {
+                writer.WriteInt(totalEntities);
+                var hasPrevious = false;
+                EntityGID previousGid = default;
+                while (true)
+                {
+                    var bestSlot = -1;
+                    for (var i = 0; i < cellCount; i++)
+                    {
+                        var cache = _cellCacheRefs[i];
+                        if (_cellCursors[i] >= cache.Blocks.Count)
+                            continue;
+                        if (bestSlot < 0 || Compare(cache.Blocks[_cellCursors[i]].Gid,
+                                _cellCacheRefs[bestSlot].Blocks[_cellCursors[bestSlot]].Gid) < 0)
+                            bestSlot = i;
+                    }
+                    if (bestSlot < 0)
+                        break;
+                    var bestCache = _cellCacheRefs[bestSlot];
+                    var block = bestCache.Blocks[_cellCursors[bestSlot]];
+                    _cellCursors[bestSlot]++;
+                    // Cells must partition entities (each entity belongs to exactly one cell);
+                    // a duplicate or out-of-order GID here means a provider bug, not bad wire
+                    // data, but is still reported the same way Capture always reports an
+                    // internal invariant violation, rather than silently producing a corrupt
+                    // canonical snapshot.
+                    if (hasPrevious && Compare(previousGid, block.Gid) >= 0)
+                        return FailCapture(buffer, writer.Buffer,
+                            SnapshotCaptureResult.InvalidEntity);
+                    previousGid = block.Gid;
+                    hasPrevious = true;
+                    writer.EnsureSize((uint)block.Length);
+                    Array.Copy(bestCache.Bytes, block.Offset, writer.Buffer,
+                        (int)writer.Position, block.Length);
+                    writer.Position += (uint)block.Length;
+                    merged++;
+                }
+            }
+            catch
+            {
+                return FailCapture(buffer, writer.Buffer, SnapshotCaptureResult.HookFailed);
+            }
+            if (merged != totalEntities)
+                return FailCapture(buffer, writer.Buffer, SnapshotCaptureResult.InvalidEntity);
+            if (writer.Position > ProtocolLimits.MaxDecodedPayloadBytes)
+                return FailCapture(buffer, writer.Buffer, SnapshotCaptureResult.LimitExceeded);
+
+            if (!ReferenceEquals(writer.Buffer, buffer.Buffer))
+            {
+                buffer.Dispose();
+                buffer = _bufferPool.Adopt(writer.Buffer, checked((int)writer.Position));
+            }
+            else
+            {
+                buffer.SetLength(checked((int)writer.Position));
+            }
+            _captureCapacity = Math.Max(_captureCapacity, buffer.Capacity);
+            snapshot = _snapshotPool.Rent(serverTick, _schema.Fingerprint, scope,
+                buffer, totalEntities, totalRecords);
+            return SnapshotCaptureResult.Success;
+        }
+
+        // Serializes exactly one cell's entities into `cache`, applying the NCORE-16
+        // update-hold policy (keyed by this cell id, if a policy is configured) against that
+        // same cell's previous capture, then publishing this tick's bytes/index/blocks as its
+        // new state. Mirrors the plain per-scope Capture body almost exactly -- the difference
+        // is entirely in what gets cached (per cell, with an ascending-GID block index for
+        // merging) rather than in how a single entity gets serialized.
+        private SnapshotCaptureResult CaptureCellInto(uint serverTick, ScopeId cellId,
+            ScopeCaptureCache cache)
+        {
+            _captureEntities.Clear();
+            _captureSeen.Clear();
+            _cellularProvider.CollectCellEntities(cellId, _captureEntities, _captureSeen);
+            if (_captureEntities.Count > ProtocolLimits.MaxEntities)
+                return SnapshotCaptureResult.LimitExceeded;
+
+            // Fast path for an empty cell -- common in a spread population, where most of a
+            // scope's 3x3 neighbourhood is unoccupied: publish "nothing here this tick" without
+            // renting a buffer, creating a writer, or touching Blocks/Index at all. Cheap enough
+            // that CaptureViaCells does not need to special-case unoccupied cells itself.
+            if (_captureEntities.Count == 0)
+            {
+                cache.Blocks.Clear();
+                cache.RecordCount = 0;
+                cache.CapturedTick = serverTick;
+                cache.HasCapturedTick = true;
+                return SnapshotCaptureResult.Success;
+            }
+            _captureEntities.Sort(EntityComparer.Instance);
+
+            var entries = _schema.RetainedEntries;
+            var buffer = _bufferPool.Rent(_cellCaptureCapacity);
+            var writer = BinaryPackWriter.Create(buffer.Buffer);
+            var records = 0;
+            var blocks = cache.Blocks;
+            blocks.Clear();
+
+            // NCORE-16: read side of the update-policy hold cache, exactly like the plain
+            // per-scope path, except the "previous capture" is this cell's, not a peer scope's.
+            // `previousBytes`/`previousIndex` are this cell's own last successful capture,
+            // untouched for the rest of this call (the cache object itself is only overwritten
+            // once, in bulk, after this entire loop finishes), so reading them into this tick's
+            // `freshIndex` while writing into a *different* rented buffer is always safe.
+            byte[] previousBytes = null;
+            Dictionary<EntityGID, HeldRecordRange> previousIndex = null;
+            Dictionary<EntityGID, HeldRecordRange> freshIndex = null;
+            if (_updatePolicy != null)
+            {
+                if (cache.HasCapturedTick)
+                {
+                    previousBytes = cache.Bytes;
+                    previousIndex = cache.Index;
+                }
+                freshIndex = new Dictionary<EntityGID, HeldRecordRange>(_captureEntities.Count);
+            }
+
+            try
+            {
+                for (var i = 0; i < _captureEntities.Count; i++)
+                {
+                    var entity = _captureEntities[i];
+                    if (i > 0 && Compare(_captureEntities[i - 1].GID, entity.GID) >= 0)
+                        return FailCapture(buffer, writer.Buffer,
+                            SnapshotCaptureResult.InvalidEntity);
+                    NetworkSchemaEntry kind = null;
+                    for (var j = 0; j < entries.Length; j++)
+                    {
+                        if (entries[j].Invoker is IEntityNetworkInvoker<TWorld> invoker &&
+                            invoker.Matches(entity))
+                        {
+                            kind = entries[j];
+                            break;
+                        }
+                    }
+                    if (kind == null)
+                        return FailCapture(buffer, writer.Buffer,
+                            SnapshotCaptureResult.InvalidEntity);
+
+                    var blockStart = writer.Position;
+                    writer.WriteUlong(entity.GID.Raw);
+                    writer.WriteUint(kind.TypeId.Value);
+                    writer.WriteBool(entity.IsDisabled);
+                    var recordCountPosition = writer.MakePoint(sizeof(ushort));
+                    var recordsStart = writer.Position;
+                    var entityRecords = 0;
+
+                    var holdCandidate = false;
+                    var previousRecordCursor = 0;
+                    var previousRecordsRemaining = 0;
+                    if (previousIndex != null &&
+                        previousIndex.TryGetValue(entity.GID, out var previousRange) &&
+                        previousRange.Kind == kind.TypeId &&
+                        _updatePolicy.ShouldHold(serverTick, cellId, entity, entity.GID))
+                    {
+                        holdCandidate = true;
+                        previousRecordCursor = previousRange.RecordsOffset;
+                        previousRecordsRemaining = previousRange.RecordCount;
+                    }
+
+                    for (var j = 0; j < entries.Length; j++)
+                    {
+                        if (entries[j].Invoker is not IRecordNetworkInvoker<TWorld> invoker ||
+                            !invoker.Has(entity))
+                            continue;
+                        if (entityRecords == ProtocolLimits.MaxRecordsPerEntity)
+                            return FailCapture(buffer, writer.Buffer,
+                                SnapshotCaptureResult.LimitExceeded);
+                        var entry = entries[j];
+
+                        if (holdCandidate)
+                        {
+                            while (previousRecordsRemaining > 0 &&
+                                   Hashing.Read32(previousBytes, previousRecordCursor) <
+                                   entry.TypeId.Value)
+                            {
+                                var skipLength = unchecked((int)Hashing.Read32(previousBytes,
+                                    previousRecordCursor + 7));
+                                previousRecordCursor += RecordHeaderSize + skipLength;
+                                previousRecordsRemaining--;
+                            }
+                            if (previousRecordsRemaining > 0 &&
+                                Hashing.Read32(previousBytes, previousRecordCursor) ==
+                                entry.TypeId.Value &&
+                                previousBytes[previousRecordCursor + 4] == (byte)entry.Kind &&
+                                previousBytes[previousRecordCursor + 5] == entry.Version)
+                            {
+                                var heldLength = unchecked((int)Hashing.Read32(previousBytes,
+                                    previousRecordCursor + 7));
+                                var blockLength = RecordHeaderSize + heldLength;
+                                writer.EnsureSize((uint)blockLength);
+                                Array.Copy(previousBytes, previousRecordCursor, writer.Buffer,
+                                    (int)writer.Position, blockLength);
+                                writer.Position += (uint)blockLength;
+                                previousRecordCursor += blockLength;
+                                previousRecordsRemaining--;
+                                entityRecords++;
+                                records++;
+                                continue;
+                            }
+                        }
+
+                        writer.WriteUint(entry.TypeId.Value);
+                        writer.WriteByte((byte)entry.Kind);
+                        writer.WriteByte(entry.Version);
+                        writer.WriteBool(invoker.IsDisabled(entity));
+                        var lengthPosition = writer.MakePoint(sizeof(uint));
+                        var payloadStart = writer.Position;
+                        invoker.Write(entity, ref writer, entry.MaxBytes);
+                        writer.WriteUintAt(lengthPosition, writer.Position - payloadStart);
+                        entityRecords++;
+                        records++;
+                    }
+                    writer.WriteUshortAt(recordCountPosition,
+                        checked((ushort)entityRecords));
+
+                    if (freshIndex != null)
+                        freshIndex[entity.GID] = new HeldRecordRange(kind.TypeId,
+                            checked((int)recordsStart),
+                            checked((ushort)entityRecords));
+                    blocks.Add(new EntityBlockRange(entity.GID, checked((int)blockStart),
+                        checked((int)(writer.Position - blockStart))));
+                }
+            }
+            catch
+            {
+                return FailCapture(buffer, writer.Buffer, SnapshotCaptureResult.HookFailed);
+            }
+
+            if (writer.Position > ProtocolLimits.MaxDecodedPayloadBytes)
+                return FailCapture(buffer, writer.Buffer, SnapshotCaptureResult.LimitExceeded);
+
+            var finalLength = checked((int)writer.Position);
+            if (cache.Bytes.Length < finalLength)
+                cache.Bytes = new byte[finalLength];
+            Array.Copy(writer.Buffer, 0, cache.Bytes, 0, finalLength);
+            cache.Length = finalLength;
+            // `blocks` is `cache.Blocks` itself (cleared and repopulated above), not a separate
+            // list, so publishing it is already done -- nothing to reassign here.
+            cache.RecordCount = records;
+            cache.CapturedTick = serverTick;
+            cache.HasCapturedTick = true;
+            if (freshIndex != null)
+                cache.Index = freshIndex;
+
+            if (!ReferenceEquals(writer.Buffer, buffer.Buffer))
+            {
+                // The writer outgrew the rented scratch buffer -- remember the larger size so
+                // the *next* capture of this cell rents enough up front instead of growing (and
+                // reallocating) again every single tick.
+                _cellCaptureCapacity = Math.Max(_cellCaptureCapacity, writer.Buffer.Length);
+                var resized = _bufferPool.Adopt(writer.Buffer, 0);
+                resized.Dispose();
+            }
+            else
+            {
+                _cellCaptureCapacity = Math.Max(_cellCaptureCapacity, buffer.Capacity);
+            }
+            buffer.Dispose();
+            return SnapshotCaptureResult.Success;
+        }
+
+        private void EvictStaleCellCache(uint serverTick)
+        {
+            if (serverTick <= CellCacheStaleAfterTicks || _cellCache.Count == 0)
+                return;
+            var threshold = serverTick - CellCacheStaleAfterTicks;
+            _staleCellIds.Clear();
+            foreach (var pair in _cellCache)
+                if (!pair.Value.HasCapturedTick || pair.Value.CapturedTick < threshold)
+                    _staleCellIds.Add(pair.Key);
+            for (var i = 0; i < _staleCellIds.Count; i++)
+                _cellCache.Remove(_staleCellIds[i]);
         }
 
         internal NetworkSnapshot CreateSnapshot(uint serverTick,
@@ -781,12 +1134,37 @@ namespace UniGame.StaticEcs.Network
         // itself writes); `Index` locates each entity's record block within it. Both are replaced
         // wholesale at the end of every successful Capture call for this scope, so an entity that
         // left the scope is dropped from `Index` within one tick instead of accumulating forever.
+        // NCORE-15b: the merge-capture path (CaptureViaCells) reuses this exact shape keyed by
+        // cell id instead of by peer scope id, and additionally populates `Blocks` (each entity's
+        // full wire block within `Bytes`, in the ascending-GID order Capture always writes them
+        // in) and `CapturedTick`, neither of which the plain per-scope hold path uses.
         private sealed class ScopeCaptureCache
         {
             internal byte[] Bytes = Array.Empty<byte>();
             internal int Length;
             internal Dictionary<EntityGID, HeldRecordRange> Index =
                 new Dictionary<EntityGID, HeldRecordRange>();
+            internal List<EntityBlockRange> Blocks = new List<EntityBlockRange>();
+            internal int RecordCount;
+            internal uint CapturedTick;
+            internal bool HasCapturedTick;
+        }
+
+        // One entity's full wire block inside a cell's ScopeCaptureCache.Bytes: from its GID
+        // field through the end of its last record, ready to be byte-copied verbatim into a
+        // merged scope buffer without touching a single record.
+        private readonly struct EntityBlockRange
+        {
+            internal EntityBlockRange(EntityGID gid, int offset, int length)
+            {
+                Gid = gid;
+                Offset = offset;
+                Length = length;
+            }
+
+            internal readonly EntityGID Gid;
+            internal readonly int Offset;
+            internal readonly int Length;
         }
 
         // Locates one entity's record block (the bytes starting right after its 2-byte record-count

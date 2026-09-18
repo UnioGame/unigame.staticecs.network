@@ -256,7 +256,10 @@ namespace UniGame.StaticEcs.Network
                     if (!_captures.TryGetValue(peer.Scope, out var capture))
                     {
                         var started = Stopwatch.GetTimestamp();
-                        if (_replicator.Capture(serverTick, peer.Scope, out capture) != SnapshotCaptureResult.Success) { peer.Session.Trace(NetworkPhase.SnapshotCapture, NetworkTraceKind.Point, NetworkResultCategory.World, NetworkPacketKind.SnapshotChunk, serverTick, 0, 0, 0, 0, 0, ElapsedNanoseconds(started)); continue; }
+                        SnapshotCaptureResult captureResult;
+                        using (NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.SnapshotCapture))
+                            captureResult = _replicator.Capture(serverTick, peer.Scope, out capture);
+                        if (captureResult != SnapshotCaptureResult.Success) { peer.Session.Trace(NetworkPhase.SnapshotCapture, NetworkTraceKind.Point, NetworkResultCategory.World, NetworkPacketKind.SnapshotChunk, serverTick, 0, 0, 0, 0, 0, ElapsedNanoseconds(started)); continue; }
                         _captures.Add(peer.Scope, capture);
                         _coordinator.StoreCapture(peer.Scope, capture);
                         peer.Session.Trace(NetworkPhase.SnapshotCapture, NetworkTraceKind.Point, NetworkResultCategory.Success, NetworkPacketKind.SnapshotChunk, serverTick, 0, capture.ByteLength, _coordinator.HistoryCount(peer.Scope), _coordinator.HistoryByteCount(peer.Scope), unchecked((int)(serverTick - peer.AcknowledgedSnapshotTick)), ElapsedNanoseconds(started), capture.EntityCount, capture.RecordCount, activeConnections: ActiveConnectionCount, activePeers: ActivePeerCount);

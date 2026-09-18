@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using FFS.Libraries.StaticEcs;
 using NUnit.Framework;
@@ -203,8 +204,14 @@ namespace UniGame.StaticEcs.Network.Tests
             }
         }
 
+        // NCORE-15b: a scope-mismatched delta is silently ignored instead of treated as
+        // malformed (see NetworkClient.TryStageSnapshot's delta branch). The three tests below
+        // exercise that contract end to end: an in-flight old-scope delta is dropped without
+        // recovery or a counted protocol error, the client still accepts whatever legitimate
+        // packet arrives next, and a delta that is malformed for an unrelated reason (not scope)
+        // is still rejected exactly as before.
         [Test]
-        public void ClientRejectsADeltaWhoseScopeDoesNotMatchItsSessionScope()
+        public void ClientIgnoresAStaleScopeDeltaWithoutRequestingRecovery()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
             CreateReplicationWorld<ClientAWorld>(false);
@@ -212,20 +219,178 @@ namespace UniGame.StaticEcs.Network.Tests
             {
                 var authoritySchema = Schema<AuthorityWorld>(true);
                 var clientSchema = Schema<ClientAWorld>(false);
+                var owner = World<AuthorityWorld>.NewEntity<TestEntity>();
+                owner.Set(new TestComponent { Value = 1 });
+
+                var provider = new StubScopeProvider();
+                provider.ScopeEntities[new ScopeId(1)] =
+                    new List<World<AuthorityWorld>.Entity> { owner };
+                provider.ScopeEntities[new ScopeId(2)] =
+                    new List<World<AuthorityWorld>.Entity> { owner };
+                var server = new NetworkServer<AuthorityWorld>(authoritySchema,
+                    static (_, _) => true, scopeProvider: provider);
+
                 MemoryNetworkTransport.CreatePair(new ConnectionId(301),
                     out var clientTransport, out var serverTransport);
                 using (clientTransport)
                 using (serverTransport)
                 {
-                    // A real handshake against scope 1, so the client's session scope is genuinely
-                    // established (not just a constructor default) before the attack packet.
+                    server.AddConnection(serverTransport, 3, 1, new ScopeId(1));
+                    var observer = new TraceCollector();
+                    var client = new NetworkClient<ClientAWorld>(clientTransport, clientSchema,
+                        new ScopeId(1), observer);
+                    client.BeginHandshake();
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+                    Assert.That(client.Session.Scope.Value, Is.EqualTo(1u));
+
+                    // A genuine hysteresis reassignment: the client legitimately adopts scope 2
+                    // from a real forced keyframe, exactly like
+                    // HysteresisScopeReassignmentForcesKeyframeCarryingTheNewScope.
+                    server.Receive();
+                    provider.Assignments[3] = new ScopeId(2);
+                    server.Tick(_ => { });
+                    client.Process();
+                    Assert.That(client.Session.Scope.Value, Is.EqualTo(2u));
+                    var acknowledgedBefore = client.AcknowledgedSnapshotTick;
+                    // Drain the harmless "recovery complete" transition every successful keyframe
+                    // apply latches (see NetworkClient.ApplySnapshot's completesRecovery branch) --
+                    // both keyframes above legitimately queued one -- so the assertion below
+                    // observes only what the stale-scope packet itself causes.
+                    client.TryConsumeRecoveryTransition(out _);
+
+                    // A well-formed chunk header for a fresh (never-acknowledged) tick, but
+                    // carrying the peer's *previous* scope -- a delta the server queued before
+                    // the reassignment above and that is still, physically, in flight.
+                    var chunk = new SnapshotChunkHeader
+                    {
+                        PayloadKind = SnapshotPayloadKind.Delta,
+                        SnapshotTick = acknowledgedBefore + 1,
+                        BaselineTick = acknowledgedBefore,
+                        ScopeValue = 1,
+                        TotalLength = 1,
+                        TotalHash = 123,
+                        ChunkIndex = 0,
+                        ChunkCount = 1,
+                    };
+                    observer.Events.Clear();
+                    SendSnapshotChunk(serverTransport, clientSchema.Fingerprint, 1, chunk,
+                        new byte[] { 0 });
+                    client.Process();
+
+                    Assert.That(client.Session.Scope.Value, Is.EqualTo(2u),
+                        "an in-flight old-scope delta must never revert the session scope");
+                    Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(acknowledgedBefore),
+                        "the stale-scope delta must not be applied");
+                    Assert.That(client.TryConsumeRecoveryTransition(out _), Is.False,
+                        "an in-flight old-scope delta must not trigger a resync/recovery");
+                    Assert.That(
+                        observer.Single(NetworkPhase.Decode, NetworkPacketKind.SnapshotChunk)
+                            .Result,
+                        Is.EqualTo(NetworkResultCategory.Rejected),
+                        "must be classified outside {Protocol, Malformed, Schema, Limits} so " +
+                        "load-harness/game protocol-error counters do not count it as an error");
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ClientAcceptsTheNextLegitimateDeltaAfterIgnoringAStaleScopeDelta()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var authoritySchema = Schema<AuthorityWorld>(true);
+                var clientSchema = Schema<ClientAWorld>(false);
+                var owner = World<AuthorityWorld>.NewEntity<TestEntity>();
+                owner.Set(new TestComponent { Value = 1 });
+
+                var provider = new StubScopeProvider();
+                provider.ScopeEntities[new ScopeId(1)] =
+                    new List<World<AuthorityWorld>.Entity> { owner };
+                provider.ScopeEntities[new ScopeId(2)] =
+                    new List<World<AuthorityWorld>.Entity> { owner };
+                var server = new NetworkServer<AuthorityWorld>(authoritySchema,
+                    static (_, _) => true, scopeProvider: provider);
+
+                MemoryNetworkTransport.CreatePair(new ConnectionId(302),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    server.AddConnection(serverTransport, 4, 1, new ScopeId(1));
+                    var client = new NetworkClient<ClientAWorld>(clientTransport, clientSchema,
+                        new ScopeId(1));
+                    client.BeginHandshake();
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+
+                    server.Receive();
+                    provider.Assignments[4] = new ScopeId(2);
+                    server.Tick(_ => { });
+                    client.Process();
+                    var acknowledgedBefore = client.AcknowledgedSnapshotTick;
+
+                    var staleChunk = new SnapshotChunkHeader
+                    {
+                        PayloadKind = SnapshotPayloadKind.Delta,
+                        SnapshotTick = acknowledgedBefore + 1,
+                        BaselineTick = acknowledgedBefore,
+                        ScopeValue = 1,
+                        TotalLength = 1,
+                        TotalHash = 123,
+                        ChunkIndex = 0,
+                        ChunkCount = 1,
+                    };
+                    SendSnapshotChunk(serverTransport, clientSchema.Fingerprint, 1, staleChunk,
+                        new byte[] { 0 });
+                    client.Process();
+
+                    // The real server, still targeting scope 2, keeps ticking normally: its next
+                    // (legitimate) send for the peer's current scope must still be accepted --
+                    // ignoring the stale packet above must not wedge assembly or ACK progression.
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+
+                    Assert.That(client.Session.Scope.Value, Is.EqualTo(2u));
+                    Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(server.ServerTick),
+                        "a legitimate same-scope packet after a stale-scope drop must still " +
+                        "advance the client's acknowledged tick");
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ClientStillRejectsADeltaWithAnUnknownBaselineAtItsOwnCurrentScope()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var authoritySchema = Schema<AuthorityWorld>(true);
+                var clientSchema = Schema<ClientAWorld>(false);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(303),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
                     var server = new NetworkServer<AuthorityWorld>(authoritySchema,
                         static (_, _) => true);
-                    // Epoch 1 matches the SendSnapshotChunk test helper's hardcoded packet epoch
-                    // below, so the fabricated attack packet passes epoch validation and is
-                    // rejected for the reason this test actually exercises (scope mismatch), not
-                    // an unrelated epoch mismatch.
-                    server.AddConnection(serverTransport, 3, 1, new ScopeId(1));
+                    server.AddConnection(serverTransport, 5, 1, new ScopeId(1));
                     var client = new NetworkClient<ClientAWorld>(clientTransport, clientSchema,
                         new ScopeId(1));
                     client.BeginHandshake();
@@ -234,31 +399,34 @@ namespace UniGame.StaticEcs.Network.Tests
                     client.Process();
                     Assert.That(client.Session.Scope.Value, Is.EqualTo(1u));
                     var acknowledgedBefore = client.AcknowledgedSnapshotTick;
+                    // Drain the harmless "recovery complete" transition every successful keyframe
+                    // apply latches (see NetworkClient.ApplySnapshot's completesRecovery branch),
+                    // so the assertion below observes only what this test's packet causes.
+                    client.TryConsumeRecoveryTransition(out _);
 
-                    // A well-formed chunk header, but for a scope the client never adopted (no
-                    // keyframe ever carried scope 2): Delta must be rejected outright rather than
-                    // reconstructed against the wrong baseline history.
+                    // The scope matches the client's own current scope, so this is not the
+                    // NCORE-15b stale-scope case: the baseline tick is a real, known history
+                    // entry, but the delta body is corrupt. This must still be treated as
+                    // malformed and trigger recovery exactly as before this change.
                     var chunk = new SnapshotChunkHeader
                     {
                         PayloadKind = SnapshotPayloadKind.Delta,
                         SnapshotTick = acknowledgedBefore + 1,
                         BaselineTick = acknowledgedBefore,
-                        ScopeValue = 2,
+                        ScopeValue = 1,
                         TotalLength = 1,
                         TotalHash = 123,
                         ChunkIndex = 0,
                         ChunkCount = 1,
                     };
-                    SendSnapshotChunk(serverTransport, clientSchema.Fingerprint, 2, chunk,
+                    SendSnapshotChunk(serverTransport, clientSchema.Fingerprint, 1, chunk,
                         new byte[] { 0 });
                     client.Process();
 
-                    Assert.That(client.Session.Scope.Value, Is.EqualTo(1u),
-                        "an unfamiliar-scope delta must never change the session scope");
                     Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(acknowledgedBefore),
                         "the malformed delta must not be applied");
                     Assert.That(client.TryConsumeRecoveryTransition(out var transition),
-                        Is.True);
+                        Is.True, "a genuinely malformed delta must still trigger recovery");
                     Assert.That(transition.Phase,
                         Is.EqualTo(NetworkRecoveryPhase.AwaitingKeyframe));
                 }
@@ -373,6 +541,246 @@ namespace UniGame.StaticEcs.Network.Tests
                     if (seen.Add(entities[i].GID))
                         buffer.Add(entities[i]);
             }
+        }
+
+        // NCORE-15b: merge-capture -- a scope provider that additionally implements
+        // INetworkCellularScopeProvider makes NetworkReplicator.Capture serialize each cell once
+        // and build a scope by copying its member cells' already-encoded bytes (CaptureViaCells)
+        // instead of re-collecting and re-serializing the whole scope every time.
+        [Test]
+        public void MergeCaptureProducesByteIdenticalSnapshotsToThePlainPerScopeCapturePath()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var a = World<AuthorityWorld>.NewEntity<TestEntity>();
+                a.Set(new TestComponent { Value = 1 });
+                var b = World<AuthorityWorld>.NewEntity<TestEntity>();
+                b.Set(new TestComponent { Value = 2 });
+                var c = World<AuthorityWorld>.NewEntity<TestEntity>();
+                c.Set(new TestComponent { Value = 3 });
+
+                var cellA = new ScopeId(101);
+                var cellB = new ScopeId(102);
+                var cellC = new ScopeId(103);
+                var scope = new ScopeId(200);
+
+                var plainProvider = new StubScopeProvider();
+                plainProvider.ScopeEntities[scope] =
+                    new List<World<AuthorityWorld>.Entity> { a, b, c };
+                var plainReplicator = new NetworkReplicator<AuthorityWorld>(schema,
+                    static (_, _) => true, scopeProvider: plainProvider);
+
+                var cellularProvider = new StubCellularScopeProvider();
+                cellularProvider.CellEntities[cellA] =
+                    new List<World<AuthorityWorld>.Entity> { a };
+                cellularProvider.CellEntities[cellB] =
+                    new List<World<AuthorityWorld>.Entity> { b };
+                cellularProvider.CellEntities[cellC] =
+                    new List<World<AuthorityWorld>.Entity> { c };
+                cellularProvider.ScopeCells[scope] = new[] { cellA, cellB, cellC };
+                var cellularReplicator = new NetworkReplicator<AuthorityWorld>(schema,
+                    static (_, _) => true, scopeProvider: cellularProvider);
+                try
+                {
+                    Assert.That(plainReplicator.Capture(1, scope, out var plainSnapshot),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(cellularReplicator.Capture(1, scope, out var cellularSnapshot),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+
+                    Assert.That(
+                        cellularSnapshot.Bytes.Span.SequenceEqual(plainSnapshot.Bytes.Span),
+                        Is.True,
+                        "merge-capture must be byte-for-byte identical to the plain " +
+                        "per-scope capture path");
+                    Assert.That(cellularSnapshot.EntityCount,
+                        Is.EqualTo(plainSnapshot.EntityCount));
+                    Assert.That(cellularSnapshot.RecordCount,
+                        Is.EqualTo(plainSnapshot.RecordCount));
+                    Assert.That(cellularSnapshot.PayloadHash,
+                        Is.EqualTo(plainSnapshot.PayloadHash));
+
+                    plainSnapshot.Dispose();
+                    cellularSnapshot.Dispose();
+                }
+                finally
+                {
+                    plainReplicator.Dispose();
+                    cellularReplicator.Dispose();
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void CaptureViaCellsSharesCellCaptureAcrossOverlappingScopesWithinOneTick()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var shared = World<AuthorityWorld>.NewEntity<TestEntity>();
+                shared.Set(new TestComponent { Value = 1 });
+                var onlyInScopeOne = World<AuthorityWorld>.NewEntity<TestEntity>();
+                onlyInScopeOne.Set(new TestComponent { Value = 2 });
+                var onlyInScopeTwo = World<AuthorityWorld>.NewEntity<TestEntity>();
+                onlyInScopeTwo.Set(new TestComponent { Value = 3 });
+
+                var sharedCell = new ScopeId(301);
+                var cellOne = new ScopeId(302);
+                var cellTwo = new ScopeId(303);
+                var scopeOne = new ScopeId(400);
+                var scopeTwo = new ScopeId(401);
+
+                var provider = new StubCellularScopeProvider();
+                provider.CellEntities[sharedCell] =
+                    new List<World<AuthorityWorld>.Entity> { shared };
+                provider.CellEntities[cellOne] =
+                    new List<World<AuthorityWorld>.Entity> { onlyInScopeOne };
+                provider.CellEntities[cellTwo] =
+                    new List<World<AuthorityWorld>.Entity> { onlyInScopeTwo };
+                provider.ScopeCells[scopeOne] = new[] { sharedCell, cellOne };
+                provider.ScopeCells[scopeTwo] = new[] { sharedCell, cellTwo };
+
+                var replicator = new NetworkReplicator<AuthorityWorld>(schema,
+                    static (_, _) => true, scopeProvider: provider);
+                try
+                {
+                    Assert.That(replicator.Capture(1, scopeOne, out var snapshotOne),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(replicator.Capture(1, scopeTwo, out var snapshotTwo),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+
+                    Assert.That(GetOrZero(provider.CollectCellCallCounts, sharedCell),
+                        Is.EqualTo(1),
+                        "a cell shared by two scopes captured in the same tick must be " +
+                        "serialized exactly once");
+                    Assert.That(GetOrZero(provider.CollectCellCallCounts, cellOne),
+                        Is.EqualTo(1));
+                    Assert.That(GetOrZero(provider.CollectCellCallCounts, cellTwo),
+                        Is.EqualTo(1));
+                    Assert.That(snapshotOne.EntityCount, Is.EqualTo(2));
+                    Assert.That(snapshotTwo.EntityCount, Is.EqualTo(2));
+
+                    snapshotOne.Dispose();
+                    snapshotTwo.Dispose();
+
+                    // Freshness is per tick, not sticky forever: a later tick must re-serialize.
+                    Assert.That(replicator.Capture(2, scopeOne, out var snapshotOneAgain),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(GetOrZero(provider.CollectCellCallCounts, sharedCell),
+                        Is.EqualTo(2));
+                    snapshotOneAgain.Dispose();
+                }
+                finally
+                {
+                    replicator.Dispose();
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void CaptureViaCellsHonoursTheUpdateHoldPolicyPerCell()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                entity.Set(new TestComponent { Value = 1 });
+
+                var cell = new ScopeId(501);
+                var scope = new ScopeId(502);
+                var provider = new StubCellularScopeProvider();
+                provider.CellEntities[cell] = new List<World<AuthorityWorld>.Entity> { entity };
+                provider.ScopeCells[scope] = new[] { cell };
+
+                var policy = new StubHoldEverythingPolicy();
+                var replicator = new NetworkReplicator<AuthorityWorld>(schema,
+                    static (_, _) => true, scopeProvider: provider, updatePolicy: policy);
+                try
+                {
+                    Assert.That(replicator.Capture(1, scope, out var first),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    entity.Set(new TestComponent { Value = 999 });
+                    Assert.That(replicator.Capture(2, scope, out var second),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+
+                    Assert.That(second.Bytes.Span.SequenceEqual(first.Bytes.Span), Is.True,
+                        "the NCORE-16 hold policy must still apply per cell under merge-capture: " +
+                        "a held entity's captured bytes must not move even though the live ECS " +
+                        "value did");
+
+                    first.Dispose();
+                    second.Dispose();
+                }
+                finally
+                {
+                    replicator.Dispose();
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        private static int GetOrZero(Dictionary<ScopeId, int> counts, ScopeId key) =>
+            counts.TryGetValue(key, out var value) ? value : 0;
+
+        /// <summary>Deterministic stand-in for a real spatial provider that also decomposes a
+        /// scope into cells (NCORE-15b test double).</summary>
+        private sealed class StubCellularScopeProvider : INetworkScopeProvider<AuthorityWorld>,
+            INetworkCellularScopeProvider<AuthorityWorld>
+        {
+            internal readonly Dictionary<ScopeId, List<World<AuthorityWorld>.Entity>>
+                CellEntities = new Dictionary<ScopeId, List<World<AuthorityWorld>.Entity>>();
+            internal readonly Dictionary<ScopeId, ScopeId[]> ScopeCells =
+                new Dictionary<ScopeId, ScopeId[]>();
+            internal readonly Dictionary<ScopeId, int> CollectCellCallCounts =
+                new Dictionary<ScopeId, int>();
+
+            public void RefreshTick(uint serverTick) { }
+
+            public bool TryUpdateScope(uint peerId, ref ScopeId scope) => false;
+
+            public void CollectEntities(ScopeId scope, List<World<AuthorityWorld>.Entity> buffer,
+                HashSet<EntityGID> seen) =>
+                throw new System.InvalidOperationException(
+                    "NetworkReplicator must prefer the cellular path once it is available, " +
+                    "never fall back to the non-cellular one.");
+
+            public int CollectScopeCells(ScopeId scope, Span<ScopeId> cells)
+            {
+                var members = ScopeCells[scope];
+                members.AsSpan().CopyTo(cells);
+                return members.Length;
+            }
+
+            public void CollectCellEntities(ScopeId cellId,
+                List<World<AuthorityWorld>.Entity> buffer, HashSet<EntityGID> seen)
+            {
+                CollectCellCallCounts[cellId] = GetOrZero(CollectCellCallCounts, cellId) + 1;
+                if (!CellEntities.TryGetValue(cellId, out var entities))
+                    return;
+                for (var i = 0; i < entities.Count; i++)
+                    if (seen.Add(entities[i].GID))
+                        buffer.Add(entities[i]);
+            }
+        }
+
+        private sealed class StubHoldEverythingPolicy : INetworkUpdatePolicy<AuthorityWorld>
+        {
+            public bool ShouldHold(uint serverTick, ScopeId scope,
+                in World<AuthorityWorld>.Entity entity, EntityGID gid) => true;
         }
     }
 }

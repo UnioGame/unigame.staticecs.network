@@ -473,7 +473,12 @@ namespace UniGame.StaticEcs.Network
                 }
                 if (header.Kind == PacketKind.SnapshotChunk)
                 {
-                    if (!awaitingSnapshotChunks)
+                    // NCORE-15b: a stale-scope delta is an expected drop, not a rejection -- skip
+                    // both the resync request and the discard-through-tick bump below so the
+                    // client keeps accepting whatever arrives next (the new scope's keyframe) for
+                    // this same tick instead of treating it as superseded.
+                    if (!awaitingSnapshotChunks &&
+                        snapshotResult != SnapshotApplyResult.ScopeStale)
                     {
                         if (staged.Snapshot == null)
                         {
@@ -837,10 +842,18 @@ namespace UniGame.StaticEcs.Network
                     NetworkBufferLease canonical = null;
                     // A delta always carries the sender's current scope; the server only ever
                     // sends a delta once the peer has already adopted its scope via an accepted
-                    // keyframe (NCORE-15), so a mismatch here means a stale or out-of-order packet
-                    // that must not be reconstructed against the wrong baseline history.
-                    if (chunk.ScopeValue != _session.Scope.Value ||
-                        !History.TryGet(chunk.BaselineTick, out var baseline) ||
+                    // keyframe (NCORE-15). A scope mismatch alone is not corruption (NCORE-15b):
+                    // after the server reassigns a peer's scope it forces a keyframe, but a delta
+                    // it queued for the peer's *previous* scope beforehand can still be in flight
+                    // and reach the client first. Treating that as malformed forced a spurious
+                    // resync (and a counted protocol error) on every scope transition. Silently
+                    // dropping it and waiting for the new scope's keyframe is correct instead --
+                    // any *other* structural problem (unknown baseline, schema/scope mismatch on
+                    // the baseline itself, bad delta bytes) still fails validation below exactly
+                    // as before and is reported as malformed.
+                    if (chunk.ScopeValue != _session.Scope.Value)
+                        return SnapshotApplyResult.ScopeStale;
+                    if (!History.TryGet(chunk.BaselineTick, out var baseline) ||
                         baseline.SchemaFingerprint != header.SchemaFingerprint ||
                         baseline.Scope != _session.Scope)
                         return SnapshotApplyResult.Malformed;
@@ -1240,6 +1253,10 @@ namespace UniGame.StaticEcs.Network
             SnapshotApplyResult.Malformed => NetworkResultCategory.Malformed,
             SnapshotApplyResult.LimitExceeded => NetworkResultCategory.Limits,
             SnapshotApplyResult.EntityConflict => NetworkResultCategory.World,
+            // NCORE-15b: an expected, self-resolving drop, not a fault -- must stay out of
+            // {Protocol, Malformed, Schema, Limits} so load-harness/game protocol-error counters
+            // (see WorldSlots.ObserveTrace) do not count a scope transition as an error.
+            SnapshotApplyResult.ScopeStale => NetworkResultCategory.Rejected,
             _ => NetworkResultCategory.World
         };
         private static long ElapsedNanoseconds(long started) => (Stopwatch.GetTimestamp() - started) * 1000000000L / Stopwatch.Frequency;

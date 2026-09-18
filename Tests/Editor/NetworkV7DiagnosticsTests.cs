@@ -565,7 +565,9 @@ namespace UniGame.StaticEcs.Network.Tests
                 Is.EqualTo(9));
             Assert.That((int)NetworkDiagnosticPhase.SnapshotDiagnostics,
                 Is.EqualTo(10));
-            Assert.That((int)NetworkDiagnosticPhase.Count, Is.EqualTo(11));
+            Assert.That((int)NetworkDiagnosticPhase.SnapshotCapture,
+                Is.EqualTo(11));
+            Assert.That((int)NetworkDiagnosticPhase.Count, Is.EqualTo(12));
 
             CreateReplicationWorld<AuthorityWorld>(true);
             CreateReplicationWorld<ClientAWorld>(false);

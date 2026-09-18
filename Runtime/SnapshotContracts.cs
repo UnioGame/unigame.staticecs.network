@@ -57,6 +57,14 @@ namespace UniGame.StaticEcs.Network
         LimitExceeded,
         /// <summary>Local entity state prevented application.</summary>
         EntityConflict,
+        /// <summary>
+        /// A delta chunk carried a replication scope other than the client's current one
+        /// (NCORE-15b). Expected during a scope transition: the server forces a keyframe on every
+        /// reassignment, but a delta it queued for the peer's previous scope beforehand can still
+        /// be in flight and arrive first. Not a structural fault -- the caller silently drops the
+        /// packet and keeps waiting for the new scope's keyframe instead of requesting a resync.
+        /// </summary>
+        ScopeStale,
     }
 
     /// <summary>Describes one validated canonical entity by primitive offsets.</summary>
