@@ -53,10 +53,13 @@ namespace UniGame.StaticEcs.Network
         private const int DeltaHeaderSize = sizeof(byte) + sizeof(uint) * 3;
         private const int EntityHeaderSize =
             sizeof(ulong) + sizeof(uint) + sizeof(byte) + sizeof(ushort);
-        private const int EntityDisabledOffset = sizeof(ulong) + sizeof(uint);
+        // Internal (not private): SnapshotDeltaBurstBackend.TryPlan's mask computation
+        // must use the exact same byte offsets as TryWritePatchFastFromMask below, or the
+        // two paths would diverge on which bit means what.
+        internal const int EntityDisabledOffset = sizeof(ulong) + sizeof(uint);
         private const int RecordHeaderSize =
             sizeof(uint) + sizeof(byte) + sizeof(byte) + sizeof(byte) + sizeof(uint);
-        private const int RecordDisabledOffset = sizeof(uint) + sizeof(byte) + sizeof(byte);
+        internal const int RecordDisabledOffset = sizeof(uint) + sizeof(byte) + sizeof(byte);
         private const int MaxMaskBytes =
             (2 * (ProtocolLimits.MaxRecordsPerEntity + 1) + 7) / 8;
         private const int EntityLayoutBytes =
@@ -434,19 +437,163 @@ namespace UniGame.StaticEcs.Network
             NetworkBufferLease candidate,
             ref SnapshotWriter writer, out uint operationCount)
         {
-            // NCORE-13 replaced the delta wire format (compact varint/bitmask
-            // encoding below) but did not port SnapshotDeltaBurstBackend to it:
-            // that backend still only knows how to emit the pre-NCORE-13 layout
-            // (full entity/record headers, no skip/mask compaction). Calling it
-            // here would silently produce bytes the new TryReconstructCore cannot
-            // parse. Route every indexed encode through the portable path until a
-            // follow-up ports the Burst backend; see the NCORE-13 report for the
-            // CPU measurement (encode is ~3.5x/tick, dominated by bytes not CPU)
-            // that justifies deferring the port instead of blocking this change on
-            // it. SnapshotDeltaBurstBackend itself is left compiling and unused.
+            // NCORE-13b: SnapshotDeltaBurstBackend.TryPlan does the O(bytes)
+            // structural diff (entity walk, skip counts, PatchFast/PatchFull
+            // classification, changed-record masks) in Burst; the wire bytes
+            // themselves -- including every hook-aware write -- are always
+            // produced by the same managed writers the portable path below uses,
+            // because NetworkComponentDeltaHooks lookups and
+            // INetworkComponentDelta calls are managed interface dispatch Burst
+            // cannot perform. `candidate` is not touched here: the Burst call
+            // only consumes pool-owned layout arrays, never candidate's bytes.
             _ = candidate;
+            var startLength = writer.Length;
+            if (TryEncodeCoreIndexedBurst(baseline, baselineLayout, target,
+                    targetLayout, hooks, ref writer, out operationCount))
+                return true;
+            // A partially-failed Burst attempt may have advanced the writer's
+            // cursor; roll it back to exactly where it stood before, or a
+            // portable retry would append after garbage instead of overwriting
+            // it (TrySetLength never touches already-written bytes, only length).
+            if (!writer.TrySetLength(checked((int)startLength)))
+                return false;
             return TryEncodeCoreIndexedPortable(baseline, baselineLayout, target,
                 targetLayout, hooks, ref writer, out operationCount);
+        }
+
+        // Replays a Burst-computed structural plan into the exact same wire bytes
+        // TryEncodeCoreIndexedPortable would produce. Returns false (never
+        // partially-committing anything the caller can't discard) whenever Burst
+        // is unavailable, declines, or the plan fails any consistency check, so
+        // the caller always has a correct portable fallback.
+        private static bool TryEncodeCoreIndexedBurst(NetworkSnapshot baseline,
+            SnapshotLayoutView baselineLayout, NetworkSnapshot target,
+            SnapshotLayoutView targetLayout, NetworkComponentDeltaHooks hooks,
+            ref SnapshotWriter writer, out uint operationCount)
+        {
+            operationCount = 0;
+            // Cheap pre-check (a cached Volatile.Read after the first call) so an
+            // environment where Burst never compiles -- no Unity Burst package,
+            // or portable dotnet test runs, where SnapshotDeltaBurstBackend's
+            // entire Unity-only implementation is compiled out -- never pays for
+            // renting the plan/mask buffers below just to have TryPlan reject
+            // them immediately. Without this, every encode call became two
+            // ArrayPool rents even when Burst could never run, which is what
+            // broke SnapshotLayoutIndex_SteadyStateEncodeAllocatesNoManagedMemory
+            // and WarmCommandAndSnapshotCoreAllocatesNoManagedMemoryPerTick.
+            if (!SnapshotDeltaBurstBackend.IsAvailable)
+                return false;
+            var planCapacity = baselineLayout.EntityCount + targetLayout.EntityCount;
+            if (planCapacity <= 0)
+                return false;
+
+            const int maskStride = MaxMaskBytes;
+            var maskCapacity = checked(planCapacity * maskStride);
+            var planPool = ArrayPool<SnapshotDeltaPlanOp>.Shared;
+            var maskPool = ArrayPool<byte>.Shared;
+            var planBuffer = planPool.Rent(planCapacity);
+            var maskBuffer = maskPool.Rent(maskCapacity);
+            try
+            {
+                var planResult = SnapshotDeltaBurstBackend.TryPlan(baseline,
+                    baselineLayout, target, targetLayout, planBuffer,
+                    planCapacity, maskBuffer, maskCapacity, maskStride,
+                    out var opCount);
+                if (planResult != SnapshotDeltaBurstResult.Success ||
+                    opCount < 0 || opCount > planCapacity)
+                    return false;
+
+                if (!writer.TryWriteByte(DeltaFormatVersion) ||
+                    !writer.TryWriteUint(checked((uint)target.EntityCount)) ||
+                    !writer.TryWriteUint(checked((uint)target.RecordCount)))
+                    return false;
+                var countOffset = writer.Length;
+                if (!writer.TryWriteUint(0))
+                    return false;
+
+                var baselineBytes = baseline.Bytes.Span;
+                var targetBytes = target.Bytes.Span;
+                var baselineEntities = baselineLayout.Entities;
+                var targetEntities = targetLayout.Entities;
+                uint operations = 0;
+                for (var index = 0; index < opCount; index++)
+                {
+                    var op = planBuffer[index];
+                    if (!TryWriteVarUInt(ref writer, op.Skip))
+                        return false;
+                    switch ((EntityOperation)op.Opcode)
+                    {
+                        case EntityOperation.Remove:
+                            if ((uint)op.BaselineIndex >=
+                                    (uint)baselineLayout.EntityCount ||
+                                !writer.TryWriteByte((byte)EntityOperation.Remove))
+                                return false;
+                            break;
+                        case EntityOperation.Add:
+                        {
+                            if ((uint)op.TargetIndex >=
+                                    (uint)targetLayout.EntityCount)
+                                return false;
+                            var added = targetEntities[op.TargetIndex];
+                            if (!writer.TryWriteByte((byte)EntityOperation.Add) ||
+                                !writer.TryWrite(targetBytes.Slice(
+                                    added.RawOffset, added.RawLength)))
+                                return false;
+                            break;
+                        }
+                        case EntityOperation.PatchFast:
+                        {
+                            if ((uint)op.BaselineIndex >=
+                                    (uint)baselineLayout.EntityCount ||
+                                (uint)op.TargetIndex >=
+                                    (uint)targetLayout.EntityCount ||
+                                op.MaskOffset < 0 || op.MaskLength < 0 ||
+                                op.MaskOffset > maskCapacity - op.MaskLength)
+                                return false;
+                            var baselineEntity = baselineEntities[op.BaselineIndex];
+                            var targetEntity = targetEntities[op.TargetIndex];
+                            if (!writer.TryWriteByte(
+                                    (byte)EntityOperation.PatchFast) ||
+                                !TryWritePatchFastFromBurstMask(baselineBytes,
+                                    baselineLayout, in baselineEntity,
+                                    targetBytes, targetLayout, in targetEntity,
+                                    hooks, maskBuffer, op.MaskOffset,
+                                    op.MaskLength, ref writer))
+                                return false;
+                            break;
+                        }
+                        case EntityOperation.PatchFull:
+                        {
+                            if ((uint)op.BaselineIndex >=
+                                    (uint)baselineLayout.EntityCount ||
+                                (uint)op.TargetIndex >=
+                                    (uint)targetLayout.EntityCount)
+                                return false;
+                            var baselineEntity = baselineEntities[op.BaselineIndex];
+                            var targetEntity = targetEntities[op.TargetIndex];
+                            if (!writer.TryWriteByte(
+                                    (byte)EntityOperation.PatchFull) ||
+                                !TryWritePatchFullIndexed(baselineBytes,
+                                    baselineLayout, in baselineEntity,
+                                    targetBytes, targetLayout, in targetEntity,
+                                    ref writer))
+                                return false;
+                            break;
+                        }
+                        default:
+                            return false;
+                    }
+                    operations++;
+                }
+
+                operationCount = operations;
+                return writer.TryWriteUintAt(countOffset, operations);
+            }
+            finally
+            {
+                planPool.Return(planBuffer);
+                maskPool.Return(maskBuffer);
+            }
         }
 
         private static bool TryEncodeCoreIndexedPortable(NetworkSnapshot baseline,
@@ -629,15 +776,69 @@ namespace UniGame.StaticEcs.Network
                     SetBit(mask, bit + 1);
             }
 
-            // A stackalloc'd mask cannot be passed to writer.TryWrite(ReadOnlySpan)
-            // here: `writer` is itself a ref struct received by ref, so its
-            // escape scope reaches the caller, wider than this stack buffer's.
-            // Byte-at-a-time writes sidestep that (each argument is a plain
-            // byte, not a span) without heap-allocating the mask.
+            // The mask cannot be handed to a shared "write from mask" helper
+            // that also takes `ref writer` here: `mask` is a stackalloc'd span
+            // (safe-to-escape = this method), while `writer`'s ref parameter
+            // gives it a wider escape scope, and the compiler rejects passing
+            // both into one call (CS8352/CS8347) regardless of what the callee
+            // does with them. TryEncodeCoreIndexedBurst's mask (backed by a
+            // pooled heap array, not stackalloc) has no such restriction and
+            // uses the array-based TryWritePatchFastFromBurstMask below instead;
+            // the two entry points intentionally still share
+            // TryWritePatchFastRecordPayload, the part that actually matters for
+            // byte-identical output (the hook lookup/call).
             for (var i = 0; i < maskBytes; i++)
                 if (!writer.TryWriteByte(mask[i]))
                     return false;
 
+            for (var i = 0; i < count; i++)
+            {
+                if (!GetBit(mask, 2 * (i + 1)))
+                    continue;
+                var b = baselineRecords[bStart + i];
+                var t = targetRecords[tStart + i];
+                var payloadLength = t.RawLength - RecordHeaderSize;
+                var payload = targetBytes.Slice(t.RawOffset + RecordHeaderSize,
+                    payloadLength);
+                if (!TryWritePatchFastRecordPayload(baselineBytes, b, payload,
+                        hooks, ref writer))
+                    return false;
+            }
+            return true;
+        }
+
+        // Burst-path counterpart of TryWritePatchFastIndexed above: writes one
+        // PatchFast entity's mask bytes and changed-record payloads from a mask
+        // SnapshotDeltaBurstBackend.TryPlan already computed into a pooled heap
+        // array (never a stackalloc span -- see the ref-escape note above for why
+        // that distinction matters here). Takes the mask as a plain array +
+        // offset/length rather than a Span so the call site in
+        // TryEncodeCoreIndexedBurst never needs to construct a span that would
+        // face the same restriction. Must produce byte-identical output to
+        // TryWritePatchFastIndexed for the same (baseline, target) pair, which is
+        // why both call the exact same TryWritePatchFastRecordPayload for every
+        // changed record's hook lookup/write.
+        private static bool TryWritePatchFastFromBurstMask(
+            ReadOnlySpan<byte> baselineBytes, SnapshotLayoutView baselineLayout,
+            in SnapshotEntityLayout baselineEntity, ReadOnlySpan<byte> targetBytes,
+            SnapshotLayoutView targetLayout, in SnapshotEntityLayout targetEntity,
+            NetworkComponentDeltaHooks hooks, byte[] maskBuffer, int maskOffset,
+            int maskLength, ref SnapshotWriter writer)
+        {
+            var count = baselineEntity.RecordCount;
+            if (maskLength != MaskByteCount(count) || maskOffset < 0 ||
+                maskLength < 0 || maskOffset > maskBuffer.Length - maskLength)
+                return false;
+            var mask = new ReadOnlySpan<byte>(maskBuffer, maskOffset, maskLength);
+
+            for (var i = 0; i < maskLength; i++)
+                if (!writer.TryWriteByte(mask[i]))
+                    return false;
+
+            var baselineRecords = baselineLayout.Records;
+            var targetRecords = targetLayout.Records;
+            var bStart = baselineEntity.RecordStart;
+            var tStart = targetEntity.RecordStart;
             for (var i = 0; i < count; i++)
             {
                 if (!GetBit(mask, 2 * (i + 1)))
@@ -1219,7 +1420,9 @@ namespace UniGame.StaticEcs.Network
             return true;
         }
 
-        private static int MaskByteCount(int recordCount) =>
+        // Internal: also used by SnapshotDeltaBurstBackend.TryPlan to size the mask
+        // buffer it fills, and by TryEncodeCoreIndexedBurst to size/validate it.
+        internal static int MaskByteCount(int recordCount) =>
             (2 * (recordCount + 1) + 7) / 8;
 
         private static bool GetBit(ReadOnlySpan<byte> mask, int bitIndex) =>

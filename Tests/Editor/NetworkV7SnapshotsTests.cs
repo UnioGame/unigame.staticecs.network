@@ -272,119 +272,19 @@ namespace UniGame.StaticEcs.Network.Tests
         [Test]
         public void SnapshotDeltaCodec_BurstBackendIsCompiled()
         {
-            Assert.That(SnapshotDeltaBurstBackend.IsAvailableForTests, Is.True);
+            Assert.That(SnapshotDeltaBurstBackend.IsAvailable, Is.True);
         }
 
 #endif
-#if UNITY_2022_2_OR_NEWER
-        // NCORE-13 replaced the delta wire format (compact varint/bitmask
-        // patches) but did not port SnapshotDeltaBurstBackend to it: the
-        // backend still only emits the pre-NCORE-13 layout, and
-        // TryEncodeCoreIndexed no longer calls it (see the comment there).
-        // With the call site removed, ForcePortableForTests=false no longer
-        // routes through Burst at all, so this test's differential/speedup
-        // assertions no longer exercise anything real. Ignored pending a
-        // Burst port of the new format; see the NCORE-13 report for the CPU
-        // measurement (encode is ~3.5x/tick, dominated by bytes not CPU) that
-        // justifies deferring the port instead of blocking the format change
-        // on it.
-        [Test]
-        [Ignore("NCORE-13: Burst backend not yet ported to the compact delta format; TryEncodeCoreIndexed is portable-only until that follow-up.")]
-        public void SnapshotDeltaCodec_BurstMatchesPortableAndReportsBatchTiming()
-        {
-            CreateReplicationWorld<AuthorityWorld>(true);
-            var pool = new NetworkBufferPool(4L << 20);
-            var replicator = new NetworkReplicator<AuthorityWorld>(
-                Schema<AuthorityWorld>(true), static (_, _) => true,
-                new ScopeId(19), bufferPool: pool);
-            var snapshots = new List<NetworkSnapshot>();
-            var actor = World<AuthorityWorld>.NewEntity<TestEntity>();
-            for (var ballastIndex = 0; ballastIndex < 256; ballastIndex++)
-            {
-                var ballast = World<AuthorityWorld>.NewEntity<TestEntity>();
-                ballast.Set(new TestComponent { Value = 1000 + ballastIndex });
-            }
-            try
-            {
-                for (var tick = 0; tick <= 31; tick++)
-                {
-                    actor.Set(new TestComponent { Value = tick * 7 + 3 });
-                    Assert.That(replicator.Capture((uint)(tick + 1), out var snapshot),
-                        Is.EqualTo(SnapshotCaptureResult.Success));
-                    snapshots.Add(snapshot);
-                }
-
-                var expected = new byte[31][];
-                SnapshotDeltaBurstBackend.ForcePortableForTests = true;
-                for (var index = 0; index < 31; index++)
-                {
-                    Assert.That(SnapshotDeltaCodec.TryEncode(pool, snapshots[index],
-                        snapshots[index + 1], out var delta), Is.True);
-                    expected[index] = delta.Span.ToArray();
-                    delta.Dispose();
-                }
-
-                SnapshotDeltaBurstBackend.ForcePortableForTests = false;
-                for (var index = 0; index < 31; index++)
-                {
-                    Assert.That(SnapshotDeltaCodec.TryEncode(pool, snapshots[index],
-                        snapshots[index + 1], out var delta), Is.True);
-                    using (delta)
-                    {
-                        Assert.That(delta.Span.SequenceEqual(expected[index]), Is.True,
-                            $"Burst delta differs at pair {index}");
-                    }
-                }
-
-                long Measure(bool burst)
-                {
-                    SnapshotDeltaBurstBackend.ForcePortableForTests = !burst;
-                    var start = Stopwatch.GetTimestamp();
-                    for (var index = 0; index < 31; index++)
-                    {
-                        Assert.That(SnapshotDeltaCodec.TryEncode(pool, snapshots[index],
-                            snapshots[index + 1], out var delta), Is.True);
-                        delta.Dispose();
-                    }
-                    return Stopwatch.GetTimestamp() - start;
-                }
-
-                var portableSamples = new long[5];
-                var burstSamples = new long[5];
-                for (var warmup = 0; warmup < 2; warmup++)
-                {
-                    Measure(false);
-                    Measure(true);
-                }
-                for (var sample = 0; sample < portableSamples.Length; sample++)
-                {
-                    portableSamples[sample] = Measure(false);
-                    burstSamples[sample] = Measure(true);
-                }
-                Array.Sort(portableSamples);
-                Array.Sort(burstSamples);
-                var portableMedian = portableSamples[portableSamples.Length / 2];
-                var burstMedian = burstSamples[burstSamples.Length / 2];
-                var portableMs = portableMedian * 1000d / Stopwatch.Frequency;
-                var burstMs = burstMedian * 1000d / Stopwatch.Frequency;
-                TestContext.Progress.WriteLine(
-                    $"SnapshotDeltaCodec 31-pair median portable={portableMs:F3}ms burst={burstMs:F3}ms speedup={(portableMs - burstMs) / portableMs:P1}");
-                Assert.That(burstMedian, Is.LessThan(portableMedian * 0.8),
-                    $"Burst median must improve by at least 20% (portable={portableMs:F3}ms, burst={burstMs:F3}ms)");
-            }
-            finally
-            {
-                SnapshotDeltaBurstBackend.ForcePortableForTests = false;
-                foreach (var snapshot in snapshots)
-                    snapshot.Dispose();
-                replicator.Dispose();
-                Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
-                pool.Dispose();
-                World<AuthorityWorld>.Destroy();
-            }
-        }
-
-#endif
+        // NCORE-13b superseded the differential/speedup test that used to live here
+        // (SnapshotDeltaCodec_BurstMatchesPortableAndReportsBatchTiming, a 256-ballast +
+        // 1-changing-entity scenario with no hooks/adds/removes/PatchFull): once
+        // SnapshotDeltaBurstBackend was ported to the compact delta format, that scenario
+        // was too narrow to trust as the port's correctness gate. See
+        // NetworkSnapshotDeltaCompactionTests.SnapshotDeltaCodec_BurstMatchesPortableWithHooksAddsRemovesAndDisabledToggles
+        // (randomized adds/removes/record-set changes/disabled toggles plus hook-tagged
+        // "mover" entities) and .SnapshotDeltaCodec_BurstVsPortableRealisticMixTiming (the
+        // Unity-only timing test for 200/300/500 entities at 30-60% moving) instead.
         [Test]
         public void SnapshotDeltaCodec_ReconstructsNoOpAndCanonicalChanges()
         {

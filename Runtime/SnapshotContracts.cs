@@ -80,6 +80,34 @@ namespace UniGame.StaticEcs.Network
         internal int RawLength;
     }
 
+    /// <summary>
+    /// One structural decision from <see cref="SnapshotDeltaBurstBackend.TryPlan"/>: the
+    /// Burst-compiled entity walk (skip/Remove/Add/PatchFast/PatchFull classification and,
+    /// for PatchFast, the changed-record mask) that <c>SnapshotDeltaCodec</c> replays through
+    /// its existing, hook-aware managed writers to produce the exact bytes the portable path
+    /// would. Burst never writes wire bytes itself: value-delta hooks
+    /// (<see cref="INetworkComponentDelta"/>) are managed interface calls it cannot make, so
+    /// every variable-length write (including hookless raw payload copies, to keep a single
+    /// write path) stays in managed code; Burst only does the O(bytes) comparison work needed
+    /// to decide what changed.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    internal struct SnapshotDeltaPlanOp
+    {
+        /// <summary>Matches SnapshotDeltaCodec's private EntityOperation byte values (1..4).</summary>
+        internal byte Opcode;
+        /// <summary>Baseline entities to copy unchanged (skip) before this operation.</summary>
+        internal uint Skip;
+        /// <summary>Index into the baseline layout's entities; -1 for Add.</summary>
+        internal int BaselineIndex;
+        /// <summary>Index into the target layout's entities; -1 for Remove.</summary>
+        internal int TargetIndex;
+        /// <summary>PatchFast only: byte offset of the precomputed mask in the mask buffer.</summary>
+        internal int MaskOffset;
+        /// <summary>PatchFast only: precomputed mask byte length.</summary>
+        internal int MaskLength;
+    }
+
     /// <summary>Rents immutable primitive layout arrays for the snapshot layout index.</summary>
     internal interface ISnapshotLayoutPool
     {

@@ -2,6 +2,7 @@ namespace UniGame.StaticEcs.Network.Tests
 {
     using System;
     using System.Collections.Generic;
+    using System.Diagnostics;
     using System.IO;
     using System.Linq;
     using FFS.Libraries.StaticEcs;
@@ -473,6 +474,237 @@ namespace UniGame.StaticEcs.Network.Tests
             }
         }
 
+#if UNITY_2022_2_OR_NEWER
+        // NCORE-13b: differential correctness test for the Burst port of the indexed
+        // structural diff (SnapshotDeltaBurstBackend.TryPlan). Burst only classifies
+        // entities (skip/Remove/Add/PatchFast/PatchFull) and computes PatchFast masks;
+        // every wire byte -- including every value-delta hook payload -- is still
+        // written by the exact managed code the portable path uses (see
+        // SnapshotDeltaCodec.TryEncodeCoreIndexedBurst / TryWritePatchFastFromMask), so a
+        // Burst bug could only show up as a *structural* mismatch (wrong skip/opcode/mask),
+        // which this test targets directly: it sweeps randomized adds/removes/record-set
+        // changes/disabled toggles (via the existing RandomEntities/Mutate fixture) AND a
+        // set of "mover" entities carrying a hook-tagged record (reusing
+        // NetworkV7Tests.DeltaTestComponent) whose payload changes almost every tick -- the
+        // realistic case a moving player/NPC's Position record exercises, and the one most
+        // likely to erode any Burst win since the hook call itself always stays managed.
+        [Test]
+        public void SnapshotDeltaCodec_BurstMatchesPortableWithHooksAddsRemovesAndDisabledToggles()
+        {
+            const uint hookTypeId = 900;
+            var hooks = new NetworkComponentDeltaHooks(new[] { hookTypeId },
+                new INetworkComponentDelta[] { new NetworkV7Tests.DeltaTestComponent() });
+
+            var bufferPool = new NetworkBufferPool(16L << 20);
+            var snapshotPool = new NetworkSnapshotPool(8);
+            var compared = 0;
+            try
+            {
+                var rng = new Random(130926);
+                var baselineEntities = RandomEntities(rng, 40);
+                var moverIds = new ulong[5];
+                for (var i = 0; i < moverIds.Length; i++)
+                {
+                    moverIds[i] = new EntityGID(9_000_000u + (uint)i, 1, 0).Raw;
+                    baselineEntities = InsertSorted(baselineEntities,
+                        new EntityDesc(moverIds[i], 1, false,
+                            new[] { HookRecord(hookTypeId, i * 17, false) }));
+                }
+
+                for (var iteration = 0; iteration < 60; iteration++)
+                {
+                    var targetEntities = Mutate(rng, baselineEntities,
+                        addCount: rng.Next(0, 4), removeCount: rng.Next(0, 4),
+                        patchCount: rng.Next(0, 8));
+                    foreach (var moverId in moverIds)
+                        targetEntities = MutateMover(rng, targetEntities, moverId,
+                            hookTypeId);
+
+                    var baseline = MakeSnapshot(snapshotPool, bufferPool, 1,
+                        baselineEntities);
+                    var target = MakeSnapshot(snapshotPool, bufferPool, 2,
+                        targetEntities);
+                    try
+                    {
+                        SnapshotDeltaBurstBackend.ForcePortableForTests = true;
+                        var portableOk = SnapshotDeltaCodec.TryEncode(bufferPool,
+                            baseline, target, out var portableDelta, hooks);
+
+                        SnapshotDeltaBurstBackend.ForcePortableForTests = false;
+                        var burstOk = SnapshotDeltaCodec.TryEncode(bufferPool,
+                            baseline, target, out var burstDelta, hooks);
+
+                        Assert.That(burstOk, Is.EqualTo(portableOk),
+                            $"iteration {iteration}: portable/Burst disagreed on " +
+                            "whether a delta was worthwhile");
+                        if (portableOk)
+                        {
+                            using (portableDelta)
+                            using (burstDelta)
+                            {
+                                Assert.That(
+                                    burstDelta.Span.SequenceEqual(portableDelta.Span),
+                                    Is.True,
+                                    $"iteration {iteration}: Burst delta differs " +
+                                    "from portable");
+                                AssertRoundTripsWithHooks(bufferPool, baseline,
+                                    target, burstDelta, hooks,
+                                    $"iteration {iteration}");
+                            }
+                            compared++;
+                        }
+                    }
+                    finally
+                    {
+                        baseline.Dispose();
+                        target.Dispose();
+                    }
+                    baselineEntities = targetEntities;
+                }
+            }
+            finally
+            {
+                SnapshotDeltaBurstBackend.ForcePortableForTests = false;
+                Assert.That(bufferPool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+                bufferPool.Dispose();
+            }
+
+            TestContext.Progress.WriteLine(
+                $"NCORE-13b Burst/portable differential: {compared} pairs " +
+                "compared byte-identical");
+            Assert.That(compared, Is.GreaterThan(30),
+                "the sweep should exercise the delta path most iterations, not " +
+                "only fall back to keyframe");
+        }
+
+        // NCORE-13b: prepared for the manager to run inside Unity. This dotnet-test
+        // environment cannot compile or execute real Burst code -- SnapshotDeltaBurstBackend's
+        // Unity-only implementation (and the FunctionPointer/BurstCompiler types it uses) is
+        // entirely `#if UNITY_2022_2_OR_NEWER`, so outside Unity SnapshotDeltaBurstBackend.TryPlan
+        // always returns Unavailable and both arms of Measure() below exercise the same
+        // portable path -- the numbers below are only meaningful when this runs in a Unity
+        // EditMode test pass. Builds realistic entity counts (200/300/500) with a moving
+        // fraction (30-60%) where each mover carries one hook-tagged record that changes
+        // (almost) every tick -- the case that forces even the Burst-assisted path to make a
+        // managed hook call per changed record, which the port's design notes flag as the
+        // scenario most likely to erode Burst's pre-NCORE-13 ~20% win. Deliberately asserts
+        // no speed threshold: only logs medians via TestContext.Progress, since asserting an
+        // unverified number would block unrelated work on a result nobody has measured yet
+        // (see the NCORE-13b report for how to read the logged output).
+        [Test]
+        public void SnapshotDeltaCodec_BurstVsPortableRealisticMixTiming()
+        {
+            const uint hookTypeId = 901;
+            var hooks = new NetworkComponentDeltaHooks(new[] { hookTypeId },
+                new INetworkComponentDelta[] { new NetworkV7Tests.DeltaTestComponent() });
+
+            foreach (var (entityCount, movingFraction) in new[]
+                     {
+                         (200, 0.3), (300, 0.45), (500, 0.6),
+                     })
+            {
+                var bufferPool = new NetworkBufferPool(32L << 20);
+                var snapshotPool = new NetworkSnapshotPool(8);
+                var pairs = new List<(NetworkSnapshot baseline, NetworkSnapshot target)>();
+                try
+                {
+                    var rng = new Random(unchecked(entityCount * 7919));
+                    var entities = RandomEntities(rng, entityCount);
+                    var moverCount = (int)(entityCount * movingFraction);
+                    for (var i = 0; i < moverCount && i < entities.Length; i++)
+                    {
+                        var e = entities[i];
+                        var records = new List<RecordDesc>(e.Records)
+                        {
+                            HookRecord(hookTypeId, i, false),
+                        };
+                        records.Sort((a, b) => CompareRecordForTests(a, b));
+                        entities[i] = new EntityDesc(e.Gid, e.Kind, e.Disabled,
+                            records.ToArray());
+                    }
+
+                    var current = entities;
+                    for (var tick = 0; tick < 40; tick++)
+                    {
+                        var next = (EntityDesc[])current.Clone();
+                        for (var i = 0; i < moverCount && i < next.Length; i++)
+                        {
+                            var e = next[i];
+                            var recordIndex = Array.FindIndex(e.Records,
+                                r => r.TypeId == hookTypeId);
+                            if (recordIndex < 0)
+                                continue;
+                            var value = ReadLeInt32(e.Records[recordIndex].Payload) +
+                                        rng.Next(-5, 6);
+                            var records = (RecordDesc[])e.Records.Clone();
+                            records[recordIndex] = HookRecord(hookTypeId, value,
+                                false);
+                            next[i] = new EntityDesc(e.Gid, e.Kind, e.Disabled,
+                                records);
+                        }
+                        var baseline = MakeSnapshot(snapshotPool, bufferPool,
+                            (uint)(tick + 1), current);
+                        var target = MakeSnapshot(snapshotPool, bufferPool,
+                            (uint)(tick + 2), next);
+                        pairs.Add((baseline, target));
+                        current = next;
+                    }
+
+                    long Measure(bool burst)
+                    {
+                        SnapshotDeltaBurstBackend.ForcePortableForTests = !burst;
+                        var start = Stopwatch.GetTimestamp();
+                        foreach (var pair in pairs)
+                        {
+                            if (SnapshotDeltaCodec.TryEncode(bufferPool,
+                                    pair.baseline, pair.target, out var delta, hooks))
+                                delta.Dispose();
+                        }
+                        return Stopwatch.GetTimestamp() - start;
+                    }
+
+                    for (var warmup = 0; warmup < 2; warmup++)
+                    {
+                        Measure(false);
+                        Measure(true);
+                    }
+                    var portableSamples = new long[5];
+                    var burstSamples = new long[5];
+                    for (var sample = 0; sample < portableSamples.Length; sample++)
+                    {
+                        portableSamples[sample] = Measure(false);
+                        burstSamples[sample] = Measure(true);
+                    }
+                    Array.Sort(portableSamples);
+                    Array.Sort(burstSamples);
+                    var portableMs = portableSamples[portableSamples.Length / 2] *
+                        1000d / Stopwatch.Frequency;
+                    var burstMs = burstSamples[burstSamples.Length / 2] *
+                        1000d / Stopwatch.Frequency;
+                    TestContext.Progress.WriteLine(
+                        $"NCORE-13b {entityCount} entities, {movingFraction:P0} " +
+                        $"moving, {pairs.Count} ticks: portable={portableMs:F3}ms " +
+                        $"burst={burstMs:F3}ms " +
+                        $"speedup={(portableMs - burstMs) / portableMs:P1} " +
+                        $"burstAvailable={SnapshotDeltaBurstBackend.IsAvailable}");
+                }
+                finally
+                {
+                    SnapshotDeltaBurstBackend.ForcePortableForTests = false;
+                    foreach (var pair in pairs)
+                    {
+                        pair.baseline.Dispose();
+                        pair.target.Dispose();
+                    }
+                    Assert.That(bufferPool.CaptureDiagnostics().OutstandingLeases,
+                        Is.Zero);
+                    bufferPool.Dispose();
+                }
+            }
+        }
+#endif
+
         // --- Fixture builders -------------------------------------------------
 
         private static EntityDesc[] InsertSorted(EntityDesc[] entities,
@@ -503,6 +735,20 @@ namespace UniGame.StaticEcs.Network.Tests
             return new RecordDesc(typeId, (byte)NetworkSchemaKind.Multi, 0,
                 false, payload);
         }
+
+        // A hook-tagged record (NCORE-13b Burst differential/perf tests): a plain
+        // 4-byte little-endian int payload, matching what
+        // NetworkV7Tests.DeltaTestComponent's INetworkComponentDelta hook expects.
+        private static RecordDesc HookRecord(uint typeId, int value, bool disabled)
+        {
+            var payload = new byte[4];
+            WriteInt(payload, 0, value);
+            return new RecordDesc(typeId, (byte)NetworkSchemaKind.Component, 0,
+                disabled, payload);
+        }
+
+        private static int ReadLeInt32(byte[] bytes) =>
+            bytes[0] | bytes[1] << 8 | bytes[2] << 16 | bytes[3] << 24;
 
         private static void WriteFloat(byte[] destination, int offset,
             float value)
@@ -709,11 +955,71 @@ namespace UniGame.StaticEcs.Network.Tests
                 records.ToArray());
         }
 
+        // Advances one hook-tagged "mover" entity (by GID) independently of the
+        // general Mutate() sweep above, which only ever generates plain
+        // (non-hook-tagged) records: this is what guarantees every iteration of the
+        // NCORE-13b Burst differential test actually exercises
+        // NetworkComponentDeltaHooks/INetworkComponentDelta, both its compact
+        // isDelta=1 path (small steps) and its raw isDelta=0 fallback (large jumps).
+        // No-ops if Mutate() already removed this entity this iteration.
+        private static EntityDesc[] MutateMover(Random rng, EntityDesc[] entities,
+            ulong gid, uint hookTypeId)
+        {
+            var index = Array.FindIndex(entities, e => e.Gid == gid);
+            if (index < 0)
+                return entities;
+            var entity = entities[index];
+            var records = new List<RecordDesc>(entity.Records);
+            var recordIndex = records.FindIndex(r => r.TypeId == hookTypeId);
+            var disabled = rng.Next(6) == 0 ? !entity.Disabled : entity.Disabled;
+            if (recordIndex < 0)
+            {
+                // The hook record is currently absent (dropped below on a previous
+                // iteration, or by Mutate()'s own record-remove case): usually put
+                // it back so later iterations keep exercising the hook path.
+                if (rng.Next(3) != 0)
+                {
+                    records.Add(HookRecord(hookTypeId, rng.Next(-2000, 2000),
+                        rng.Next(4) == 0));
+                    records.Sort((a, b) => CompareRecordForTests(a, b));
+                }
+            }
+            else if (rng.Next(20) == 0)
+            {
+                // Rarely drop the hook record entirely: forces PatchFull for this
+                // entity (its record set no longer matches the baseline's).
+                records.RemoveAt(recordIndex);
+            }
+            else
+            {
+                var current = ReadLeInt32(records[recordIndex].Payload);
+                // Mostly small steps (fit the hook's compact sbyte-delta path);
+                // sometimes a large jump (forces its raw isDelta=0 fallback).
+                var step = rng.Next(10) == 0
+                    ? rng.Next(-100_000, 100_000)
+                    : rng.Next(-5, 6);
+                var next = unchecked(current + step);
+                records[recordIndex] = HookRecord(hookTypeId, next,
+                    rng.Next(4) == 0);
+            }
+            var updated = (EntityDesc[])entities.Clone();
+            updated[index] = new EntityDesc(entity.Gid, entity.Kind, disabled,
+                records.ToArray());
+            return updated;
+        }
+
         // --- Shared round-trip assertion ---------------------------------------
 
         private static void AssertRoundTrips(NetworkBufferPool bufferPool,
             NetworkSnapshot baseline, NetworkSnapshot target,
-            NetworkBufferLease delta, string context = null)
+            NetworkBufferLease delta, string context = null) =>
+            AssertRoundTripsWithHooks(bufferPool, baseline, target, delta,
+                NetworkComponentDeltaHooks.Empty, context);
+
+        private static void AssertRoundTripsWithHooks(NetworkBufferPool bufferPool,
+            NetworkSnapshot baseline, NetworkSnapshot target,
+            NetworkBufferLease delta, NetworkComponentDeltaHooks hooks,
+            string context = null)
         {
             var header = new SnapshotChunkHeader
             {
@@ -727,7 +1033,7 @@ namespace UniGame.StaticEcs.Network.Tests
             };
             var ok = SnapshotDeltaCodec.TryReconstruct(bufferPool, baseline,
                 delta.Span, in header, Fingerprint, Scope, out var canonical,
-                out var entityCount, out var recordCount);
+                out var entityCount, out var recordCount, hooks);
             Assert.That(ok, Is.True,
                 (context ?? "reconstruct") + ": TryReconstruct failed");
             using (canonical)

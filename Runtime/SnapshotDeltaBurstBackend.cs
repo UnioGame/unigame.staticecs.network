@@ -1,7 +1,6 @@
 namespace UniGame.StaticEcs.Network
 {
     using System;
-    using System.Runtime.InteropServices;
     using System.Threading;
 
 #if UNITY_2022_2_OR_NEWER
@@ -15,63 +14,75 @@ namespace UniGame.StaticEcs.Network
         Failed,
     }
 
-    /// <summary>Runs the validated indexed delta merge through a synchronous Burst pointer.</summary>
+    /// <summary>
+    /// Runs the structural half of the indexed delta merge (entity walk, skip counts,
+    /// PatchFast/PatchFull classification, changed-record masks) through a synchronous
+    /// Burst pointer. It never writes wire bytes: value-delta hooks
+    /// (<see cref="INetworkComponentDelta"/>) are managed interface calls Burst cannot make,
+    /// so <see cref="SnapshotDeltaCodec"/> always does the actual variable-length writing
+    /// (including hookless raw-payload copies, to keep one write path), replaying the plan
+    /// this backend produced. See <c>TryPlan</c>/<c>Plan</c> below for the split rationale.
+    /// </summary>
     #if UNITY_2022_2_OR_NEWER
     [BurstCompile]
     #endif
     internal static unsafe class SnapshotDeltaBurstBackend
     {
 #if UNITY_2022_2_OR_NEWER
-        private const int EntityLayoutStride = 22;
-        private const int RecordLayoutStride = 13;
-        private const int EntityHeaderSize = 15;
-        private const byte EntityAdd = 1;
-        private const byte EntityRemove = 2;
-        private const byte EntityPatch = 3;
-        private const byte RecordAdd = 1;
-        private const byte RecordRemove = 2;
-        private const byte RecordReplace = 3;
+        private const byte PlanRemove = 1;
+        private const byte PlanAdd = 2;
+        private const byte PlanPatchFast = 3;
+        private const byte PlanPatchFull = 4;
 
-        public delegate int EncodeFunction(
+        public delegate int PlanFunction(
             byte* baselineBytes, int baselineLength,
             SnapshotEntityLayout* baselineEntities, int baselineEntityCount,
             SnapshotRecordLayout* baselineRecords,
             byte* targetBytes, int targetLength,
             SnapshotEntityLayout* targetEntities, int targetEntityCount,
             SnapshotRecordLayout* targetRecords,
-            byte* destination, int destinationCapacity,
-            int targetEntityCountValue, int targetRecordCountValue,
-            int* writtenLength, uint* operationCount);
+            SnapshotDeltaPlanOp* plan, int planCapacity,
+            byte* maskBuffer, int maskBufferCapacity, int maskStride,
+            int* opCount);
 
         public delegate int ProbeFunction();
 
         private static readonly object Sync = new object();
-        private static FunctionPointer<EncodeFunction> _encode;
+        private static FunctionPointer<PlanFunction> _plan;
         private static int _state;
         private static bool _probeFallback;
 
         internal static bool ForcePortableForTests;
 
-        internal static SnapshotDeltaBurstResult TryEncode(
+        /// <summary>
+        /// Fills <paramref name="planBuffer"/>/<paramref name="maskBuffer"/> with the
+        /// structural diff between <paramref name="baseline"/> and <paramref name="target"/>.
+        /// The caller (SnapshotDeltaCodec.TryEncodeCoreIndexedBurst) owns both arrays (rented
+        /// from ArrayPool) and replays the plan into wire bytes; this method never touches
+        /// hooks, wire opcodes' variable-length payloads, or the output buffer.
+        /// </summary>
+        internal static SnapshotDeltaBurstResult TryPlan(
             NetworkSnapshot baseline, SnapshotLayoutView baselineLayout,
             NetworkSnapshot target, SnapshotLayoutView targetLayout,
-            NetworkBufferLease candidate, out int writtenLength,
-            out uint operationCount)
+            SnapshotDeltaPlanOp[] planBuffer, int planCapacity,
+            byte[] maskBuffer, int maskBufferCapacity, int maskStride,
+            out int opCount)
         {
-            writtenLength = 0;
-            operationCount = 0;
+            opCount = 0;
             if (ForcePortableForTests)
                 return SnapshotDeltaBurstResult.Unavailable;
             if (!EnsureBurst())
                 return SnapshotDeltaBurstResult.Unavailable;
             if (!ValidateSnapshot(baseline, baselineLayout) ||
                 !ValidateSnapshot(target, targetLayout) ||
-                !ValidateCandidate(candidate))
+                planBuffer == null || planCapacity <= 0 ||
+                planCapacity > planBuffer.Length ||
+                maskBuffer == null || maskBufferCapacity < 0 ||
+                maskBufferCapacity > maskBuffer.Length || maskStride <= 0)
                 return SnapshotDeltaBurstResult.Failed;
 
             var baselineBuffer = baseline.Buffer;
             var targetBuffer = target.Buffer;
-            var outputBuffer = candidate.Buffer;
             try
             {
                 fixed (byte* baselinePointer = baselineBuffer)
@@ -80,34 +91,32 @@ namespace UniGame.StaticEcs.Network
                 fixed (byte* targetPointer = targetBuffer)
                 fixed (SnapshotEntityLayout* targetEntities = targetLayout.Entities)
                 fixed (SnapshotRecordLayout* targetRecords = targetLayout.Records)
-                fixed (byte* outputPointer = outputBuffer)
+                fixed (SnapshotDeltaPlanOp* planPointer = planBuffer)
+                fixed (byte* maskPointer = maskBuffer)
                 {
-                    var written = 0;
-                    var operations = 0u;
-                    var result = _encode.Invoke(
+                    var ops = 0;
+                    var result = _plan.Invoke(
                         baselinePointer + baseline.Offset, baseline.ByteLength,
                         baselineEntities, baselineLayout.EntityCount, baselineRecords,
                         targetPointer + target.Offset, target.ByteLength,
                         targetEntities, targetLayout.EntityCount, targetRecords,
-                        outputPointer + candidate.Offset, candidate.Length,
-                        target.EntityCount, target.RecordCount,
-                        &written, &operations);
-                    if (result != 1 || written < 0 || written > candidate.Length)
+                        planPointer, planCapacity,
+                        maskPointer, maskBufferCapacity, maskStride,
+                        &ops);
+                    if (result != 1 || ops < 0 || ops > planCapacity)
                         return SnapshotDeltaBurstResult.Failed;
-                    writtenLength = written;
-                    operationCount = operations;
+                    opCount = ops;
                     return SnapshotDeltaBurstResult.Success;
                 }
             }
             catch
             {
-                writtenLength = 0;
-                operationCount = 0;
+                opCount = 0;
                 return SnapshotDeltaBurstResult.Failed;
             }
         }
 
-        internal static bool IsAvailableForTests
+        internal static bool IsAvailable
         {
 #if UNITY_2022_2_OR_NEWER
             get { return EnsureBurst(); }
@@ -138,7 +147,7 @@ namespace UniGame.StaticEcs.Network
                         _state = -1;
                         return false;
                     }
-                    _encode = BurstCompiler.CompileFunctionPointer<EncodeFunction>(Encode);
+                    _plan = BurstCompiler.CompileFunctionPointer<PlanFunction>(Plan);
                     _state = 1;
                     return true;
                 }
@@ -177,41 +186,31 @@ namespace UniGame.StaticEcs.Network
                    snapshot.Offset >= 0 && snapshot.Offset <= snapshot.Buffer.Length &&
                    snapshot.ByteLength <= snapshot.Buffer.Length - snapshot.Offset;
         }
-        private static bool ValidateCandidate(NetworkBufferLease candidate)
-        {
-            if (candidate == null || candidate.Length < 12 ||
-                candidate.Offset < 0 || candidate.Offset > candidate.Capacity ||
-                candidate.Length > candidate.Capacity - candidate.Offset)
-                return false;
-            _ = candidate.Buffer;
-            return true;
-        }
 
+        // Pure structural diff: classifies each baseline/target entity pair (by GID,
+        // mirroring SnapshotDeltaCodec's own merge-walk order) as an unchanged skip, a
+        // Remove, an Add, a PatchFast (record set unchanged; only payload/disabled bits
+        // differ -- mask computed here), or a PatchFull (record set itself changed --
+        // SnapshotDeltaCodec.TryWritePatchFullIndexed re-diffs and writes it, unmodified).
+        // Writes only compact plan entries and mask bytes; every entry that needs a
+        // variable-length wire write leaves that write to managed code.
         [BurstCompile]
-        private static int Encode(
+        private static int Plan(
             byte* baselineBytes, int baselineLength,
             SnapshotEntityLayout* baselineEntities, int baselineEntityCount,
             SnapshotRecordLayout* baselineRecords,
             byte* targetBytes, int targetLength,
             SnapshotEntityLayout* targetEntities, int targetEntityCount,
             SnapshotRecordLayout* targetRecords,
-            byte* destination, int destinationCapacity,
-            int targetEntityCountValue, int targetRecordCountValue,
-            int* writtenLength, uint* operationCount)
+            SnapshotDeltaPlanOp* plan, int planCapacity,
+            byte* maskBuffer, int maskBufferCapacity, int maskStride,
+            int* opCount)
         {
-            var position = 0;
-            var operations = 0u;
-            if (!WriteU32(destination, destinationCapacity, ref position,
-                    (uint)targetEntityCountValue) ||
-                !WriteU32(destination, destinationCapacity, ref position,
-                    (uint)targetRecordCountValue))
-                return 0;
-            var countPosition = position;
-            if (!WriteU32(destination, destinationCapacity, ref position, 0))
-                return 0;
-
             var baselineIndex = 0;
             var targetIndex = 0;
+            var ops = 0;
+            var pendingSkip = 0u;
+
             while (baselineIndex < baselineEntityCount ||
                    targetIndex < targetEntityCount)
             {
@@ -221,134 +220,179 @@ namespace UniGame.StaticEcs.Network
                         targetEntities[targetIndex].Gid);
                 if (comparison < 0)
                 {
-                    if (!WriteByte(destination, destinationCapacity, ref position,
-                            EntityRemove) ||
-                        !WriteU64(destination, destinationCapacity, ref position,
-                            baselineEntities[baselineIndex].Gid))
+                    if (ops >= planCapacity)
                         return 0;
-                    operations++;
+                    plan[ops] = new SnapshotDeltaPlanOp
+                    {
+                        Opcode = PlanRemove,
+                        Skip = pendingSkip,
+                        BaselineIndex = baselineIndex,
+                        TargetIndex = -1,
+                        MaskOffset = -1,
+                        MaskLength = 0,
+                    };
+                    pendingSkip = 0;
+                    ops++;
                     baselineIndex++;
                     continue;
                 }
                 if (comparison > 0)
                 {
-                    var added = targetEntities[targetIndex];
-                    if (!WriteByte(destination, destinationCapacity, ref position,
-                            EntityAdd) ||
-                        !CopyBytes(destination, destinationCapacity, ref position,
-                            targetBytes, targetLength, added.RawOffset,
-                            added.RawLength))
+                    if (ops >= planCapacity)
                         return 0;
-                    operations++;
+                    plan[ops] = new SnapshotDeltaPlanOp
+                    {
+                        Opcode = PlanAdd,
+                        Skip = pendingSkip,
+                        BaselineIndex = -1,
+                        TargetIndex = targetIndex,
+                        MaskOffset = -1,
+                        MaskLength = 0,
+                    };
+                    pendingSkip = 0;
+                    ops++;
                     targetIndex++;
                     continue;
                 }
 
                 var baselineEntity = baselineEntities[baselineIndex];
                 var targetEntity = targetEntities[targetIndex];
-                if (!BytesEqual(baselineBytes, baselineLength,
-                        baselineEntity.RawOffset, targetBytes, targetLength,
-                        targetEntity.RawOffset,
-                        baselineEntity.RawLength) ||
-                    baselineEntity.RawLength != targetEntity.RawLength)
+                if (!RawSpansEqual(baselineBytes, baselineLength,
+                        baselineEntity.RawOffset, baselineEntity.RawLength,
+                        targetBytes, targetLength, targetEntity.RawOffset,
+                        targetEntity.RawLength))
                 {
-                    if (!WritePatch(destination, destinationCapacity, ref position,
-                            baselineBytes, baselineLength, baselineEntities,
-                            baselineRecords, baselineEntity,
-                            targetBytes, targetLength, targetEntities,
-                            targetRecords, targetEntity))
+                    if (ops >= planCapacity)
                         return 0;
-                    operations++;
+                    if (RecordSequenceMatches(baselineRecords, baselineEntity,
+                            targetRecords, targetEntity))
+                    {
+                        var maskBytes =
+                            SnapshotDeltaCodec.MaskByteCount(baselineEntity.RecordCount);
+                        var maskOffset = ops * maskStride;
+                        if (maskBytes > maskStride || maskOffset < 0 ||
+                            maskOffset > maskBufferCapacity - maskBytes ||
+                            !ComputeMask(baselineBytes, baselineLength,
+                                baselineEntity, baselineRecords, targetBytes,
+                                targetLength, targetEntity, targetRecords,
+                                maskBuffer, maskOffset, maskBytes))
+                            return 0;
+                        plan[ops] = new SnapshotDeltaPlanOp
+                        {
+                            Opcode = PlanPatchFast,
+                            Skip = pendingSkip,
+                            BaselineIndex = baselineIndex,
+                            TargetIndex = targetIndex,
+                            MaskOffset = maskOffset,
+                            MaskLength = maskBytes,
+                        };
+                    }
+                    else
+                    {
+                        plan[ops] = new SnapshotDeltaPlanOp
+                        {
+                            Opcode = PlanPatchFull,
+                            Skip = pendingSkip,
+                            BaselineIndex = baselineIndex,
+                            TargetIndex = targetIndex,
+                            MaskOffset = -1,
+                            MaskLength = 0,
+                        };
+                    }
+                    pendingSkip = 0;
+                    ops++;
+                }
+                else
+                {
+                    pendingSkip++;
                 }
                 baselineIndex++;
                 targetIndex++;
             }
 
-            if (!WriteU32At(destination, destinationCapacity, countPosition,
-                    operations))
-                return 0;
-            *writtenLength = position;
-            *operationCount = operations;
+            *opCount = ops;
             return 1;
         }
 
-        private static bool WritePatch(byte* destination, int capacity,
-            ref int position, byte* baselineBytes, int baselineLength,
-            SnapshotEntityLayout* baselineEntities,
-            SnapshotRecordLayout* baselineRecords,
-            SnapshotEntityLayout baselineEntity, byte* targetBytes,
-            int targetLength, SnapshotEntityLayout* targetEntities,
-            SnapshotRecordLayout* targetRecords, SnapshotEntityLayout targetEntity)
+        // Mirrors SnapshotDeltaCodec.RecordSequenceMatchesIndexed exactly (same
+        // iteration and comparison order): true when every baseline record of this
+        // entity has an exact (kind, typeId) counterpart at the same position in the
+        // target, so the compact positional PatchFast encoding applies.
+        private static bool RecordSequenceMatches(SnapshotRecordLayout* baselineRecords,
+            SnapshotEntityLayout baselineEntity, SnapshotRecordLayout* targetRecords,
+            SnapshotEntityLayout targetEntity)
         {
-            if (!WriteByte(destination, capacity, ref position, EntityPatch) ||
-                !CopyBytes(destination, capacity, ref position, targetBytes,
-                    targetLength, targetEntity.RawOffset, EntityHeaderSize))
+            if (baselineEntity.RecordCount != targetEntity.RecordCount)
                 return false;
-            var countPosition = position;
-            if (!WriteU32(destination, capacity, ref position, 0))
-                return false;
-
-            var baselineIndex = baselineEntity.RecordStart;
-            var baselineEnd = baselineIndex + baselineEntity.RecordCount;
-            var targetIndex = targetEntity.RecordStart;
-            var targetEnd = targetIndex + targetEntity.RecordCount;
-            var operations = 0u;
-            while (baselineIndex < baselineEnd || targetIndex < targetEnd)
+            var bStart = baselineEntity.RecordStart;
+            var tStart = targetEntity.RecordStart;
+            for (var i = 0; i < baselineEntity.RecordCount; i++)
             {
-                var comparison = baselineIndex >= baselineEnd ? 1 :
-                    targetIndex >= targetEnd ? -1 :
-                    CompareRecord(baselineRecords[baselineIndex].Kind,
-                        baselineRecords[baselineIndex].TypeId,
-                        targetRecords[targetIndex].Kind,
-                        targetRecords[targetIndex].TypeId);
-                if (comparison < 0)
-                {
-                    var removed = baselineRecords[baselineIndex];
-                    if (!WriteByte(destination, capacity, ref position,
-                            RecordRemove) ||
-                        !WriteU32(destination, capacity, ref position,
-                            removed.TypeId) ||
-                        !WriteByte(destination, capacity, ref position,
-                            removed.Kind))
-                        return false;
-                    operations++;
-                    baselineIndex++;
-                    continue;
-                }
-                if (comparison > 0)
-                {
-                    var added = targetRecords[targetIndex];
-                    if (!WriteByte(destination, capacity, ref position,
-                            RecordAdd) ||
-                        !CopyBytes(destination, capacity, ref position,
-                            targetBytes, targetLength, added.RawOffset,
-                            added.RawLength))
-                        return false;
-                    operations++;
-                    targetIndex++;
-                    continue;
-                }
-
-                var baselineRecord = baselineRecords[baselineIndex];
-                var targetRecord = targetRecords[targetIndex];
-                if (baselineRecord.RawLength != targetRecord.RawLength ||
-                    !BytesEqual(baselineBytes, baselineLength,
-                        baselineRecord.RawOffset, targetBytes, targetLength,
-                        targetRecord.RawOffset, baselineRecord.RawLength))
-                {
-                    if (!WriteByte(destination, capacity, ref position,
-                            RecordReplace) ||
-                        !CopyBytes(destination, capacity, ref position,
-                            targetBytes, targetLength, targetRecord.RawOffset,
-                            targetRecord.RawLength))
-                        return false;
-                    operations++;
-                }
-                baselineIndex++;
-                targetIndex++;
+                var b = baselineRecords[bStart + i];
+                var t = targetRecords[tStart + i];
+                if (b.Kind != t.Kind || b.TypeId != t.TypeId)
+                    return false;
             }
-            return WriteU32At(destination, capacity, countPosition, operations);
+            return true;
         }
+
+        // Mirrors SnapshotDeltaCodec.TryWritePatchFastIndexed's mask computation
+        // exactly (same bit numbering, same disabled-flag offsets): bit 0/1 encode the
+        // entity's own Disabled flag change, bits 2*(i+1)/2*(i+1)+1 encode record i's
+        // payload change and new Disabled flag. Only bit *placement* is decided here;
+        // SnapshotDeltaCodec.TryWritePatchFastFromMask still owns every payload write
+        // (including the hook lookup PatchFast's tagged length field depends on).
+        private static bool ComputeMask(byte* baselineBytes, int baselineLength,
+            SnapshotEntityLayout baselineEntity, SnapshotRecordLayout* baselineRecords,
+            byte* targetBytes, int targetLength, SnapshotEntityLayout targetEntity,
+            SnapshotRecordLayout* targetRecords, byte* maskBuffer, int maskOffset,
+            int maskBytes)
+        {
+            for (var i = 0; i < maskBytes; i++)
+                maskBuffer[maskOffset + i] = 0;
+
+            var baselineDisabledIndex =
+                baselineEntity.RawOffset + SnapshotDeltaCodec.EntityDisabledOffset;
+            var targetDisabledIndex =
+                targetEntity.RawOffset + SnapshotDeltaCodec.EntityDisabledOffset;
+            if ((uint)baselineDisabledIndex >= (uint)baselineLength ||
+                (uint)targetDisabledIndex >= (uint)targetLength)
+                return false;
+            var baselineDisabled = baselineBytes[baselineDisabledIndex];
+            var targetDisabled = targetBytes[targetDisabledIndex];
+            if (baselineDisabled != targetDisabled)
+            {
+                SetMaskBit(maskBuffer, maskOffset, 0);
+                if (targetDisabled != 0)
+                    SetMaskBit(maskBuffer, maskOffset, 1);
+            }
+
+            var count = baselineEntity.RecordCount;
+            var bStart = baselineEntity.RecordStart;
+            var tStart = targetEntity.RecordStart;
+            for (var i = 0; i < count; i++)
+            {
+                var b = baselineRecords[bStart + i];
+                var t = targetRecords[tStart + i];
+                if (!RawSpansEqual(baselineBytes, baselineLength, b.RawOffset,
+                        b.RawLength, targetBytes, targetLength, t.RawOffset,
+                        t.RawLength))
+                {
+                    var bit = 2 * (i + 1);
+                    SetMaskBit(maskBuffer, maskOffset, bit);
+                    var targetRecordDisabledIndex =
+                        t.RawOffset + SnapshotDeltaCodec.RecordDisabledOffset;
+                    if ((uint)targetRecordDisabledIndex >= (uint)targetLength)
+                        return false;
+                    if (targetBytes[targetRecordDisabledIndex] != 0)
+                        SetMaskBit(maskBuffer, maskOffset, bit + 1);
+                }
+            }
+            return true;
+        }
+
+        private static void SetMaskBit(byte* maskBuffer, int baseOffset, int bitIndex) =>
+            maskBuffer[baseOffset + (bitIndex >> 3)] |= (byte)(1 << (bitIndex & 7));
 
         private static int CompareGid(ulong left, ulong right)
         {
@@ -366,12 +410,16 @@ namespace UniGame.StaticEcs.Network
                 leftVersion < rightVersion ? -1 : 1;
         }
 
-        private static int CompareRecord(byte leftKind, uint leftType,
-            byte rightKind, uint rightType)
+        // left/right lengths must match first: unlike a plain memcmp, differing
+        // lengths always mean "not equal" (mirrors ReadOnlySpan<byte>.SequenceEqual,
+        // which SnapshotDeltaCodec's portable path calls for the same comparisons).
+        private static bool RawSpansEqual(byte* left, int leftLength, int leftOffset,
+            int leftLen, byte* right, int rightLength, int rightOffset, int rightLen)
         {
-            if (leftKind != rightKind)
-                return leftKind < rightKind ? -1 : 1;
-            return leftType == rightType ? 0 : leftType < rightType ? -1 : 1;
+            if (leftLen != rightLen)
+                return false;
+            return BytesEqual(left, leftLength, leftOffset, right, rightLength,
+                rightOffset, leftLen);
         }
 
         private static bool BytesEqual(byte* left, int leftLength, int leftOffset,
@@ -397,84 +445,20 @@ namespace UniGame.StaticEcs.Network
             }
             return true;
         }
-
-        private static bool CopyBytes(byte* destination, int capacity,
-            ref int position, byte* source, int sourceLength, int sourceOffset,
-            int length)
-        {
-            if (length < 0 || sourceOffset < 0 || sourceOffset > sourceLength ||
-                position < 0 || position > capacity ||
-                length > sourceLength - sourceOffset ||
-                length > capacity - position)
-                return false;
-            var index = 0;
-            while (index <= length - 8)
-            {
-                *(ulong*)(destination + position + index) =
-                    *(ulong*)(source + sourceOffset + index);
-                index += 8;
-            }
-            while (index < length)
-            {
-                destination[position + index] = source[sourceOffset + index];
-                index++;
-            }
-            position += length;
-            return true;
-        }
-        private static bool WriteByte(byte* destination, int capacity,
-            ref int position, byte value)
-        {
-            if (position < 0 || position >= capacity)
-                return false;
-            destination[position++] = value;
-            return true;
-        }
-
-        private static bool WriteU32(byte* destination, int capacity,
-            ref int position, uint value)
-        {
-            if (position < 0 || capacity - position < 4)
-                return false;
-            destination[position++] = (byte)value;
-            destination[position++] = (byte)(value >> 8);
-            destination[position++] = (byte)(value >> 16);
-            destination[position++] = (byte)(value >> 24);
-            return true;
-        }
-
-        private static bool WriteU64(byte* destination, int capacity,
-            ref int position, ulong value)
-        {
-            if (position < 0 || capacity - position < 8)
-                return false;
-            for (var index = 0; index < 8; index++)
-                destination[position++] = (byte)(value >> (index * 8));
-            return true;
-        }
-
-        private static bool WriteU32At(byte* destination, int capacity,
-            int position, uint value)
-        {
-            if (position < 0 || capacity - position < 4)
-                return false;
-            destination[position] = (byte)value;
-            destination[position + 1] = (byte)(value >> 8);
-            destination[position + 2] = (byte)(value >> 16);
-            destination[position + 3] = (byte)(value >> 24);
-            return true;
-        }
 #else
-        internal static SnapshotDeltaBurstResult TryEncode(
+        internal static SnapshotDeltaBurstResult TryPlan(
             NetworkSnapshot baseline, SnapshotLayoutView baselineLayout,
             NetworkSnapshot target, SnapshotLayoutView targetLayout,
-            NetworkBufferLease candidate, out int writtenLength,
-            out uint operationCount)
+            SnapshotDeltaPlanOp[] planBuffer, int planCapacity,
+            byte[] maskBuffer, int maskBufferCapacity, int maskStride,
+            out int opCount)
         {
-            writtenLength = 0;
-            operationCount = 0;
+            opCount = 0;
             return SnapshotDeltaBurstResult.Unavailable;
         }
+
+        internal static bool ForcePortableForTests;
+        internal static bool IsAvailable => false;
 #endif
     }
 }
