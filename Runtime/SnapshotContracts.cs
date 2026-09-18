@@ -11,6 +11,24 @@ namespace UniGame.StaticEcs.Network
     public delegate bool NetworkScopeSelector<TWorld>(ScopeId scope,
         World<TWorld>.Entity entity) where TWorld : struct, IWorldType;
 
+    /// <summary>
+    /// Reports whether a replica entity may skip re-applying a snapshot record this tick when
+    /// that record's raw bytes and disabled flag are byte-identical to the last snapshot this
+    /// client actually applied to it (see <see cref="NetworkReplicator{TWorld}.Apply"/>).
+    /// <para>
+    /// Called only at that point, never for an entity whose bytes changed. Must return
+    /// <c>false</c> for any entity a client-side system (prediction, reconciliation,
+    /// interpolation, or any other local mutation) can write into between snapshot applies:
+    /// skipping re-applies the authoritative record and is what corrects such a local write.
+    /// Skipping is opt-in and off by default (no policy supplied) precisely because most
+    /// callers cannot make that guarantee for every replicated entity — see the caller-supplied
+    /// policy parameter on <see cref="NetworkClient{TWorld}"/> and
+    /// <see cref="NetworkReplicator{TWorld}"/>'s client constructor.
+    /// </para>
+    /// </summary>
+    public delegate bool NetworkReplicaSkipPolicy<TWorld>(World<TWorld>.Entity entity)
+        where TWorld : struct, IWorldType;
+
     /// <summary>Reports full snapshot capture results.</summary>
     public enum SnapshotCaptureResult : byte
     {
@@ -168,6 +186,16 @@ namespace UniGame.StaticEcs.Network
 
         internal byte[] Buffer => _bytes?.Buffer;
         internal int Offset => _bytes?.Offset ?? 0;
+
+        // Creates an independently disposable, ref-counted view over one byte range of
+        // this snapshot's canonical bytes. The caller owns the returned lease and may
+        // retain it past this snapshot's own disposal (e.g. past a History eviction);
+        // the underlying buffer stays alive until every retained view is disposed. Used
+        // by NetworkReplicator.Apply to cache the last-applied bytes per replica entity
+        // without copying them.
+        internal NetworkBufferLease RetainBytes(int offset, int length) =>
+            _bytes?.RetainSlice(offset, length) ??
+            throw new ObjectDisposedException(nameof(NetworkSnapshot));
 
         // Only pool-owned snapshots may lazily build and reuse the layout. Public
         // descriptors keep the parser/hash path so caller-supplied bytes are never

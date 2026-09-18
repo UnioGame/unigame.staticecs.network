@@ -53,12 +53,18 @@ namespace UniGame.StaticEcs.Network
         private uint _snapshotDiscardThroughTick;
         private uint _resyncCorrelationId;
 
+        /// <param name="unchangedApplySkipPolicy">
+        /// Opt-in, off by default. See <see cref="NetworkReplicaSkipPolicy{TWorld}"/> for the
+        /// exact safety contract — supply a policy only after confirming no client-side system
+        /// writes the covered entities' replicated components between snapshot applies.
+        /// </param>
         public NetworkClient(INetworkTransport transport, NetworkSchema<TWorld> schema,
             ScopeId scope = default, INetworkObserver observer = null,
             int ticksPerSecond = 20, int predictionLeadTicks = 1,
             int commandRedundancy = NetworkSimulationConfig.DefaultCommandRedundancy,
             ulong simulationFingerprint = 0,
-            ulong contentFingerprint = 0, NetworkBufferPool bufferPool = null)
+            ulong contentFingerprint = 0, NetworkBufferPool bufferPool = null,
+            NetworkReplicaSkipPolicy<TWorld> unchangedApplySkipPolicy = null)
         {
             _transport = transport ?? throw new ArgumentNullException(nameof(transport));
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
@@ -76,7 +82,7 @@ namespace UniGame.StaticEcs.Network
                 new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes);
             _ownsBufferPool = bufferPool == null;
             _replicator = new NetworkReplicator<TWorld>(schema, scope,
-                bufferPool: _bufferPool);
+                bufferPool: _bufferPool, skipPolicy: unchangedApplySkipPolicy);
             _session = new NetworkSession<TWorld>(transport.Connection,
                 NetworkRole.Client, schema, _bufferPool, observer);
             _session.ReportSession(0, 0, 0, _packetSequence);

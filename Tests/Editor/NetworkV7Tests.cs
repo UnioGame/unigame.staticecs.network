@@ -328,6 +328,257 @@ namespace UniGame.StaticEcs.Network.Tests
             }
         }
 
+        // NCORE-24: NetworkReplicator.Apply() used to fully re-decode and re-apply every
+        // replicated entity's complete record set on every tick, even entities whose bytes
+        // were identical to what was already applied (the client-side path is what real
+        // game clients run, so unchanged NPCs/environment entities paid full apply cost
+        // every tick). Apply() can now skip the record loop for an entity whose disabled
+        // flag and raw record bytes are byte-identical to its last successful apply, but
+        // only when the caller opts in via a NetworkReplicaSkipPolicy (see round 2: with no
+        // policy — the default every existing caller gets — every entity is always fully
+        // re-applied, exactly as before this optimization; see
+        // DefaultApplyAlwaysCorrectsLocalWritesToReplicatedComponents and
+        // SkipPolicyCorrectsIneligibleLocalWriteWhileSkippingEligibleUnchangedEntity below for
+        // why). This test opts every entity in (`_ => true`) to exercise exactly the cases
+        // skip must get right once a caller has taken on that responsibility: an untouched
+        // entity staying correct while a sibling entity changes, a disabled-flag-only change
+        // still applying, entity removal still destroying the replica, and the buffer pool
+        // never leaking the NetworkBufferLease the skip path retains per replica
+        // (NetworkReplicaEntry.AppliedBytes).
+        [Test]
+        public void UnchangedEntityIsSkippedWhileChangedSiblingAndRemovalStillApply()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var authoritySchema = Schema<AuthorityWorld>(true);
+                var clientSchema = Schema<ClientAWorld>(false);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(41),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    var server = new NetworkServer<AuthorityWorld>(authoritySchema,
+                        static (_, _) => true);
+                    server.AddConnection(serverTransport, 3, 1, new ScopeId(1));
+                    var client = new NetworkClient<ClientAWorld>(clientTransport,
+                        clientSchema, new ScopeId(1),
+                        unchangedApplySkipPolicy: static _ => true);
+                    var freshClientLeases = client.CaptureBufferDiagnostics().OutstandingLeases;
+
+                    var changing = World<AuthorityWorld>.NewEntity<TestEntity>()
+                        .Set(new TestComponent { Value = 1 })
+                        .Set(new NetworkOwnerComponent { PeerId = 1 });
+                    var changingGid = changing.GID;
+                    var stable = World<AuthorityWorld>.NewEntity<SecondEntity>()
+                        .Set(new TestComponent { Value = 100 })
+                        .Set(new NetworkOwnerComponent { PeerId = 2 });
+                    var stableGid = stable.GID;
+
+                    Assert.That(client.BeginHandshake(), Is.True);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+                    Assert.That(client.Session.State, Is.EqualTo(NetworkSessionState.Established));
+                    Assert.That(changingGid.TryUnpack<ClientAWorld>(out var changingReplica), Is.True);
+                    Assert.That(stableGid.TryUnpack<ClientAWorld>(out var stableReplica), Is.True);
+                    Assert.That(changingReplica.Read<TestComponent>().Value, Is.EqualTo(1));
+                    Assert.That(stableReplica.Read<TestComponent>().Value, Is.EqualTo(100));
+
+                    // Only "changing" mutates; "stable" is byte-identical to its last apply.
+                    changing.Set(new TestComponent { Value = 2 });
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+                    Assert.That(changingReplica.Read<TestComponent>().Value, Is.EqualTo(2),
+                        "the entity that actually changed must still apply");
+                    Assert.That(stableReplica.Read<TestComponent>().Value, Is.EqualTo(100),
+                        "an entity skipped as unchanged must keep its last correctly applied value");
+                    Assert.That(stableReplica.HasDisabled<TestComponent>(), Is.False);
+
+                    // A disabled-flag-only change (no value change) must not be skipped.
+                    stable.Disable<TestComponent>();
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+                    Assert.That(stableReplica.HasDisabled<TestComponent>(), Is.True,
+                        "a disabled-flag change must still apply even though the value did not change");
+                    Assert.That(stableReplica.Read<TestComponent>().Value, Is.EqualTo(100));
+                    Assert.That(changingReplica.HasDisabled<TestComponent>(), Is.False);
+
+                    // Removing "stable" must still destroy its replica and release the bytes
+                    // the skip path retained for it, while "changing" is unaffected.
+                    stable.Destroy();
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+                    Assert.That(stableGid.TryUnpack<ClientAWorld>(out _), Is.False);
+                    Assert.That(changingGid.TryUnpack<ClientAWorld>(out var survivor), Is.True);
+                    Assert.That(survivor.Read<TestComponent>().Value, Is.EqualTo(2));
+
+                    // Drain the Ack this tick's apply just sent before disconnecting, so the
+                    // assertion below measures the replicator's own cleanup and not an
+                    // in-flight transport packet the server has not read yet.
+                    server.Receive();
+                    client.Disconnect();
+                    Assert.That(client.CaptureBufferDiagnostics().OutstandingLeases,
+                        Is.EqualTo(freshClientLeases),
+                        "every NetworkBufferLease the skip path retained per replica " +
+                        "(NetworkReplicaEntry.AppliedBytes) must be released on disconnect, " +
+                        "returning to the same outstanding-lease count as a fresh client");
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        // NCORE-24 round 2: the skip in Apply() is only correct for an entity no client-side
+        // system writes between snapshot applies. Until NCORE-24, Apply() was this client's
+        // only correction mechanism for such a local write (prediction, reconciliation,
+        // interpolation writing a replicated component directly) — every tick unconditionally
+        // re-asserted the authoritative value regardless of whether the wire bytes changed.
+        // This proves the shipped default — no NetworkReplicaSkipPolicy supplied, which is
+        // every existing caller including the real game client and calibration/load-client
+        // construction sites — keeps that exact correction behavior: a local write to a
+        // replicated component is still overwritten by the next apply even when the server's
+        // bytes for that entity did not change at all.
+        [Test]
+        public void DefaultApplyAlwaysCorrectsLocalWritesToReplicatedComponents()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var authoritySchema = Schema<AuthorityWorld>(true);
+                var clientSchema = Schema<ClientAWorld>(false);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(45),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    var server = new NetworkServer<AuthorityWorld>(authoritySchema,
+                        static (_, _) => true);
+                    server.AddConnection(serverTransport, 3, 1, new ScopeId(1));
+                    // No unchangedApplySkipPolicy: this is the default every current caller
+                    // gets, including NetworkClientFeature in the game and the load client.
+                    var client = new NetworkClient<ClientAWorld>(clientTransport,
+                        clientSchema, new ScopeId(1));
+
+                    var authority = World<AuthorityWorld>.NewEntity<TestEntity>()
+                        .Set(new TestComponent { Value = 1 })
+                        .Set(new NetworkOwnerComponent { PeerId = 1 });
+                    var gid = authority.GID;
+
+                    Assert.That(client.BeginHandshake(), Is.True);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+                    Assert.That(gid.TryUnpack<ClientAWorld>(out var replica), Is.True);
+                    Assert.That(replica.Read<TestComponent>().Value, Is.EqualTo(1));
+
+                    // Simulate a client-side system (prediction/reconciliation/interpolation)
+                    // writing directly into the replicated component between applies, with
+                    // the authority's own record left completely untouched — the exact
+                    // situation that made the entity "unchanged" from the wire's perspective.
+                    replica.Set(new TestComponent { Value = 999 });
+                    Assert.That(replica.Read<TestComponent>().Value, Is.EqualTo(999));
+
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+
+                    Assert.That(replica.Read<TestComponent>().Value, Is.EqualTo(1),
+                        "with no opt-in skip policy, Apply must still overwrite a local " +
+                        "write even when the server's bytes for this entity did not change " +
+                        "— this is the exact desync NCORE-24 round 2 review flagged");
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        // Proves the policy contract is enforced per entity: an entity kind the policy
+        // excludes (standing in for one carrying a local-ownership/prediction marker in the
+        // real game) is always corrected even after a local write, while an entity kind the
+        // policy allows is skipped once unchanged — which only stays safe because the caller
+        // that supplied the policy is responsible for knowing no client-side system writes
+        // that kind's replicated components.
+        [Test]
+        public void SkipPolicyCorrectsIneligibleLocalWriteWhileSkippingEligibleUnchangedEntity()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var authoritySchema = Schema<AuthorityWorld>(true);
+                var clientSchema = Schema<ClientAWorld>(false);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(46),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    var server = new NetworkServer<AuthorityWorld>(authoritySchema,
+                        static (_, _) => true);
+                    server.AddConnection(serverTransport, 3, 1, new ScopeId(1));
+
+                    // TestEntity stands in for an owned/predicted entity a client-side
+                    // system can write (e.g. one carrying a local-ownership tag in the real
+                    // game); SecondEntity stands in for a purely remote replica nothing
+                    // local writes into.
+                    var client = new NetworkClient<ClientAWorld>(clientTransport,
+                        clientSchema, new ScopeId(1),
+                        unchangedApplySkipPolicy: entity => !entity.Is<TestEntity>());
+
+                    var owned = World<AuthorityWorld>.NewEntity<TestEntity>()
+                        .Set(new TestComponent { Value = 1 })
+                        .Set(new NetworkOwnerComponent { PeerId = 1 });
+                    var ownedGid = owned.GID;
+                    var remote = World<AuthorityWorld>.NewEntity<SecondEntity>()
+                        .Set(new TestComponent { Value = 100 })
+                        .Set(new NetworkOwnerComponent { PeerId = 2 });
+                    var remoteGid = remote.GID;
+
+                    Assert.That(client.BeginHandshake(), Is.True);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+                    Assert.That(ownedGid.TryUnpack<ClientAWorld>(out var ownedReplica), Is.True);
+                    Assert.That(remoteGid.TryUnpack<ClientAWorld>(out var remoteReplica), Is.True);
+
+                    // Neither entity's authoritative record changes on this tick; a local
+                    // write lands on both, simulating what a client-side system would do to
+                    // an owned entity (and, hypothetically, to a remote one to prove the
+                    // outcome depends on the policy, not luck).
+                    ownedReplica.Set(new TestComponent { Value = 999 });
+                    remoteReplica.Set(new TestComponent { Value = 999 });
+
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+
+                    Assert.That(ownedReplica.Read<TestComponent>().Value, Is.EqualTo(1),
+                        "the policy excludes this entity kind, so its local write must " +
+                        "still be corrected regardless of unchanged wire bytes");
+                    Assert.That(remoteReplica.Read<TestComponent>().Value, Is.EqualTo(999),
+                        "the policy allows this entity kind to skip; a caller that enables " +
+                        "it accepts responsibility for it never being locally written " +
+                        "between applies");
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
         private sealed class TestPeerObserver : INetworkPeerObserver
         {
             internal readonly List<NetworkPeerData> AdmittedPeers = new List<NetworkPeerData>();

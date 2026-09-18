@@ -51,6 +51,13 @@ namespace UniGame.StaticEcs.Network
         internal bool Disabled;
         internal int RecordStart;
         internal int RecordCount;
+        // Byte range (relative to the owning NetworkSnapshot's bytes, same base as
+        // StagedRecord.Offset) spanning every one of this entity's record headers and
+        // payloads contiguously. Apply() uses it to detect an entity whose replicated
+        // state is byte-identical to what it last applied, without decoding records
+        // that did not change; see NetworkReplicaEntry.AppliedBytes.
+        internal int ByteOffset;
+        internal int ByteLength;
     }
 
     internal struct StagedRecord
@@ -65,11 +72,22 @@ namespace UniGame.StaticEcs.Network
     {
         internal readonly EntityGID LocalGid;
         internal readonly NetworkTypeId KindId;
+        internal readonly bool Disabled;
+        // Retained view (via NetworkSnapshot.RetainBytes) over this entity's exact
+        // record bytes as of the last successful apply. Independently ref-counted
+        // from the owning NetworkSnapshot/History, so it stays valid after the
+        // snapshot that produced it is evicted. Owned by the replicas dictionary
+        // entry that holds it; every path that removes or replaces an entry must
+        // dispose it exactly once (see NetworkReplicator.Apply/ClearReplicas).
+        internal readonly NetworkBufferLease AppliedBytes;
 
-        internal NetworkReplicaEntry(EntityGID localGid, NetworkTypeId kindId)
+        internal NetworkReplicaEntry(EntityGID localGid, NetworkTypeId kindId,
+            bool disabled, NetworkBufferLease appliedBytes)
         {
             LocalGid = localGid;
             KindId = kindId;
+            Disabled = disabled;
+            AppliedBytes = appliedBytes;
         }
     }
 }

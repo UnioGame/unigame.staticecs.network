@@ -24,19 +24,29 @@ namespace UniGame.StaticEcs.Network
             new List<NetworkReplicaEntry>();
         private readonly object _owner = new object();
         private readonly NetworkScopeSelector<TWorld> _scopeSelector;
+        private readonly NetworkReplicaSkipPolicy<TWorld> _skipPolicy;
         private readonly NetworkSnapshotPool _snapshotPool;
         private int _captureCapacity = 4096;
 
         /// <summary>Creates a client-side snapshot apply replicator.</summary>
+        /// <param name="skipPolicy">
+        /// Opt-in, off by default. When null (the default), every applied entity's records are
+        /// always fully re-applied, matching this type's original, always-safe behavior exactly.
+        /// Supply a policy only after confirming no client-side system writes the covered
+        /// entities' replicated components between applies; see
+        /// <see cref="NetworkReplicaSkipPolicy{TWorld}"/> for the exact contract.
+        /// </param>
         public NetworkReplicator(NetworkSchema<TWorld> schema,
             ScopeId scope = default, int historyTicks = 64,
             long historyBytes = 32 * 1024 * 1024,
-            NetworkBufferPool bufferPool = null)
+            NetworkBufferPool bufferPool = null,
+            NetworkReplicaSkipPolicy<TWorld> skipPolicy = null)
         {
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
             _bufferPool = bufferPool ??
                 new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes);
             _ownsBufferPool = bufferPool == null;
+            _skipPolicy = skipPolicy;
             _snapshotPool = new NetworkSnapshotPool(historyTicks + 2);
             Scope = scope;
             History = new NetworkHistory<NetworkSnapshot>(historyTicks, historyBytes,
@@ -228,6 +238,7 @@ namespace UniGame.StaticEcs.Network
                             SnapshotApplyResult.LimitExceeded);
 
                     var start = recordIndex;
+                    var entityByteStart = offset;
                     NetworkSchemaEntry previousEntry = null;
                     for (var j = 0; j < recordCount; j++)
                     {
@@ -270,6 +281,8 @@ namespace UniGame.StaticEcs.Network
                         Disabled = disabledByte != 0,
                         RecordStart = start,
                         RecordCount = recordCount,
+                        ByteOffset = entityByteStart,
+                        ByteLength = offset - entityByteStart,
                     };
                 }
                 if (offset != bytes.Length || recordIndex != snapshot.RecordCount)
@@ -324,9 +337,10 @@ namespace UniGame.StaticEcs.Network
             for (var i = 0; i < _removed.Count; i++)
             {
                 var sourceGid = _removed[i];
-                var localGid = _replicas[sourceGid].LocalGid;
-                if (localGid.TryUnpack<TWorld>(out var removed))
+                var removedReplica = _replicas[sourceGid];
+                if (removedReplica.LocalGid.TryUnpack<TWorld>(out var removed))
                     removed.Destroy();
+                removedReplica.AppliedBytes?.Dispose();
                 _replicas.Remove(sourceGid);
             }
 
@@ -337,7 +351,8 @@ namespace UniGame.StaticEcs.Network
             {
                 var source = staged.Entities[i];
                 World<TWorld>.Entity entity;
-                if (_replicas.TryGetValue(source.Gid, out var replica))
+                var hasReplica = _replicas.TryGetValue(source.Gid, out var replica);
+                if (hasReplica)
                 {
                     if (!replica.LocalGid.TryUnpack<TWorld>(out entity))
                         return SnapshotApplyResult.EntityConflict;
@@ -349,37 +364,86 @@ namespace UniGame.StaticEcs.Network
                 if (!((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Matches(entity))
                     return SnapshotApplyResult.EntityConflict;
 
-                var sourceIndex = source.RecordStart;
-                var sourceEnd = source.RecordStart + source.RecordCount;
-                for (var j = 0; j < entries.Length; j++)
+                // A canonical snapshot always carries every replicated entity's full current
+                // record set, not only what changed on the wire (delta encoding only shrinks
+                // the packet; SnapshotDeltaCodec reconstructs the complete per-entity byte
+                // range before Stage() ever sees it). Re-decoding and re-applying that
+                // unchanged byte-for-byte range every tick is the dominant per-snapshot
+                // allocation on this path (NCORE-24): each record apply rents a scratch
+                // buffer and re-runs the StaticPack read hook.
+                //
+                // Skipping that work when bytes are unchanged is only correct for an entity
+                // no client-side system writes between applies: today's apply is also this
+                // client's only correction mechanism for local writes (prediction,
+                // reconciliation, interpolation) into replicated components, so skipping an
+                // entity such a system can touch would let a local write persist uncorrected
+                // until the server's bytes for it next change. _skipPolicy is null unless a
+                // caller explicitly opted in per entity (see NetworkReplicaSkipPolicy), so by
+                // default `unchanged` is always false here and every entity is fully
+                // re-applied every tick, exactly as before this optimization existed.
+                var unchanged = false;
+                if (_skipPolicy != null && hasReplica &&
+                    replica.Disabled == source.Disabled &&
+                    replica.AppliedBytes != null &&
+                    replica.AppliedBytes.Length == source.ByteLength)
                 {
-                    if (entries[j].Invoker is not IRecordNetworkInvoker<TWorld> invoker)
-                        continue;
-                    while (sourceIndex < sourceEnd &&
-                           Compare(staged.Records[sourceIndex].Entry, entries[j]) < 0)
-                        sourceIndex++;
-                    if (sourceIndex >= sourceEnd ||
-                        staged.Records[sourceIndex].Entry.TypeId != entries[j].TypeId)
-                        invoker.Remove(entity);
+                    var sourceBytes = new ReadOnlySpan<byte>(buffer,
+                        checked(baseOffset + source.ByteOffset), source.ByteLength);
+                    unchanged = replica.AppliedBytes.Span.SequenceEqual(sourceBytes) &&
+                        _skipPolicy(entity);
                 }
-                for (var j = source.RecordStart; j < sourceEnd; j++)
+
+                if (!unchanged)
                 {
-                    var record = staged.Records[j];
-                    ((IRecordNetworkInvoker<TWorld>)record.Entry.Invoker).Apply(entity,
-                        buffer, checked(baseOffset + record.Offset), record.Length,
-                        record.Entry.Version, record.Disabled);
+                    var sourceIndex = source.RecordStart;
+                    var sourceEnd = source.RecordStart + source.RecordCount;
+                    for (var j = 0; j < entries.Length; j++)
+                    {
+                        if (entries[j].Invoker is not IRecordNetworkInvoker<TWorld> invoker)
+                            continue;
+                        while (sourceIndex < sourceEnd &&
+                               Compare(staged.Records[sourceIndex].Entry, entries[j]) < 0)
+                            sourceIndex++;
+                        if (sourceIndex >= sourceEnd ||
+                            staged.Records[sourceIndex].Entry.TypeId != entries[j].TypeId)
+                            invoker.Remove(entity);
+                    }
+                    for (var j = source.RecordStart; j < sourceEnd; j++)
+                    {
+                        var record = staged.Records[j];
+                        ((IRecordNetworkInvoker<TWorld>)record.Entry.Invoker).Apply(entity,
+                            buffer, checked(baseOffset + record.Offset), record.Length,
+                            record.Entry.Version, record.Disabled);
+                    }
+                    if (source.Disabled)
+                        entity.Disable();
+                    else
+                        entity.Enable();
+                    entity.Set(new NetworkReplicaIdentityComponent
+                    {
+                        AuthorityGid = source.Gid,
+                        KindId = source.Kind.TypeId,
+                    });
+
+                    // Only retain comparison bytes when a skip policy is actually in use:
+                    // with no policy, `unchanged` above is always false, so this branch runs
+                    // for every entity every tick, and retaining a lease here would add the
+                    // exact per-tick lease churn NCORE-24 removes elsewhere for zero benefit.
+                    // Once a policy is in use, only move the retained bytes forward when
+                    // something actually applied — an unchanged entity's existing
+                    // AppliedBytes are already byte-identical to this tick's bytes (that is
+                    // what made it "unchanged"), so re-retaining here would be redundant.
+                    NetworkBufferLease retainedBytes = null;
+                    if (_skipPolicy != null)
+                    {
+                        retainedBytes = staged.Snapshot.RetainBytes(source.ByteOffset,
+                            source.ByteLength);
+                        if (hasReplica)
+                            replica.AppliedBytes?.Dispose();
+                    }
+                    _replicas[source.Gid] = new NetworkReplicaEntry(entity.GID,
+                        source.Kind.TypeId, source.Disabled, retainedBytes);
                 }
-                if (source.Disabled)
-                    entity.Disable();
-                else
-                    entity.Enable();
-                entity.Set(new NetworkReplicaIdentityComponent
-                {
-                    AuthorityGid = source.Gid,
-                    KindId = source.Kind.TypeId,
-                });
-                _replicas[source.Gid] = new NetworkReplicaEntry(entity.GID,
-                    source.Kind.TypeId);
             }
             History.Store(staged.ServerTick, staged.Snapshot);
             return SnapshotApplyResult.Success;
@@ -390,6 +454,8 @@ namespace UniGame.StaticEcs.Network
         {
             if (World<TWorld>.Status != WorldStatus.Initialized)
             {
+                foreach (var replica in _replicas.Values)
+                    replica.AppliedBytes?.Dispose();
                 _replicas.Clear();
                 History.Clear();
                 return;
@@ -398,8 +464,11 @@ namespace UniGame.StaticEcs.Network
             foreach (var replica in _replicas.Values)
                 _replicaScratch.Add(replica);
             for (var i = 0; i < _replicaScratch.Count; i++)
+            {
                 if (_replicaScratch[i].LocalGid.TryUnpack<TWorld>(out var entity))
                     entity.Destroy();
+                _replicaScratch[i].AppliedBytes?.Dispose();
+            }
             _replicas.Clear();
             History.Clear();
         }
@@ -437,7 +506,12 @@ namespace UniGame.StaticEcs.Network
 
         private static int Compare(NetworkSchemaEntry left, NetworkSchemaEntry right)
         {
-            var kind = left.Kind.CompareTo(right.Kind);
+            // Enum.CompareTo(object) is the only overload NetworkSchemaKind has, so
+            // calling it directly boxes the argument on every comparison; this runs
+            // once per wire record on both Stage() and Apply()'s hot paths, so the
+            // byte cast (whose CompareTo(byte) is a real, non-boxing IComparable<T>
+            // implementation) is worth the small loss of readability.
+            var kind = ((byte)left.Kind).CompareTo((byte)right.Kind);
             return kind != 0 ? kind : left.TypeId.CompareTo(right.TypeId);
         }
 
