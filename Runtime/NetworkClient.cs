@@ -18,6 +18,7 @@ namespace UniGame.StaticEcs.Network
         private readonly NetworkSession<TWorld> _session;
         private readonly NetworkBufferPool _bufferPool;
         private readonly bool _ownsBufferPool;
+        private readonly NetworkReconstructionCache _reconstructionCache;
         private readonly List<NetworkCommandEnvelope> _recentCommands = new List<NetworkCommandEnvelope>();
         private readonly Dictionary<NetworkTransactionId, NetworkClientTransaction> _transactions =
             new Dictionary<NetworkTransactionId, NetworkClientTransaction>();
@@ -58,13 +59,21 @@ namespace UniGame.StaticEcs.Network
         /// exact safety contract — supply a policy only after confirming no client-side system
         /// writes the covered entities' replicated components between snapshot applies.
         /// </param>
+        /// <param name="reconstructionCache">
+        /// Opt-in, off by default. See <see cref="NetworkReconstructionCache"/> for the exact
+        /// safety contract — share one instance across every <see cref="NetworkClient{TWorld}"/>
+        /// in a process that is pumped from a single thread (e.g. a thin load generator running
+        /// many client slots) to reuse identical delta reconstructions instead of repeating the
+        /// same O(canonical snapshot) work and hash verification per client.
+        /// </param>
         public NetworkClient(INetworkTransport transport, NetworkSchema<TWorld> schema,
             ScopeId scope = default, INetworkObserver observer = null,
             int ticksPerSecond = 20, int predictionLeadTicks = 1,
             int commandRedundancy = NetworkSimulationConfig.DefaultCommandRedundancy,
             ulong simulationFingerprint = 0,
             ulong contentFingerprint = 0, NetworkBufferPool bufferPool = null,
-            NetworkReplicaSkipPolicy<TWorld> unchangedApplySkipPolicy = null)
+            NetworkReplicaSkipPolicy<TWorld> unchangedApplySkipPolicy = null,
+            NetworkReconstructionCache reconstructionCache = null)
         {
             _transport = transport ?? throw new ArgumentNullException(nameof(transport));
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
@@ -81,6 +90,7 @@ namespace UniGame.StaticEcs.Network
             _bufferPool = bufferPool ??
                 new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes);
             _ownsBufferPool = bufferPool == null;
+            _reconstructionCache = reconstructionCache;
             _replicator = new NetworkReplicator<TWorld>(schema, scope,
                 bufferPool: _bufferPool, skipPolicy: unchangedApplySkipPolicy);
             _session = new NetworkSession<TWorld>(transport.Connection,
@@ -799,10 +809,9 @@ namespace UniGame.StaticEcs.Network
                         baseline.SchemaFingerprint != header.SchemaFingerprint ||
                         baseline.Scope != _session.Scope)
                         return SnapshotApplyResult.Malformed;
-                    if (!SnapshotDeltaCodec.TryReconstruct(_bufferPool, baseline,
-                            body.Span, in chunk, header.SchemaFingerprint,
-                            _session.Scope, out canonical, out entities, out records,
-                            _schema.DeltaHooks))
+                    if (!TryReconstructDelta(baseline, body.Span, in chunk,
+                            header.SchemaFingerprint, out canonical, out entities,
+                            out records))
                     {
                         discardRejectedTick = true;
                         return SnapshotApplyResult.Malformed;
@@ -832,6 +841,21 @@ namespace UniGame.StaticEcs.Network
             {
                 body?.Dispose();
             }
+        }
+
+        // Routes through the shared reconstruction cache when one was supplied at construction
+        // (NCORE-26), otherwise reconstructs independently exactly as before that change.
+        private bool TryReconstructDelta(NetworkSnapshot baseline, ReadOnlySpan<byte> delta,
+            in SnapshotChunkHeader chunk, SchemaFingerprint schemaFingerprint,
+            out NetworkBufferLease canonical, out int entities, out int records)
+        {
+            if (_reconstructionCache != null)
+                return _reconstructionCache.TryReconstruct(_bufferPool, baseline, delta,
+                    in chunk, schemaFingerprint, _session.Scope, out canonical, out entities,
+                    out records, _schema.DeltaHooks);
+            return SnapshotDeltaCodec.TryReconstruct(_bufferPool, baseline, delta, in chunk,
+                schemaFingerprint, _session.Scope, out canonical, out entities, out records,
+                _schema.DeltaHooks);
         }
 
         private bool TryAssembleSnapshot(NetworkBufferLease packet,
