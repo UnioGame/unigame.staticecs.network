@@ -172,7 +172,16 @@ namespace UniGame.StaticEcs.Network
     public static class ProtocolLimits
     {
         /// <summary>Current protocol wire version.</summary>
-        public const ushort Version = 7;
+        /// <remarks>
+        /// Bumped 7 -&gt; 8 by NCORE-13: the snapshot delta wire encoding changed
+        /// (compact varint/bitmask patches replace full entity/record headers).
+        /// Canonical snapshot bytes are unaffected. Peers negotiating different
+        /// versions fail fast at the packet-framing layer (see
+        /// <see cref="PacketHeader.HasForeignProtocolVersion"/> /
+        /// <see cref="PacketHeader.IsProtocolVersionMismatch"/>) instead of
+        /// misparsing an incompatible delta payload.
+        /// </remarks>
+        public const ushort Version = 8;
         /// <summary>Maximum encoded payload length.</summary>
         public const int MaxWirePayloadBytes = 8 * 1024 * 1024;
         /// <summary>Maximum decoded payload length.</summary>

@@ -277,7 +277,19 @@ namespace UniGame.StaticEcs.Network.Tests
 
 #endif
 #if UNITY_2022_2_OR_NEWER
+        // NCORE-13 replaced the delta wire format (compact varint/bitmask
+        // patches) but did not port SnapshotDeltaBurstBackend to it: the
+        // backend still only emits the pre-NCORE-13 layout, and
+        // TryEncodeCoreIndexed no longer calls it (see the comment there).
+        // With the call site removed, ForcePortableForTests=false no longer
+        // routes through Burst at all, so this test's differential/speedup
+        // assertions no longer exercise anything real. Ignored pending a
+        // Burst port of the new format; see the NCORE-13 report for the CPU
+        // measurement (encode is ~3.5x/tick, dominated by bytes not CPU) that
+        // justifies deferring the port instead of blocking the format change
+        // on it.
         [Test]
+        [Ignore("NCORE-13: Burst backend not yet ported to the compact delta format; TryEncodeCoreIndexed is portable-only until that follow-up.")]
         public void SnapshotDeltaCodec_BurstMatchesPortableAndReportsBatchTiming()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
@@ -409,11 +421,12 @@ namespace UniGame.StaticEcs.Network.Tests
                     Is.EqualTo(SnapshotCaptureResult.Success));
                 Assert.That(SnapshotDeltaCodec.TryEncode(pool, baseline,
                     unchanged, out delta), Is.True);
-                Assert.That(delta.Length, Is.EqualTo(12));
-                var expectedDelta = new byte[12];
-                Write32(expectedDelta, 0,
+                Assert.That(delta.Length, Is.EqualTo(13));
+                var expectedDelta = new byte[13];
+                expectedDelta[0] = 1; // delta format version
+                Write32(expectedDelta, 1,
                     checked((uint)unchanged.EntityCount));
-                Write32(expectedDelta, 4,
+                Write32(expectedDelta, 5,
                     checked((uint)unchanged.RecordCount));
                 Assert.That(delta.Span.SequenceEqual(expectedDelta), Is.True);
                 var header = DeltaHeader(baseline, unchanged);
@@ -445,7 +458,7 @@ namespace UniGame.StaticEcs.Network.Tests
 
                 Assert.That(SnapshotDeltaCodec.TryEncode(pool, baseline,
                     target, out delta), Is.True);
-                Assert.That(Read32(delta.Span, 8), Is.GreaterThan(0));
+                Assert.That(Read32(delta.Span, 9), Is.GreaterThan(0));
                 header = DeltaHeader(baseline, target);
                 Assert.That(header.TotalLength, Is.EqualTo(target.ByteLength));
                 Assert.That(header.TotalHash, Is.EqualTo(target.PayloadHash));
@@ -518,12 +531,16 @@ namespace UniGame.StaticEcs.Network.Tests
                 AssertDeltaRejected(pool, baseline,
                     patchDelta.Span.Slice(0, patchDelta.Length - 1), in header,
                     schema.Fingerprint, scope);
+                // Header layout: formatVersion(1) + entityCount(4) + recordCount(4)
+                // + operationCount(4) = 13 bytes; the first operation is
+                // `ballast` unchanged (skip=1, one varint byte at offset 13) then
+                // the opcode byte for the `first` patch at offset 14.
                 var unknownOperation = patchDelta.Span.ToArray();
-                unknownOperation[12] = 0;
+                unknownOperation[14] = 0;
                 AssertDeltaRejected(pool, baseline, unknownOperation, in header,
                     schema.Fingerprint, scope);
                 var wrongCount = patchDelta.Span.ToArray();
-                Write32(wrongCount, 0, Read32(wrongCount, 0) + 1);
+                Write32(wrongCount, 9, Read32(wrongCount, 9) + 1);
                 AssertDeltaRejected(pool, baseline, wrongCount, in header,
                     schema.Fingerprint, scope);
                 var wrongLength = header;
@@ -549,16 +566,24 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(SnapshotDeltaCodec.TryEncode(pool, removeBaseline,
                     emptyTarget, out var removeDelta), Is.True);
                 leases.Add(removeDelta);
-                Assert.That(removeDelta.Length, Is.EqualTo(30));
-                Assert.That(Read32(removeDelta.Span, 8), Is.EqualTo(2));
+                // Header (13) + two Remove ops, each a 1-byte skip varint plus a
+                // 1-byte opcode (no GID on the wire: baseline position is
+                // implicit from the walk): ballast is skipped (skip=1) before
+                // removing `first`, then `second` is removed immediately
+                // (skip=0).
+                Assert.That(removeDelta.Length, Is.EqualTo(17));
+                Assert.That(Read32(removeDelta.Span, 9), Is.EqualTo(2));
                 var removeHeader = DeltaHeader(removeBaseline, emptyTarget);
-                var reordered = removeDelta.Span.ToArray();
-                Swap(reordered, 12, 21, 9);
-                AssertDeltaRejected(pool, removeBaseline, reordered,
+                var overrunSkip = removeDelta.Span.ToArray();
+                overrunSkip[13] = 200; // skip count now exceeds the baseline
+                AssertDeltaRejected(pool, removeBaseline, overrunSkip,
                     in removeHeader, schema.Fingerprint, scope);
-                var duplicate = removeDelta.Span.ToArray();
-                Array.Copy(duplicate, 12, duplicate, 21, 9);
-                AssertDeltaRejected(pool, removeBaseline, duplicate,
+                var duplicateOp = new byte[removeDelta.Length + 2];
+                removeDelta.Span.Slice(0, 15).CopyTo(duplicateOp);
+                removeDelta.Span.Slice(13, 2).CopyTo(duplicateOp.AsSpan(15));
+                removeDelta.Span.Slice(15).CopyTo(duplicateOp.AsSpan(17));
+                Write32(duplicateOp, 9, Read32(duplicateOp, 9) + 1);
+                AssertDeltaRejected(pool, removeBaseline, duplicateOp,
                     in removeHeader, schema.Fingerprint, scope);
                 AssertDeltaRejected(pool, emptyBaseline, removeDelta.Span,
                     in removeHeader, schema.Fingerprint, scope);

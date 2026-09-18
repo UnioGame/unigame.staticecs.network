@@ -6,10 +6,50 @@ namespace UniGame.StaticEcs.Network
     using FFS.Libraries.StaticEcs;
     using FFS.Libraries.StaticPack;
 
+    // NCORE-13 wire format (delta format version 1; gated by ProtocolLimits.Version 8):
+    //
+    // The canonical full-snapshot byte layout (entity header 15 B, record header 11 B,
+    // TotalLength/TotalHash, client reconstruction) is UNCHANGED. Only the on-the-wire
+    // DELTA encoding below changed; TryReconstruct always rebuilds the exact same
+    // canonical bytes a keyframe would carry.
+    //
+    // Delta body:
+    //   byte   formatVersion (=1)
+    //   uint32 targetEntityCount
+    //   uint32 targetRecordCount
+    //   uint32 operationCount
+    //   operationCount * {
+    //     varint skip        -- baseline entities (in GID order) to copy unchanged
+    //                           before this operation
+    //     byte   opcode      -- 1=Remove 2=Add 3=PatchFast 4=PatchFull
+    //     ...opcode-specific payload (see TryWritePatchFast/Full and
+    //        TryReconstructPatchFast/Full)
+    //   }
+    //   -- any baseline entities left after the last operation are copied unchanged
+    //      with no further framing (the decoder just drains the baseline cursor).
+    //
+    // Entity references are never sent as GID/8-byte headers for Remove/Patch: both
+    // sides walk the baseline's GID-sorted entity list in lockstep, so a `skip` count
+    // is a strictly cheaper equivalent of a delta-coded baseline index. PatchFast
+    // covers the common case (record set unchanged, only payload/disabled bits
+    // differ): a 2-bits-per-item mask (item 0 = entity Disabled flag, items 1..N =
+    // baseline records 0..N-1 in canonical (kind,typeId) order) marks
+    // changed/new-value, and only changed records carry a varint length + payload
+    // (no typeId/kind/version/length-header — position implies identity). PatchFull
+    // is the escape path for entities whose record set was added to or removed from;
+    // it keeps the old, self-describing per-record Add/Remove/Replace encoding.
     internal static class SnapshotDeltaCodec
     {
-        private const int DeltaHeaderSize = sizeof(uint) * 3;
-        private const int EntityHeaderSize = sizeof(ulong) + sizeof(uint) + sizeof(byte) + sizeof(ushort);
+        private const byte DeltaFormatVersion = 1;
+        private const int DeltaHeaderSize = sizeof(byte) + sizeof(uint) * 3;
+        private const int EntityHeaderSize =
+            sizeof(ulong) + sizeof(uint) + sizeof(byte) + sizeof(ushort);
+        private const int EntityDisabledOffset = sizeof(ulong) + sizeof(uint);
+        private const int RecordHeaderSize =
+            sizeof(uint) + sizeof(byte) + sizeof(byte) + sizeof(byte) + sizeof(uint);
+        private const int RecordDisabledOffset = sizeof(uint) + sizeof(byte) + sizeof(byte);
+        private const int MaxMaskBytes =
+            (2 * (ProtocolLimits.MaxRecordsPerEntity + 1) + 7) / 8;
         private const int EntityLayoutBytes =
             sizeof(ulong) + sizeof(ushort) + sizeof(int) * 3;
         private const int RecordLayoutBytes =
@@ -23,9 +63,10 @@ namespace UniGame.StaticEcs.Network
 
         private enum EntityOperation : byte
         {
-            Add = 1,
-            Remove = 2,
-            Patch = 3,
+            Remove = 1,
+            Add = 2,
+            PatchFast = 3,
+            PatchFull = 4,
         }
 
         private enum RecordOperation : byte
@@ -380,18 +421,17 @@ namespace UniGame.StaticEcs.Network
             SnapshotLayoutView targetLayout, NetworkBufferLease candidate,
             ref SnapshotWriter writer, out uint operationCount)
         {
-#if UNITY_2022_2_OR_NEWER
-            var burstResult = SnapshotDeltaBurstBackend.TryEncode(baseline,
-                baselineLayout, target, targetLayout, candidate,
-                out var burstLength, out operationCount);
-            if (burstResult == SnapshotDeltaBurstResult.Success)
-                return writer.TrySetLength(burstLength);
-            if (burstResult == SnapshotDeltaBurstResult.Failed)
-            {
-                operationCount = 0;
-                return false;
-            }
-#endif
+            // NCORE-13 replaced the delta wire format (compact varint/bitmask
+            // encoding below) but did not port SnapshotDeltaBurstBackend to it:
+            // that backend still only knows how to emit the pre-NCORE-13 layout
+            // (full entity/record headers, no skip/mask compaction). Calling it
+            // here would silently produce bytes the new TryReconstructCore cannot
+            // parse. Route every indexed encode through the portable path until a
+            // follow-up ports the Burst backend; see the NCORE-13 report for the
+            // CPU measurement (encode is ~3.5x/tick, dominated by bytes not CPU)
+            // that justifies deferring the port instead of blocking this change on
+            // it. SnapshotDeltaBurstBackend itself is left compiling and unused.
+            _ = candidate;
             return TryEncodeCoreIndexedPortable(baseline, baselineLayout, target,
                 targetLayout, ref writer, out operationCount);
         }
@@ -402,7 +442,8 @@ namespace UniGame.StaticEcs.Network
             out uint operationCount)
         {
             operationCount = 0;
-            if (!writer.TryWriteUint(checked((uint)target.EntityCount)) ||
+            if (!writer.TryWriteByte(DeltaFormatVersion) ||
+                !writer.TryWriteUint(checked((uint)target.EntityCount)) ||
                 !writer.TryWriteUint(checked((uint)target.RecordCount)))
                 return false;
             var countOffset = writer.Length;
@@ -419,6 +460,7 @@ namespace UniGame.StaticEcs.Network
             var targetIndex = 0;
             var hasBaseline = baselineIndex < baselineCount;
             var hasTarget = targetIndex < targetCount;
+            uint pendingSkip = 0;
 
             while (hasBaseline || hasTarget)
             {
@@ -427,10 +469,10 @@ namespace UniGame.StaticEcs.Network
                         targetEntities[targetIndex].Gid);
                 if (comparison < 0)
                 {
-                    if (!writer.TryWriteByte((byte)EntityOperation.Remove) ||
-                        !writer.TryWriteUlong(
-                            baselineEntities[baselineIndex].Gid))
+                    if (!TryWriteVarUInt(ref writer, pendingSkip) ||
+                        !writer.TryWriteByte((byte)EntityOperation.Remove))
                         return false;
+                    pendingSkip = 0;
                     operationCount++;
                     baselineIndex++;
                     hasBaseline = baselineIndex < baselineCount;
@@ -439,10 +481,12 @@ namespace UniGame.StaticEcs.Network
                 if (comparison > 0)
                 {
                     var added = targetEntities[targetIndex];
-                    if (!writer.TryWriteByte((byte)EntityOperation.Add) ||
+                    if (!TryWriteVarUInt(ref writer, pendingSkip) ||
+                        !writer.TryWriteByte((byte)EntityOperation.Add) ||
                         !writer.TryWrite(targetBytes.Slice(added.RawOffset,
                             added.RawLength)))
                         return false;
+                    pendingSkip = 0;
                     operationCount++;
                     targetIndex++;
                     hasTarget = targetIndex < targetCount;
@@ -452,11 +496,18 @@ namespace UniGame.StaticEcs.Network
                 if (!EntityRawEqual(baselineBytes, baselineEntities[baselineIndex],
                         targetBytes, targetEntities[targetIndex]))
                 {
+                    if (!TryWriteVarUInt(ref writer, pendingSkip))
+                        return false;
+                    pendingSkip = 0;
                     if (!TryWritePatchIndexed(baselineBytes, baselineLayout,
                             baselineIndex, targetBytes, targetLayout,
                             targetIndex, ref writer))
                         return false;
                     operationCount++;
+                }
+                else
+                {
+                    pendingSkip++;
                 }
                 baselineIndex++;
                 targetIndex++;
@@ -464,6 +515,9 @@ namespace UniGame.StaticEcs.Network
                 hasTarget = targetIndex < targetCount;
             }
 
+            // Any trailing unchanged baseline entities need no wire bytes at all:
+            // TryReconstructCore drains whatever is left on the baseline cursor
+            // once operationCount operations have been consumed.
             return writer.TryWriteUintAt(countOffset, operationCount);
         }
 
@@ -483,9 +537,126 @@ namespace UniGame.StaticEcs.Network
         {
             var baselineEntity = baselineLayout.Entities[baselineEntityIndex];
             var targetEntity = targetLayout.Entities[targetEntityIndex];
-            if (!writer.TryWriteByte((byte)EntityOperation.Patch) ||
-                !writer.TryWrite(targetBytes.Slice(targetEntity.RawOffset,
-                    EntityHeaderSize)))
+            if (RecordSequenceMatchesIndexed(baselineLayout, in baselineEntity,
+                    targetLayout, in targetEntity))
+                return writer.TryWriteByte((byte)EntityOperation.PatchFast) &&
+                       TryWritePatchFastIndexed(baselineBytes, baselineLayout,
+                           in baselineEntity, targetBytes, targetLayout,
+                           in targetEntity, ref writer);
+            return writer.TryWriteByte((byte)EntityOperation.PatchFull) &&
+                   TryWritePatchFullIndexed(baselineBytes, baselineLayout,
+                       in baselineEntity, targetBytes, targetLayout,
+                       in targetEntity, ref writer);
+        }
+
+        // True when every baseline record of this entity has an exact (kind,
+        // typeId) counterpart at the same position in the target: no record was
+        // added or removed, only payload bytes and/or disabled bits may differ.
+        // Callers may then use the compact positional PatchFast encoding.
+        private static bool RecordSequenceMatchesIndexed(
+            SnapshotLayoutView baselineLayout, in SnapshotEntityLayout baselineEntity,
+            SnapshotLayoutView targetLayout, in SnapshotEntityLayout targetEntity)
+        {
+            if (baselineEntity.RecordCount != targetEntity.RecordCount)
+                return false;
+            var baselineRecords = baselineLayout.Records;
+            var targetRecords = targetLayout.Records;
+            var bStart = baselineEntity.RecordStart;
+            var tStart = targetEntity.RecordStart;
+            for (var i = 0; i < baselineEntity.RecordCount; i++)
+            {
+                var b = baselineRecords[bStart + i];
+                var t = targetRecords[tStart + i];
+                if (b.Kind != t.Kind || b.TypeId != t.TypeId)
+                    return false;
+            }
+            return true;
+        }
+
+        private static bool TryWritePatchFastIndexed(
+            ReadOnlySpan<byte> baselineBytes, SnapshotLayoutView baselineLayout,
+            in SnapshotEntityLayout baselineEntity, ReadOnlySpan<byte> targetBytes,
+            SnapshotLayoutView targetLayout, in SnapshotEntityLayout targetEntity,
+            ref SnapshotWriter writer)
+        {
+            var count = baselineEntity.RecordCount;
+            var maskBytes = MaskByteCount(count);
+            Span<byte> maskBuffer = stackalloc byte[MaxMaskBytes];
+            var mask = maskBuffer.Slice(0, maskBytes);
+            mask.Clear();
+
+            var baselineDisabled =
+                baselineBytes[baselineEntity.RawOffset + EntityDisabledOffset];
+            var targetDisabled =
+                targetBytes[targetEntity.RawOffset + EntityDisabledOffset];
+            if (baselineDisabled != targetDisabled)
+            {
+                SetBit(mask, 0);
+                if (targetDisabled != 0)
+                    SetBit(mask, 1);
+            }
+
+            var baselineRecords = baselineLayout.Records;
+            var targetRecords = targetLayout.Records;
+            var bStart = baselineEntity.RecordStart;
+            var tStart = targetEntity.RecordStart;
+            for (var i = 0; i < count; i++)
+            {
+                var b = baselineRecords[bStart + i];
+                var t = targetRecords[tStart + i];
+                var bRaw = baselineBytes.Slice(b.RawOffset, b.RawLength);
+                var tRaw = targetBytes.Slice(t.RawOffset, t.RawLength);
+                if (bRaw.SequenceEqual(tRaw))
+                    continue;
+                var bit = 2 * (i + 1);
+                SetBit(mask, bit);
+                if (targetBytes[t.RawOffset + RecordDisabledOffset] != 0)
+                    SetBit(mask, bit + 1);
+            }
+
+            // A stackalloc'd mask cannot be passed to writer.TryWrite(ReadOnlySpan)
+            // here: `writer` is itself a ref struct received by ref, so its
+            // escape scope reaches the caller, wider than this stack buffer's.
+            // Byte-at-a-time writes sidestep that (each argument is a plain
+            // byte, not a span) without heap-allocating the mask.
+            for (var i = 0; i < maskBytes; i++)
+                if (!writer.TryWriteByte(mask[i]))
+                    return false;
+
+            for (var i = 0; i < count; i++)
+            {
+                if (!GetBit(mask, 2 * (i + 1)))
+                    continue;
+                var t = targetRecords[tStart + i];
+                var payloadLength = t.RawLength - RecordHeaderSize;
+                var payload = targetBytes.Slice(t.RawOffset + RecordHeaderSize,
+                    payloadLength);
+                if (!TryWriteVarUInt(ref writer, (uint)payloadLength) ||
+                    !writer.TryWrite(payload))
+                    return false;
+            }
+            return true;
+        }
+
+        private static bool TryWritePatchFullIndexed(
+            ReadOnlySpan<byte> baselineBytes, SnapshotLayoutView baselineLayout,
+            in SnapshotEntityLayout baselineEntity, ReadOnlySpan<byte> targetBytes,
+            SnapshotLayoutView targetLayout, in SnapshotEntityLayout targetEntity,
+            ref SnapshotWriter writer)
+        {
+            var baselineDisabled =
+                baselineBytes[baselineEntity.RawOffset + EntityDisabledOffset];
+            var targetDisabled =
+                targetBytes[targetEntity.RawOffset + EntityDisabledOffset];
+            byte entityFlags = 0;
+            if (baselineDisabled != targetDisabled)
+            {
+                entityFlags = 1;
+                if (targetDisabled != 0)
+                    entityFlags |= 2;
+            }
+            if (!writer.TryWriteByte(entityFlags) ||
+                !TryWriteVarUInt(ref writer, (uint)targetEntity.RecordCount))
                 return false;
             var countOffset = writer.Length;
             if (!writer.TryWriteUint(0))
@@ -494,13 +665,12 @@ namespace UniGame.StaticEcs.Network
             var baselineRecords = baselineLayout.Records;
             var targetRecords = targetLayout.Records;
             var baselineIndex = baselineEntity.RecordStart;
-            var baselineEnd = baselineEntity.RecordStart +
-                baselineEntity.RecordCount;
+            var baselineEnd = baselineIndex + baselineEntity.RecordCount;
             var targetIndex = targetEntity.RecordStart;
-            var targetEnd = targetEntity.RecordStart + targetEntity.RecordCount;
+            var targetEnd = targetIndex + targetEntity.RecordCount;
             var hasBaseline = baselineIndex < baselineEnd;
             var hasTarget = targetIndex < targetEnd;
-            uint operationCount = 0;
+            uint operations = 0;
 
             while (hasBaseline || hasTarget)
             {
@@ -516,7 +686,7 @@ namespace UniGame.StaticEcs.Network
                         !writer.TryWriteUint(removed.TypeId) ||
                         !writer.TryWriteByte(removed.Kind))
                         return false;
-                    operationCount++;
+                    operations++;
                     baselineIndex++;
                     hasBaseline = baselineIndex < baselineEnd;
                     continue;
@@ -528,7 +698,7 @@ namespace UniGame.StaticEcs.Network
                         !writer.TryWrite(targetBytes.Slice(added.RawOffset,
                             added.RawLength)))
                         return false;
-                    operationCount++;
+                    operations++;
                     targetIndex++;
                     hasTarget = targetIndex < targetEnd;
                     continue;
@@ -545,7 +715,7 @@ namespace UniGame.StaticEcs.Network
                     if (!writer.TryWriteByte((byte)RecordOperation.Replace) ||
                         !writer.TryWrite(right))
                         return false;
-                    operationCount++;
+                    operations++;
                 }
                 baselineIndex++;
                 targetIndex++;
@@ -553,7 +723,7 @@ namespace UniGame.StaticEcs.Network
                 hasTarget = targetIndex < targetEnd;
             }
 
-            return writer.TryWriteUintAt(countOffset, operationCount);
+            return writer.TryWriteUintAt(countOffset, operations);
         }
 
         private static bool TryEncodeCore(NetworkSnapshot baseline,
@@ -563,6 +733,7 @@ namespace UniGame.StaticEcs.Network
             operationCount = 0;
             if (!TryOpenSnapshot(baseline, out var baselineCursor) ||
                 !TryOpenSnapshot(target, out var targetCursor) ||
+                !writer.TryWriteByte(DeltaFormatVersion) ||
                 !writer.TryWriteUint(checked((uint)target.EntityCount)) ||
                 !writer.TryWriteUint(checked((uint)target.RecordCount)))
                 return false;
@@ -576,15 +747,17 @@ namespace UniGame.StaticEcs.Network
                     out var hasTarget))
                 return false;
 
+            uint pendingSkip = 0;
             while (hasBaseline || hasTarget)
             {
                 var comparison = !hasBaseline ? 1 : !hasTarget ? -1 :
                     CompareGid(baselineEntity.Gid, targetEntity.Gid);
                 if (comparison < 0)
                 {
-                    if (!writer.TryWriteByte((byte)EntityOperation.Remove) ||
-                        !writer.TryWriteUlong(baselineEntity.Gid))
+                    if (!TryWriteVarUInt(ref writer, pendingSkip) ||
+                        !writer.TryWriteByte((byte)EntityOperation.Remove))
                         return false;
+                    pendingSkip = 0;
                     operationCount++;
                     if (!TryMoveNext(ref baselineCursor, out baselineEntity,
                             out hasBaseline))
@@ -593,9 +766,11 @@ namespace UniGame.StaticEcs.Network
                 }
                 if (comparison > 0)
                 {
-                    if (!writer.TryWriteByte((byte)EntityOperation.Add) ||
+                    if (!TryWriteVarUInt(ref writer, pendingSkip) ||
+                        !writer.TryWriteByte((byte)EntityOperation.Add) ||
                         !writer.TryWrite(targetEntity.Raw))
                         return false;
+                    pendingSkip = 0;
                     operationCount++;
                     if (!TryMoveNext(ref targetCursor, out targetEntity,
                             out hasTarget))
@@ -605,10 +780,18 @@ namespace UniGame.StaticEcs.Network
 
                 if (!baselineEntity.Raw.SequenceEqual(targetEntity.Raw))
                 {
-                    if (!TryWritePatch(in baselineEntity, in targetEntity,
+                    if (!TryWriteVarUInt(ref writer, pendingSkip))
+                        return false;
+                    pendingSkip = 0;
+                    if (!writer.TryWriteByte((byte)EntityOperation.PatchFull) ||
+                        !TryWritePatch(in baselineEntity, in targetEntity,
                             ref writer))
                         return false;
                     operationCount++;
+                }
+                else
+                {
+                    pendingSkip++;
                 }
                 if (!TryMoveNext(ref baselineCursor, out baselineEntity,
                         out hasBaseline) ||
@@ -621,11 +804,23 @@ namespace UniGame.StaticEcs.Network
                    writer.TryWriteUintAt(countOffset, operationCount);
         }
 
+        // Streaming (non-indexed) patch fallback: always uses the self-describing
+        // PatchFull record encoding. This path only runs when a snapshot's layout
+        // index cannot be built or cached (pathologically large snapshots or pool
+        // exhaustion); it favors simplicity/correctness over the compaction the
+        // indexed path gives the hot path.
         private static bool TryWritePatch(in CanonicalEntity baseline,
             in CanonicalEntity target, ref SnapshotWriter writer)
         {
-            if (!writer.TryWriteByte((byte)EntityOperation.Patch) ||
-                !writer.TryWrite(target.Header))
+            byte entityFlags = 0;
+            if (baseline.Disabled != target.Disabled)
+            {
+                entityFlags = 1;
+                if (target.Disabled != 0)
+                    entityFlags |= 2;
+            }
+            if (!writer.TryWriteByte(entityFlags) ||
+                !TryWriteVarUInt(ref writer, target.RecordCount))
                 return false;
             var countOffset = writer.Length;
             if (!writer.TryWriteUint(0))
@@ -693,121 +888,301 @@ namespace UniGame.StaticEcs.Network
             entityCount = 0;
             recordCount = 0;
             if (!TryOpenSnapshot(baseline, out var baselineCursor) ||
-                !TryOpenDelta(delta, out var targetEntities, out var targetRecords,
-                    out var operationCursor) ||
-                !writer.TryWriteUint(targetEntities) ||
-                !TryMoveNext(ref baselineCursor, out var baselineEntity,
-                    out var hasBaseline) ||
-                !TryMoveNext(ref operationCursor, out var operation,
-                    out var hasOperation))
+                !TryReadDeltaHeader(delta, out var offset, out var targetEntities,
+                    out var targetRecords, out var operationCount) ||
+                !writer.TryWriteUint(targetEntities))
                 return false;
 
-            while (hasBaseline || hasOperation)
+            for (var opIndex = 0u; opIndex < operationCount; opIndex++)
             {
-                var comparison = !hasBaseline ? 1 : !hasOperation ? -1 :
-                    CompareGid(baselineEntity.Gid, operation.Gid);
-                if (comparison < 0)
-                {
-                    if (!writer.TryWrite(baselineEntity.Raw) ||
-                        !TryAdd(ref entityCount, 1) ||
-                        !TryAdd(ref recordCount, baselineEntity.RecordCount) ||
-                        !TryMoveNext(ref baselineCursor, out baselineEntity,
-                            out hasBaseline))
-                        return false;
-                    continue;
-                }
-                if (comparison > 0)
-                {
-                    if (operation.Kind != EntityOperation.Add ||
-                        !writer.TryWrite(operation.Added.Raw) ||
-                        !TryAdd(ref entityCount, 1) ||
-                        !TryAdd(ref recordCount, operation.Added.RecordCount) ||
-                        !TryMoveNext(ref operationCursor, out operation,
-                            out hasOperation))
-                        return false;
-                    continue;
-                }
-
-                if (operation.Kind == EntityOperation.Add)
+                if (!TryReadVarUInt(delta, ref offset, out var skip))
                     return false;
-                if (operation.Kind == EntityOperation.Patch)
+                for (var i = 0u; i < skip; i++)
                 {
-                    if (!TryReconstructPatch(in baselineEntity, in operation,
+                    if (!TryMoveNext(ref baselineCursor, out var carried,
+                            out var hasCarried) || !hasCarried ||
+                        !writer.TryWrite(carried.Raw) ||
+                        !TryAdd(ref entityCount, 1) ||
+                        !TryAdd(ref recordCount, carried.RecordCount))
+                        return false;
+                }
+                if (!TryReadByte(delta, ref offset, out var rawOpcode))
+                    return false;
+                var opcode = (EntityOperation)rawOpcode;
+                if (opcode == EntityOperation.Remove)
+                {
+                    if (!TryMoveNext(ref baselineCursor, out _, out var hasValue) ||
+                        !hasValue)
+                        return false;
+                }
+                else if (opcode == EntityOperation.Add)
+                {
+                    if (!TryReadCanonicalEntity(delta, ref offset, out var added) ||
+                        !writer.TryWrite(added.Raw) ||
+                        !TryAdd(ref entityCount, 1) ||
+                        !TryAdd(ref recordCount, added.RecordCount))
+                        return false;
+                }
+                else if (opcode == EntityOperation.PatchFast)
+                {
+                    if (!TryMoveNext(ref baselineCursor, out var current,
+                            out var hasValue) || !hasValue ||
+                        !TryReconstructPatchFast(in current, delta, ref offset,
                             ref writer, out var patchedRecords) ||
                         !TryAdd(ref entityCount, 1) ||
                         !TryAdd(ref recordCount, patchedRecords))
                         return false;
                 }
-                if (!TryMoveNext(ref baselineCursor, out baselineEntity,
-                        out hasBaseline) ||
-                    !TryMoveNext(ref operationCursor, out operation,
-                        out hasOperation))
+                else if (opcode == EntityOperation.PatchFull)
+                {
+                    if (!TryMoveNext(ref baselineCursor, out var current,
+                            out var hasValue) || !hasValue ||
+                        !TryReconstructPatchFull(in current, delta, ref offset,
+                            ref writer, out var patchedRecords) ||
+                        !TryAdd(ref entityCount, 1) ||
+                        !TryAdd(ref recordCount, patchedRecords))
+                        return false;
+                }
+                else
+                {
+                    return false;
+                }
+            }
+
+            // Drain any remaining baseline entities: they carry no wire bytes.
+            while (baselineCursor.Remaining > 0)
+            {
+                if (!TryMoveNext(ref baselineCursor, out var carried,
+                        out var hasCarried) || !hasCarried ||
+                    !writer.TryWrite(carried.Raw) ||
+                    !TryAdd(ref entityCount, 1) ||
+                    !TryAdd(ref recordCount, carried.RecordCount))
                     return false;
             }
 
-            return baselineCursor.Complete && operationCursor.Complete &&
+            return baselineCursor.Complete && offset == delta.Length &&
                    entityCount == targetEntities && recordCount == targetRecords;
         }
 
-        private static bool TryReconstructPatch(in CanonicalEntity baseline,
-            in EntityDelta operation, ref SnapshotWriter writer,
+        private static bool TryReconstructPatchFast(in CanonicalEntity baseline,
+            ReadOnlySpan<byte> delta, ref int offset, ref SnapshotWriter writer,
             out int recordCount)
         {
             recordCount = 0;
-            if (!writer.TryWrite(operation.Header))
+            var count = baseline.RecordCount;
+            var maskBytes = MaskByteCount(count);
+            if (offset < 0 || maskBytes > delta.Length - offset)
                 return false;
-            var baselineCursor = new RecordCursor(baseline.Records,
-                baseline.RecordCount);
-            var operationCursor = new RecordDeltaCursor(operation.RecordOperations,
-                operation.RecordOperationCount);
-            if (!TryMoveNext(ref baselineCursor, out var baselineRecord,
-                    out var hasBaseline) ||
-                !TryMoveNext(ref operationCursor, out var recordOperation,
-                    out var hasOperation))
+            var mask = delta.Slice(offset, maskBytes);
+            offset += maskBytes;
+            if (HasStrayBits(mask, 2 * (count + 1)))
                 return false;
 
-            while (hasBaseline || hasOperation)
+            var disabled = GetBit(mask, 0)
+                ? GetBit(mask, 1) ? (byte)1 : (byte)0
+                : baseline.Disabled;
+            if (!writer.TryWriteUlong(baseline.Gid) ||
+                !writer.TryWriteUint(baseline.Kind) ||
+                !writer.TryWriteByte(disabled) ||
+                !writer.TryWriteUshort(baseline.RecordCount))
+                return false;
+
+            var baselineRecords = new RecordCursor(baseline.Records, count);
+            for (var i = 0; i < count; i++)
             {
-                var comparison = !hasBaseline ? 1 : !hasOperation ? -1 :
+                if (!TryMoveNext(ref baselineRecords, out var record,
+                        out var hasRecord) || !hasRecord)
+                    return false;
+                var bit = 2 * (i + 1);
+                if (!GetBit(mask, bit))
+                {
+                    if (!writer.TryWrite(record.Raw))
+                        return false;
+                }
+                else
+                {
+                    var newDisabled = GetBit(mask, bit + 1) ? (byte)1 : (byte)0;
+                    var version = record.Raw[RecordDisabledOffset - 1];
+                    if (!TryReadVarUInt(delta, ref offset, out var length) ||
+                        length > ProtocolLimits.MaxComponentBytes ||
+                        length > (uint)(delta.Length - offset))
+                        return false;
+                    if (!writer.TryWriteUint(record.TypeId) ||
+                        !writer.TryWriteByte(record.Kind) ||
+                        !writer.TryWriteByte(version) ||
+                        !writer.TryWriteByte(newDisabled) ||
+                        !writer.TryWriteUint(length) ||
+                        !writer.TryWrite(delta.Slice(offset,
+                            checked((int)length))))
+                        return false;
+                    offset += checked((int)length);
+                }
+                recordCount++;
+            }
+            if (!baselineRecords.Complete)
+                return false;
+            return true;
+        }
+
+        private static bool TryReconstructPatchFull(in CanonicalEntity baseline,
+            ReadOnlySpan<byte> delta, ref int offset, ref SnapshotWriter writer,
+            out int recordCount)
+        {
+            recordCount = 0;
+            if (!TryReadByte(delta, ref offset, out var entityFlags) ||
+                (entityFlags & ~0x3) != 0)
+                return false;
+            var disabledChanged = (entityFlags & 1) != 0;
+            var newDisabled = (byte)((entityFlags >> 1) & 1);
+            if (!TryReadVarUInt(delta, ref offset, out var targetRecordCount) ||
+                targetRecordCount > (uint)ProtocolLimits.MaxRecordsPerEntity ||
+                !TryReadUint(delta, ref offset, out var recordOpCount) ||
+                recordOpCount > (uint)ProtocolLimits.MaxRecordsPerEntity * 2u)
+                return false;
+
+            var disabled = disabledChanged ? newDisabled : baseline.Disabled;
+            if (!writer.TryWriteUlong(baseline.Gid) ||
+                !writer.TryWriteUint(baseline.Kind) ||
+                !writer.TryWriteByte(disabled) ||
+                !writer.TryWriteUshort(checked((ushort)targetRecordCount)))
+                return false;
+
+            var baselineRecords = new RecordCursor(baseline.Records,
+                baseline.RecordCount);
+            if (offset < 0 || offset > delta.Length)
+                return false;
+            var opCursor = new RecordDeltaCursor(delta.Slice(offset),
+                checked((int)recordOpCount));
+            if (!TryMoveNext(ref baselineRecords, out var baselineRecord,
+                    out var hasBaseline) ||
+                !TryMoveNext(ref opCursor, out var recordOp, out var hasOp))
+                return false;
+            while (hasBaseline || hasOp)
+            {
+                var comparison = !hasBaseline ? 1 : !hasOp ? -1 :
                     CompareRecord(baselineRecord.Kind, baselineRecord.TypeId,
-                        recordOperation.Kind, recordOperation.TypeId);
+                        recordOp.Kind, recordOp.TypeId);
                 if (comparison < 0)
                 {
                     if (!writer.TryWrite(baselineRecord.Raw) ||
                         !TryAdd(ref recordCount, 1) ||
-                        !TryMoveNext(ref baselineCursor, out baselineRecord,
+                        !TryMoveNext(ref baselineRecords, out baselineRecord,
                             out hasBaseline))
                         return false;
                     continue;
                 }
                 if (comparison > 0)
                 {
-                    if (recordOperation.Operation != RecordOperation.Add ||
-                        !writer.TryWrite(recordOperation.Raw) ||
+                    if (recordOp.Operation != RecordOperation.Add ||
+                        !writer.TryWrite(recordOp.Raw) ||
                         !TryAdd(ref recordCount, 1) ||
-                        !TryMoveNext(ref operationCursor, out recordOperation,
-                            out hasOperation))
+                        !TryMoveNext(ref opCursor, out recordOp, out hasOp))
                         return false;
                     continue;
                 }
 
-                if (recordOperation.Operation == RecordOperation.Add)
+                if (recordOp.Operation == RecordOperation.Add)
                     return false;
-                if (recordOperation.Operation == RecordOperation.Replace)
+                if (recordOp.Operation == RecordOperation.Replace)
                 {
-                    if (!writer.TryWrite(recordOperation.Raw) ||
+                    if (!writer.TryWrite(recordOp.Raw) ||
                         !TryAdd(ref recordCount, 1))
                         return false;
                 }
-                if (!TryMoveNext(ref baselineCursor, out baselineRecord,
+                if (!TryMoveNext(ref baselineRecords, out baselineRecord,
                         out hasBaseline) ||
-                    !TryMoveNext(ref operationCursor, out recordOperation,
-                        out hasOperation))
+                    !TryMoveNext(ref opCursor, out recordOp, out hasOp))
                     return false;
             }
+            if (!baselineRecords.Complete || recordCount != targetRecordCount)
+                return false;
+            offset += opCursor.Consumed;
+            return true;
+        }
 
-            return baselineCursor.Complete && operationCursor.Complete &&
-                   recordCount == operation.RecordCount;
+        private static bool TryReadDeltaHeader(ReadOnlySpan<byte> bytes,
+            out int offset, out uint entityCount, out uint recordCount,
+            out uint operationCount)
+        {
+            offset = 0;
+            entityCount = 0;
+            recordCount = 0;
+            operationCount = 0;
+            if (bytes.Length < DeltaHeaderSize ||
+                !TryReadByte(bytes, ref offset, out var formatVersion) ||
+                formatVersion != DeltaFormatVersion ||
+                !TryReadUint(bytes, ref offset, out entityCount) ||
+                !TryReadUint(bytes, ref offset, out recordCount) ||
+                !TryReadUint(bytes, ref offset, out operationCount) ||
+                entityCount > (uint)ProtocolLimits.MaxEntities ||
+                recordCount > (uint)(ProtocolLimits.MaxEntities *
+                    ProtocolLimits.MaxRecordsPerEntity) ||
+                operationCount > (uint)ProtocolLimits.MaxEntities * 2u)
+            {
+                offset = 0;
+                return false;
+            }
+            return true;
+        }
+
+        private static int MaskByteCount(int recordCount) =>
+            (2 * (recordCount + 1) + 7) / 8;
+
+        private static bool GetBit(ReadOnlySpan<byte> mask, int bitIndex) =>
+            (mask[bitIndex >> 3] & (1 << (bitIndex & 7))) != 0;
+
+        private static void SetBit(Span<byte> mask, int bitIndex) =>
+            mask[bitIndex >> 3] |= (byte)(1 << (bitIndex & 7));
+
+        // Rejects a mask whose bits beyond the last meaningful item are non-zero:
+        // the encoder always emits zero padding, so any set stray bit means the
+        // delta was corrupted or hand-crafted.
+        private static bool HasStrayBits(ReadOnlySpan<byte> mask, int usedBits)
+        {
+            var totalBits = mask.Length * 8;
+            for (var bit = usedBits; bit < totalBits; bit++)
+                if (GetBit(mask, bit))
+                    return true;
+            return false;
+        }
+
+        private static bool TryWriteVarUInt(ref SnapshotWriter writer, uint value)
+        {
+            do
+            {
+                var chunk = (byte)(value & 0x7F);
+                value >>= 7;
+                if (value != 0)
+                    chunk |= 0x80;
+                if (!writer.TryWriteByte(chunk))
+                    return false;
+            } while (value != 0);
+            return true;
+        }
+
+        private static bool TryReadVarUInt(ReadOnlySpan<byte> bytes,
+            ref int offset, out uint value)
+        {
+            value = 0;
+            var shift = 0;
+            while (true)
+            {
+                if (shift >= 35 || !TryReadByte(bytes, ref offset, out var b))
+                {
+                    value = 0;
+                    return false;
+                }
+                var chunk = (uint)(b & 0x7F);
+                if (shift == 28 && chunk > 0xFu)
+                {
+                    value = 0;
+                    return false;
+                }
+                value |= chunk << shift;
+                if ((b & 0x80) == 0)
+                    return true;
+                shift += 7;
+            }
         }
 
         private static bool TryOpenSnapshot(NetworkSnapshot snapshot,
@@ -829,31 +1204,6 @@ namespace UniGame.StaticEcs.Network
                 return false;
             cursor = new CanonicalCursor(bytes, offset, snapshot.EntityCount,
                 snapshot.RecordCount);
-            return true;
-        }
-
-        private static bool TryOpenDelta(ReadOnlySpan<byte> bytes,
-            out uint entityCount, out uint recordCount,
-            out EntityDeltaCursor cursor)
-        {
-            entityCount = 0;
-            recordCount = 0;
-            cursor = default;
-            var offset = 0;
-            if (bytes.Length < DeltaHeaderSize ||
-                !TryReadUint(bytes, ref offset, out entityCount) ||
-                !TryReadUint(bytes, ref offset, out recordCount) ||
-                !TryReadUint(bytes, ref offset, out var operationCount) ||
-                entityCount > (uint)ProtocolLimits.MaxEntities ||
-                recordCount > (uint)(ProtocolLimits.MaxEntities *
-                    ProtocolLimits.MaxRecordsPerEntity) ||
-                operationCount > (uint)ProtocolLimits.MaxEntities * 2u)
-            {
-                return false;
-            }
-
-            cursor = new EntityDeltaCursor(bytes, offset,
-                checked((int)operationCount));
             return true;
         }
 
@@ -937,14 +1287,6 @@ namespace UniGame.StaticEcs.Network
 
         private static bool TryMoveNext(ref RecordCursor cursor,
             out CanonicalRecord value, out bool hasValue)
-        {
-            value = default;
-            hasValue = cursor.Remaining > 0;
-            return !hasValue || cursor.TryRead(out value);
-        }
-
-        private static bool TryMoveNext(ref EntityDeltaCursor cursor,
-            out EntityDelta value, out bool hasValue)
         {
             value = default;
             hasValue = cursor.Remaining > 0;
@@ -1075,6 +1417,15 @@ namespace UniGame.StaticEcs.Network
                 return true;
             }
 
+            internal bool TryWriteUshort(ushort value)
+            {
+                if (!TryReserve(sizeof(ushort), out var offset))
+                    return false;
+                if (!_measure)
+                    Hashing.Write16(_destination, offset, value);
+                return true;
+            }
+
             internal bool TryWriteUint(uint value)
             {
                 if (!TryReserve(sizeof(uint), out var offset))
@@ -1189,80 +1540,6 @@ namespace UniGame.StaticEcs.Network
             }
         }
 
-        private ref struct EntityDeltaCursor
-        {
-            private readonly ReadOnlySpan<byte> _bytes;
-            private int _offset;
-            private ulong _previousGid;
-            private bool _hasPrevious;
-
-            internal EntityDeltaCursor(ReadOnlySpan<byte> bytes, int offset,
-                int count)
-            {
-                _bytes = bytes;
-                _offset = offset;
-                Remaining = count;
-                _previousGid = 0;
-                _hasPrevious = false;
-            }
-
-            internal int Remaining { get; private set; }
-            internal bool Complete => Remaining == 0 && _offset == _bytes.Length;
-
-            internal bool TryRead(out EntityDelta operation)
-            {
-                operation = default;
-                if (Remaining <= 0 || !TryReadByte(_bytes, ref _offset,
-                        out var rawOperation))
-                    return false;
-                var kind = (EntityOperation)rawOperation;
-                ulong gid;
-                if (kind == EntityOperation.Add)
-                {
-                    if (!TryReadCanonicalEntity(_bytes, ref _offset,
-                            out var added))
-                        return false;
-                    gid = added.Gid;
-                    operation = EntityDelta.Add(in added);
-                }
-                else if (kind == EntityOperation.Remove)
-                {
-                    if (!TryReadUlong(_bytes, ref _offset, out gid) ||
-                        new EntityGID(gid).Version == 0)
-                        return false;
-                    operation = EntityDelta.Remove(gid);
-                }
-                else if (kind == EntityOperation.Patch)
-                {
-                    if (!TryReadEntityHeader(_bytes, ref _offset, out gid,
-                            out _, out _, out var recordCount, out var header) ||
-                        !TryReadUint(_bytes, ref _offset, out var rawCount) ||
-                        rawCount > ProtocolLimits.MaxRecordsPerEntity * 2u)
-                        return false;
-                    var count = checked((int)rawCount);
-                    var operationStart = _offset;
-                    var records = new RecordDeltaCursor(
-                        _bytes.Slice(operationStart), count);
-                    while (records.Remaining > 0)
-                        if (!records.TryRead(out _))
-                            return false;
-                    _offset += records.Consumed;
-                    operation = EntityDelta.Patch(gid, recordCount, header,
-                        _bytes.Slice(operationStart, records.Consumed), count);
-                }
-                else
-                {
-                    return false;
-                }
-                if (_hasPrevious && CompareGid(_previousGid, gid) >= 0)
-                    return false;
-                _previousGid = gid;
-                _hasPrevious = true;
-                Remaining--;
-                return true;
-            }
-        }
-
         private ref struct RecordDeltaCursor
         {
             private readonly ReadOnlySpan<byte> _bytes;
@@ -1367,51 +1644,6 @@ namespace UniGame.StaticEcs.Network
             internal uint TypeId { get; }
             internal byte Kind { get; }
             internal ReadOnlySpan<byte> Raw { get; }
-        }
-
-        private readonly ref struct EntityDelta
-        {
-            private EntityDelta(EntityOperation kind, ulong gid,
-                in CanonicalEntity added, ushort recordCount,
-                ReadOnlySpan<byte> header, ReadOnlySpan<byte> recordOperations,
-                int recordOperationCount)
-            {
-                Kind = kind;
-                Gid = gid;
-                Added = added;
-                RecordCount = recordCount;
-                Header = header;
-                RecordOperations = recordOperations;
-                RecordOperationCount = recordOperationCount;
-            }
-
-            internal EntityOperation Kind { get; }
-            internal ulong Gid { get; }
-            internal CanonicalEntity Added { get; }
-            internal ushort RecordCount { get; }
-            internal ReadOnlySpan<byte> Header { get; }
-            internal ReadOnlySpan<byte> RecordOperations { get; }
-            internal int RecordOperationCount { get; }
-
-            internal static EntityDelta Add(in CanonicalEntity entity) =>
-                new EntityDelta(EntityOperation.Add, entity.Gid, in entity, 0,
-                    default, default, 0);
-
-            internal static EntityDelta Remove(ulong gid)
-            {
-                var entity = default(CanonicalEntity);
-                return new EntityDelta(EntityOperation.Remove, gid, in entity, 0,
-                    default, default, 0);
-            }
-
-            internal static EntityDelta Patch(ulong gid, ushort recordCount,
-                ReadOnlySpan<byte> header, ReadOnlySpan<byte> operations,
-                int operationCount)
-            {
-                var entity = default(CanonicalEntity);
-                return new EntityDelta(EntityOperation.Patch, gid, in entity,
-                    recordCount, header, operations, operationCount);
-            }
         }
 
         private readonly ref struct RecordDelta
