@@ -6,10 +6,45 @@ using FFS.Libraries.StaticEcs;
 
 namespace UniGame.StaticEcs.Network
 {
+    /// <summary>Selects when the server may offer the next snapshot batch to a peer.</summary>
+    public enum NetworkSnapshotAdmissionMode : byte
+    {
+        /// <summary>Uses transport-reported pending reliable work.</summary>
+        Current,
+
+        /// <summary>Waits for the exact application ACK of each fully accepted batch.</summary>
+        ApplicationAck,
+    }
+
+    /// <summary>Copies bounded cumulative counters for the snapshot admission policy.</summary>
+    public readonly struct NetworkSnapshotAdmissionDiagnostics
+    {
+        public NetworkSnapshotAdmissionDiagnostics(
+            NetworkSnapshotAdmissionMode mode, long suppressedSnapshots,
+            long acknowledgementGaps, long recoveryAttempts,
+            long recoveryBatchesAccepted, long partialBatchFailures)
+        {
+            Mode = mode;
+            SuppressedSnapshots = suppressedSnapshots;
+            AcknowledgementGaps = acknowledgementGaps;
+            RecoveryAttempts = recoveryAttempts;
+            RecoveryBatchesAccepted = recoveryBatchesAccepted;
+            PartialBatchFailures = partialBatchFailures;
+        }
+
+        public NetworkSnapshotAdmissionMode Mode { get; }
+        public long SuppressedSnapshots { get; }
+        public long AcknowledgementGaps { get; }
+        public long RecoveryAttempts { get; }
+        public long RecoveryBatchesAccepted { get; }
+        public long PartialBatchFailures { get; }
+    }
+
     /// <summary>Runs framed receive, decode, command dispatch, capture, and send for isolated server connections.</summary>
     public sealed class NetworkServer<TWorld> : IDisposable
         where TWorld : struct, IWorldType
     {
+        private const uint ApplicationAckRecoveryRetryTicks = 10;
         private readonly NetworkSchema<TWorld> _schema;
         private readonly NetworkServerCoordinator<TWorld> _coordinator;
         private readonly NetworkReplicator<TWorld> _replicator;
@@ -32,11 +67,23 @@ namespace UniGame.StaticEcs.Network
         private int _activeConnectionCount;
         private int _activePeerCount;
         private bool _disposed;
+        private readonly NetworkSnapshotAdmissionMode _snapshotAdmissionMode;
+        private long _suppressedSnapshots;
+        private long _acknowledgementGaps;
+        private long _recoveryAttempts;
+        private long _recoveryBatchesAccepted;
+        private long _partialBatchFailures;
 
         /// <summary>Gets the latest authoritative tick completed by this server.</summary>
         public uint ServerTick { get; private set; }
 
         public int ConnectionCount => _peers.Count;
+
+        /// <summary>Copies cumulative counters for the configured admission mode.</summary>
+        public NetworkSnapshotAdmissionDiagnostics CaptureSnapshotAdmissionDiagnostics() =>
+            new NetworkSnapshotAdmissionDiagnostics(_snapshotAdmissionMode,
+                _suppressedSnapshots, _acknowledgementGaps, _recoveryAttempts,
+                _recoveryBatchesAccepted, _partialBatchFailures);
 
         public NetworkBufferPoolDiagnostics CaptureBufferDiagnostics() =>
             _bufferPool.CaptureDiagnostics();
@@ -67,10 +114,13 @@ namespace UniGame.StaticEcs.Network
         /// Leaving this null keeps capture behavior and cost byte-for-byte identical to before this
         /// parameter existed.
         /// </param>
-        public NetworkServer(NetworkSchema<TWorld> schema, NetworkScopeSelector<TWorld> scopeSelector, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024, INetworkObserver observer = null, INetworkPeerObserver peerObserver = null, INetworkPeerAdmissionPolicy admissionPolicy = null, ulong simulationFingerprint = 0, ulong contentFingerprint = 0, NetworkBufferPool bufferPool = null, INetworkScopeProvider<TWorld> scopeProvider = null, INetworkUpdatePolicy<TWorld> updatePolicy = null)
+        public NetworkServer(NetworkSchema<TWorld> schema, NetworkScopeSelector<TWorld> scopeSelector, int historyTicks = 64, long historyBytes = 32 * 1024 * 1024, INetworkObserver observer = null, INetworkPeerObserver peerObserver = null, INetworkPeerAdmissionPolicy admissionPolicy = null, ulong simulationFingerprint = 0, ulong contentFingerprint = 0, NetworkBufferPool bufferPool = null, INetworkScopeProvider<TWorld> scopeProvider = null, INetworkUpdatePolicy<TWorld> updatePolicy = null, NetworkSnapshotAdmissionMode snapshotAdmissionMode = NetworkSnapshotAdmissionMode.Current)
         {
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
             if (scopeSelector == null) throw new ArgumentNullException(nameof(scopeSelector));
+            if (snapshotAdmissionMode != NetworkSnapshotAdmissionMode.Current &&
+                snapshotAdmissionMode != NetworkSnapshotAdmissionMode.ApplicationAck)
+                throw new ArgumentOutOfRangeException(nameof(snapshotAdmissionMode));
             _bufferPool = bufferPool ??
                 new NetworkBufferPool(NetworkBufferPool.DefaultServerRetainedBytes);
             _ownsBufferPool = bufferPool == null;
@@ -83,6 +133,7 @@ namespace UniGame.StaticEcs.Network
             _scopeProvider = scopeProvider;
             _simulationFingerprint = simulationFingerprint;
             _contentFingerprint = contentFingerprint;
+            _snapshotAdmissionMode = snapshotAdmissionMode;
         }
 
         public void Dispose()
@@ -229,6 +280,9 @@ namespace UniGame.StaticEcs.Network
                             scope != peer.Scope)
                         {
                             peer.SetScope(scope);
+                            if (_snapshotAdmissionMode ==
+                                NetworkSnapshotAdmissionMode.ApplicationAck)
+                                peer.ResetSnapshotAdmissionState();
                             peer.ResyncRequested = true;
                         }
                     }
@@ -248,9 +302,7 @@ namespace UniGame.StaticEcs.Network
                     // whose delivery callback and fragments are still pending.
                     // This keeps ordered delivery bounded without changing the
                     // snapshot baseline or transaction guarantees.
-                    if (peer.LastSnapshotSentTick != 0 &&
-                        peer.Transport is INetworkReliableSendState reliableState &&
-                        reliableState.HasPendingReliablePackets)
+                    if (ShouldDeferSnapshot(peer, serverTick))
                         continue;
                     using var snapshotScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.Snapshot);
                     if (!_captures.TryGetValue(peer.Scope, out var capture))
@@ -497,7 +549,22 @@ namespace UniGame.StaticEcs.Network
                 resyncCorrelationId = request.CorrelationId;
                 var startsRecovery = !peer.ResyncRequested;
                 peer.ResyncRequested = true;
-                if (peer.ResyncCorrelationId == 0)
+                if (_snapshotAdmissionMode ==
+                    NetworkSnapshotAdmissionMode.ApplicationAck)
+                {
+                    // A new explicit request supersedes a recovery batch the
+                    // client could not apply. Keep its tick inert so a delayed
+                    // ACK cannot release the replacement batch.
+                    if (peer.RecoveryOutstandingTick != 0)
+                    {
+                        peer.SupersededSnapshotTick =
+                            peer.RecoveryOutstandingTick;
+                        peer.RecoveryOutstandingTick = 0;
+                    }
+                    peer.ResyncCorrelationId = request.CorrelationId;
+                    peer.ResyncSnapshotTick = 0;
+                }
+                else if (peer.ResyncCorrelationId == 0)
                 {
                     peer.ResyncCorrelationId = request.CorrelationId;
                     if (startsRecovery)
@@ -748,6 +815,12 @@ namespace UniGame.StaticEcs.Network
 
         private void DecodeAcknowledgement(Peer peer, uint acknowledgedTick)
         {
+            if (_snapshotAdmissionMode ==
+                NetworkSnapshotAdmissionMode.ApplicationAck)
+            {
+                DecodeApplicationAcknowledgement(peer, acknowledgedTick);
+                return;
+            }
             if (acknowledgedTick <= peer.AcknowledgedSnapshotTick)
                 return;
             if (acknowledgedTick > ServerTick ||
@@ -769,8 +842,111 @@ namespace UniGame.StaticEcs.Network
             peer.ResyncSnapshotTick = 0;
         }
 
+        private void DecodeApplicationAcknowledgement(Peer peer,
+            uint acknowledgedTick)
+        {
+            if (acknowledgedTick <= peer.AcknowledgedSnapshotTick)
+                return;
+
+            var acknowledgesRecovery = peer.RecoveryOutstandingTick != 0 &&
+                acknowledgedTick == peer.RecoveryOutstandingTick;
+            var acknowledgesNormal = peer.ApplicationAckOutstandingTick != 0 &&
+                acknowledgedTick == peer.ApplicationAckOutstandingTick;
+            if (!acknowledgesRecovery && !acknowledgesNormal)
+            {
+                if (acknowledgedTick == peer.SupersededSnapshotTick)
+                    return;
+                RecordAcknowledgementGap(peer);
+                return;
+            }
+
+            if (acknowledgedTick > ServerTick ||
+                !_coordinator.TryGetCapture(peer.Scope, acknowledgedTick,
+                    out var baseline) ||
+                baseline.Scope != peer.Scope ||
+                baseline.SchemaFingerprint != _schema.Fingerprint)
+            {
+                RecordAcknowledgementGap(peer);
+                peer.ApplicationAckOutstandingTick = 0;
+                peer.RecoveryOutstandingTick = 0;
+                peer.SupersededSnapshotTick = 0;
+                peer.ResyncSnapshotTick = 0;
+                return;
+            }
+
+            peer.AcknowledgedSnapshotTick = acknowledgedTick;
+            peer.ApplicationAckOutstandingTick = 0;
+            peer.SupersededSnapshotTick = 0;
+            if (acknowledgesRecovery)
+            {
+                peer.RecoveryOutstandingTick = 0;
+                peer.HasRecoveryAttempted = false;
+                peer.LastRecoveryAttemptServerTick = 0;
+            }
+
+            if (peer.ResyncRequested &&
+                (peer.ResyncSnapshotTick == 0 ||
+                 acknowledgedTick < peer.ResyncSnapshotTick))
+                return;
+            peer.ResyncRequested = false;
+            peer.ResyncCorrelationId = 0;
+            peer.ResyncSnapshotTick = 0;
+        }
+
+        private bool ShouldDeferSnapshot(Peer peer, uint serverTick)
+        {
+            if (_snapshotAdmissionMode == NetworkSnapshotAdmissionMode.Current)
+                return peer.LastSnapshotSentTick != 0 &&
+                    peer.Transport is INetworkReliableSendState currentState &&
+                    currentState.HasPendingReliablePackets;
+
+            var waitingForApplicationAck = peer.RecoveryOutstandingTick != 0 ||
+                (peer.ApplicationAckOutstandingTick != 0 &&
+                 !peer.ResyncRequested);
+            var transportBackpressured =
+                peer.Transport is INetworkReliableSendState reliableState &&
+                reliableState.HasPendingReliablePackets;
+            var recoveryRetryDelayed = peer.ResyncRequested &&
+                peer.HasRecoveryAttempted &&
+                unchecked(serverTick - peer.LastRecoveryAttemptServerTick) <
+                    ApplicationAckRecoveryRetryTicks;
+            if (!waitingForApplicationAck && !transportBackpressured &&
+                !recoveryRetryDelayed)
+                return false;
+
+            IncrementSaturating(ref _suppressedSnapshots);
+            return true;
+        }
+
+        private void RecordAcknowledgementGap(Peer peer)
+        {
+            IncrementSaturating(ref _acknowledgementGaps);
+            peer.ResyncRequested = true;
+            if (peer.RecoveryOutstandingTick == 0)
+                peer.ResyncSnapshotTick = 0;
+        }
+
+        private static void IncrementSaturating(ref long value)
+        {
+            if (value < long.MaxValue)
+                value++;
+        }
+
         private void SendSnapshot(Peer peer, NetworkSnapshot snapshot)
         {
+            var baselineTick = peer.AcknowledgedSnapshotTick;
+            var keyframe = peer.ResyncRequested || baselineTick == 0;
+            var applicationAckRecovery =
+                _snapshotAdmissionMode ==
+                    NetworkSnapshotAdmissionMode.ApplicationAck && keyframe;
+            if (applicationAckRecovery)
+            {
+                peer.ResyncRequested = true;
+                peer.LastRecoveryAttemptServerTick = snapshot.ServerTick;
+                peer.HasRecoveryAttempted = true;
+                IncrementSaturating(ref _recoveryAttempts);
+            }
+
             var reliableLimit = peer.Transport.MaxReliablePayloadBytes;
             if (reliableLimit <= PacketHeader.Size + SnapshotChunkHeader.Size)
             {
@@ -787,9 +963,7 @@ namespace UniGame.StaticEcs.Network
                 return;
 
             NetworkBufferLease delta = null;
-            var baselineTick = peer.AcknowledgedSnapshotTick;
             NetworkSnapshot baseline = null;
-            var keyframe = peer.ResyncRequested || baselineTick == 0;
             if (!keyframe)
             {
                 _coordinator.TryGetCapture(peer.Scope, baselineTick,
@@ -857,13 +1031,39 @@ namespace UniGame.StaticEcs.Network
                     // can retry the delta against the same baseline.
                     if (!keyframe && !acceptedChunk && chunkIndex == 0)
                         return;
+                    if (acceptedChunk && _snapshotAdmissionMode ==
+                        NetworkSnapshotAdmissionMode.ApplicationAck)
+                        IncrementSaturating(ref _partialBatchFailures);
                     peer.ResyncRequested = true;
                     return;
                 }
                 acceptedChunk = true;
             }
             if (acceptedChunk)
+            {
                 peer.LastSnapshotSentTick = snapshot.ServerTick;
+                if (_snapshotAdmissionMode ==
+                    NetworkSnapshotAdmissionMode.ApplicationAck)
+                {
+                    if (keyframe)
+                    {
+                        if (peer.ApplicationAckOutstandingTick != 0)
+                            peer.SupersededSnapshotTick =
+                                peer.ApplicationAckOutstandingTick;
+                        peer.ApplicationAckOutstandingTick = 0;
+                        peer.RecoveryOutstandingTick = snapshot.ServerTick;
+                        IncrementSaturating(
+                            ref _recoveryBatchesAccepted);
+                    }
+                    else
+                    {
+                        peer.ApplicationAckOutstandingTick =
+                            snapshot.ServerTick;
+                        peer.RecoveryOutstandingTick = 0;
+                        peer.SupersededSnapshotTick = 0;
+                    }
+                }
+            }
         }
 
         private bool TryGetSnapshotDelta(ScopeId scope, uint baselineTick,
@@ -1426,9 +1626,26 @@ namespace UniGame.StaticEcs.Network
             internal ScopeId Scope { get; private set; }
             /// <summary>Reassigns this peer's scope (NCORE-15) and keeps its session in sync.</summary>
             internal void SetScope(ScopeId scope) { Scope = scope; Session.SetScope(scope); }
+            internal void ResetSnapshotAdmissionState()
+            {
+                AcknowledgedSnapshotTick = 0;
+                LastSnapshotSentTick = 0;
+                ApplicationAckOutstandingTick = 0;
+                RecoveryOutstandingTick = 0;
+                SupersededSnapshotTick = 0;
+                LastRecoveryAttemptServerTick = 0;
+                HasRecoveryAttempted = false;
+                ResyncCorrelationId = 0;
+                ResyncSnapshotTick = 0;
+            }
             internal uint PacketSequence;
             internal uint AcknowledgedSnapshotTick;
             internal uint LastSnapshotSentTick;
+            internal uint ApplicationAckOutstandingTick;
+            internal uint RecoveryOutstandingTick;
+            internal uint SupersededSnapshotTick;
+            internal uint LastRecoveryAttemptServerTick;
+            internal bool HasRecoveryAttempted;
             internal uint ServerProcessedCommandTick;
             internal uint ServerProcessedCommandSequence;
             internal bool ResyncRequested;

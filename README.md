@@ -56,6 +56,18 @@ flowchart LR
 - The Burst backend plans the delta structure; managed code writes every byte. Output is
   byte-identical to the portable encoder.
 
+## Snapshot admission
+
+`NetworkServer<TWorld>` defaults to `NetworkSnapshotAdmissionMode.Current`, which preserves
+the existing transport-reported pending-reliable behavior. The opt-in
+`ApplicationAck` mode admits at most one fully accepted snapshot batch per peer until that
+peer acknowledges its exact snapshot tick. Acknowledgements for unoffered ticks do not
+advance the delta baseline; gaps request keyframe recovery. A partially accepted recovery
+keyframe is retried at a bounded simulation-tick cadence. This is diagnostic admission
+policy only: it does not change packet ordering, flags, snapshot contents, or the wire
+protocol. The game's runtime config restricts this experiment to UTP; production remains on
+the default `Current` mode unless a separate change is approved.
+
 ## Interest management
 
 ```mermaid

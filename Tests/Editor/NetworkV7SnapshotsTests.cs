@@ -1163,6 +1163,485 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void CurrentSnapshotAdmissionRemainsTransportPendingDriven()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(826),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true,
+                           snapshotAdmissionMode:
+                               NetworkSnapshotAdmissionMode.Current))
+                {
+                    server.AddConnection(serverTransport, 1, 1,
+                        new ScopeId(71));
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).SnapshotTick,
+                        Is.EqualTo(1));
+
+                    server.Tick(_ => { });
+                    var second = ReceiveChunk(clientTransport);
+                    Assert.That(second.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                    Assert.That(second.SnapshotTick, Is.EqualTo(2));
+
+                    var diagnostics =
+                        server.CaptureSnapshotAdmissionDiagnostics();
+                    Assert.That(diagnostics.Mode,
+                        Is.EqualTo(NetworkSnapshotAdmissionMode.Current));
+                    Assert.That(diagnostics.SuppressedSnapshots, Is.Zero);
+                    Assert.That(diagnostics.AcknowledgementGaps, Is.Zero);
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ApplicationAckAdmissionWaitsForExactOfferedSnapshotAck()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(827),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true,
+                           snapshotAdmissionMode:
+                               NetworkSnapshotAdmissionMode.ApplicationAck))
+                {
+                    server.AddConnection(serverTransport, 1, 1,
+                        new ScopeId(72));
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    server.Tick(_ => { });
+                    var initial = ReceiveChunk(clientTransport);
+                    Assert.That(initial.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                    Assert.That(initial.SnapshotTick, Is.EqualTo(1));
+
+                    server.Tick(_ => { });
+                    AssertNoPacket(clientTransport,
+                        "a fully accepted but unacknowledged keyframe blocks the next batch");
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 2, 1);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    var delta = ReceiveChunk(clientTransport);
+                    Assert.That(delta.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(delta.BaselineTick, Is.EqualTo(1));
+                    Assert.That(delta.SnapshotTick, Is.EqualTo(3));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 3, 1);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    AssertNoPacket(clientTransport,
+                        "a stale ACK cannot release a newer outstanding batch");
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 4, 3);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    delta = ReceiveChunk(clientTransport);
+                    Assert.That(delta.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(delta.BaselineTick, Is.EqualTo(3));
+                    Assert.That(delta.SnapshotTick, Is.EqualTo(5));
+
+                    var diagnostics =
+                        server.CaptureSnapshotAdmissionDiagnostics();
+                    Assert.That(diagnostics.SuppressedSnapshots,
+                        Is.EqualTo(2));
+                    Assert.That(diagnostics.AcknowledgementGaps, Is.Zero);
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ApplicationAckRejectsSnapshotTickNeverOfferedToThatPeer()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var scope = new ScopeId(73);
+                using (var mock = new TwoClientNetworkMock())
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true,
+                           snapshotAdmissionMode:
+                               NetworkSnapshotAdmissionMode.ApplicationAck))
+                {
+                    server.AddConnection(mock.ServerA, 1, 11, scope);
+                    server.AddConnection(mock.ServerB, 2, 22, scope);
+                    SendPeerPacket(mock.ClientA, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    SendPeerPacket(mock.ClientB, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(mock.ClientA.TryReceive(out var readyA),
+                        Is.True);
+                    readyA.Dispose();
+                    Assert.That(mock.ClientB.TryReceive(out var readyB),
+                        Is.True);
+                    readyB.Dispose();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(mock.ClientA).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                    Assert.That(ReceiveChunk(mock.ClientB).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+
+                    SendPeerPacket(mock.ClientA, schema.Fingerprint,
+                        PacketKind.Ack, 11, 2, 1);
+                    SendPeerPacket(mock.ClientB, schema.Fingerprint,
+                        PacketKind.Ack, 22, 2, 1);
+                    server.Receive();
+
+                    entity.Set(new TestComponent { Value = 2 });
+                    server.Tick(_ => { });
+                    var deltaA = ReceiveChunk(mock.ClientA);
+                    var deltaB = ReceiveChunk(mock.ClientB);
+                    Assert.That(deltaA.SnapshotTick, Is.EqualTo(2));
+                    Assert.That(deltaB.SnapshotTick, Is.EqualTo(2));
+                    SendPeerPacket(mock.ClientB, schema.Fingerprint,
+                        PacketKind.Ack, 22, 3, 2);
+                    server.Receive();
+
+                    entity.Set(new TestComponent { Value = 3 });
+                    server.Tick(_ => { });
+                    AssertNoPacket(mock.ClientA,
+                        "peer A still awaits its tick-2 ACK");
+                    var offeredToB = ReceiveChunk(mock.ClientB);
+                    Assert.That(offeredToB.SnapshotTick, Is.EqualTo(3));
+                    Assert.That(offeredToB.BaselineTick, Is.EqualTo(2));
+
+                    SendPeerPacket(mock.ClientA, schema.Fingerprint,
+                        PacketKind.Ack, 11, 3, 3);
+                    server.Receive();
+                    var acknowledgedTicks = new uint[2];
+                    Assert.That(server.TryGetConnection(0, out var first),
+                        Is.True);
+                    Assert.That(server.TryGetConnection(1, out var second),
+                        Is.True);
+                    acknowledgedTicks[0] =
+                        first.Ticks.AcknowledgedSnapshotTick;
+                    acknowledgedTicks[1] =
+                        second.Ticks.AcknowledgedSnapshotTick;
+                    CollectionAssert.AreEquivalent(new uint[] { 1, 2 },
+                        acknowledgedTicks,
+                        "an ACK for B's retained tick 3 is not an ACK for A's offered tick 2");
+
+                    server.Tick(_ => { });
+                    var recovery = ReceiveChunk(mock.ClientA);
+                    Assert.That(recovery.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                    Assert.That(recovery.SnapshotTick, Is.EqualTo(4));
+
+                    SendPeerPacket(mock.ClientA, schema.Fingerprint,
+                        PacketKind.Ack, 11, 4, 4);
+                    server.Receive();
+                    entity.Set(new TestComponent { Value = 4 });
+                    server.Tick(_ => { });
+                    var recoveredDelta = ReceiveChunk(mock.ClientA);
+                    Assert.That(recoveredDelta.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(recoveredDelta.BaselineTick, Is.EqualTo(4));
+
+                    Assert.That(server.CaptureSnapshotAdmissionDiagnostics()
+                        .AcknowledgementGaps, Is.EqualTo(1));
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ApplicationAckRecoverySupersedesOlderBatchAndRetriesPartialKeyframeBoundedly()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                using var pool = new NetworkBufferPool(0);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(828),
+                    out var clientTransport, out var serverEndpoint);
+                using (clientTransport)
+                using (var serverTransport = new PreflightNetworkTransport(
+                           serverEndpoint))
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true, bufferPool: pool,
+                           snapshotAdmissionMode:
+                               NetworkSnapshotAdmissionMode.ApplicationAck))
+                {
+                    server.AddConnection(serverTransport, 1, 1,
+                        new ScopeId(74));
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    var changed = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    changed.Set(new TestComponent { Value = 1 });
+                    for (var i = 0; i < 7; i++)
+                    {
+                        var entity =
+                            World<AuthorityWorld>.NewEntity<TestEntity>();
+                        entity.Set(new TestComponent { Value = 10 + i });
+                    }
+
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 2, 1);
+                    server.Receive();
+
+                    server.Tick(_ => { });
+                    var normal = ReceiveChunk(clientTransport);
+                    Assert.That(normal.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(normal.SnapshotTick, Is.EqualTo(2));
+                    SendResyncRequest(clientTransport, schema.Fingerprint,
+                        1, 3, 17);
+                    server.Receive();
+
+                    server.Tick(_ => { });
+                    var recovery = ReceiveChunk(clientTransport);
+                    Assert.That(recovery.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                    Assert.That(recovery.SnapshotTick, Is.EqualTo(3));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 4, 2);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    AssertNoPacket(clientTransport,
+                        "the superseded normal ACK cannot release recovery");
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 5, 3);
+                    server.Receive();
+                    changed.Set(new TestComponent { Value = 2 });
+                    server.Tick(_ => { });
+                    var afterRecovery = ReceiveChunk(clientTransport);
+                    Assert.That(afterRecovery.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(afterRecovery.BaselineTick, Is.EqualTo(3));
+
+                    SendResyncRequest(clientTransport, schema.Fingerprint,
+                        1, 6, 18);
+                    server.Receive();
+                    serverTransport.MaxReliablePayloadBytes =
+                        PacketHeader.Size + SnapshotChunkHeader.Size + 8;
+                    serverTransport.ResetCounters();
+                    serverTransport.FailOnSendNumber = 2;
+                    server.Tick(_ => { });
+                    Assert.That(serverTransport.SentPacketCount, Is.EqualTo(2));
+                    Assert.That(clientTransport.TryReceive(out var firstChunk),
+                        Is.True);
+                    try
+                    {
+                        Assert.That(NetworkPacket.TryDecode(firstChunk,
+                            out var packetHeader, out var payload), Is.True);
+                        Assert.That(packetHeader.Kind,
+                            Is.EqualTo(PacketKind.SnapshotChunk));
+                        Assert.That(SnapshotChunkHeader.TryRead(payload.Span,
+                            out var partial), Is.True);
+                        Assert.That(partial.PayloadKind,
+                            Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                        Assert.That(partial.ChunkIndex, Is.Zero);
+                        Assert.That(partial.ChunkCount, Is.GreaterThan(1));
+                    }
+                    finally
+                    {
+                        firstChunk.Dispose();
+                    }
+
+                    var afterPartial =
+                        server.CaptureSnapshotAdmissionDiagnostics();
+                    Assert.That(afterPartial.PartialBatchFailures,
+                        Is.EqualTo(1));
+                    Assert.That(afterPartial.RecoveryAttempts,
+                        Is.EqualTo(3));
+                    Assert.That(afterPartial.RecoveryBatchesAccepted,
+                        Is.EqualTo(2));
+
+                    serverTransport.FailOnSendNumber = 0;
+                    serverTransport.MaxReliablePayloadBytes =
+                        serverEndpoint.MaxReliablePayloadBytes;
+                    for (var tick = 7; tick < 16; tick++)
+                    {
+                        server.Tick(_ => { });
+                        AssertNoPacket(clientTransport,
+                            "partial recovery retries are rate-limited to 10 simulation ticks");
+                    }
+
+                    server.Tick(_ => { });
+                    var retriedRecovery = ReceiveChunk(clientTransport);
+                    Assert.That(retriedRecovery.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                    Assert.That(retriedRecovery.SnapshotTick, Is.EqualTo(16));
+
+                    server.Tick(_ => { });
+                    AssertNoPacket(clientTransport,
+                        "an accepted recovery waits for its exact application ACK");
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 7, 16);
+                    server.Receive();
+                    changed.Set(new TestComponent { Value = 99 });
+                    server.Tick(_ => { });
+                    var recoveredDelta = ReceiveChunk(clientTransport);
+                    Assert.That(recoveredDelta.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(recoveredDelta.BaselineTick, Is.EqualTo(16));
+
+                    var diagnostics =
+                        server.CaptureSnapshotAdmissionDiagnostics();
+                    Assert.That(diagnostics.PartialBatchFailures, Is.EqualTo(1));
+                    Assert.That(diagnostics.RecoveryAttempts, Is.EqualTo(4));
+                    Assert.That(diagnostics.RecoveryBatchesAccepted,
+                        Is.EqualTo(3));
+                    Assert.That(diagnostics.AcknowledgementGaps, Is.Zero);
+                }
+
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ApplicationAckNewResyncSupersedesOutstandingRecovery()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(829),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true,
+                           snapshotAdmissionMode:
+                               NetworkSnapshotAdmissionMode.ApplicationAck))
+                {
+                    server.AddConnection(serverTransport, 1, 1,
+                        new ScopeId(75));
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).SnapshotTick,
+                        Is.EqualTo(1));
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 2, 1);
+                    server.Receive();
+
+                    SendResyncRequest(clientTransport, schema.Fingerprint,
+                        1, 3, 17);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    var firstRecovery = ReceiveSnapshotChunk(clientTransport,
+                        out _, out _);
+                    Assert.That(firstRecovery.SnapshotTick, Is.EqualTo(2));
+                    Assert.That(firstRecovery.ResyncCorrelationId,
+                        Is.EqualTo(17));
+
+                    SendResyncRequest(clientTransport, schema.Fingerprint,
+                        1, 4, 18);
+                    server.Receive();
+                    for (var tick = 3; tick < 12; tick++)
+                    {
+                        server.Tick(_ => { });
+                        AssertNoPacket(clientTransport,
+                            "renewed recovery is rate-limited before its retry interval");
+                    }
+
+                    server.Tick(_ => { });
+                    var replacementRecovery = ReceiveSnapshotChunk(
+                        clientTransport, out _, out _);
+                    Assert.That(replacementRecovery.SnapshotTick,
+                        Is.EqualTo(12));
+                    Assert.That(replacementRecovery.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Keyframe));
+                    Assert.That(replacementRecovery.ResyncCorrelationId,
+                        Is.EqualTo(18));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 5, 2);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    AssertNoPacket(clientTransport,
+                        "an ACK for the superseded recovery cannot release its replacement");
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 6, 12);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    var delta = ReceiveChunk(clientTransport);
+                    Assert.That(delta.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(delta.BaselineTick, Is.EqualTo(12));
+                    Assert.That(server.CaptureSnapshotAdmissionDiagnostics()
+                        .AcknowledgementGaps, Is.Zero);
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
         public void ServerAckAtRecoveryBoundaryClearsBackpressuredKeyframe()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
@@ -2452,6 +2931,28 @@ namespace UniGame.StaticEcs.Network.Tests
             {
                 packet.Dispose();
             }
+        }
+
+        private static void SendResyncRequest(INetworkTransport transport,
+            SchemaFingerprint schema, uint epoch, uint sequence,
+            uint correlationId)
+        {
+            Span<byte> payload = stackalloc byte[ResyncRequestPayload.Size];
+            Assert.That(new ResyncRequestPayload(correlationId).TryWrite(
+                payload), Is.True);
+            var header = Packet(PacketKind.ResyncRequest, epoch, sequence);
+            header.SchemaFingerprint = schema;
+            Assert.That(NetworkPacket.TryEncode(Buffers, header, payload,
+                out var packet), Is.True);
+            Assert.That(transport.TrySend(packet), Is.True);
+        }
+
+        private static void AssertNoPacket(INetworkTransport transport,
+            string reason)
+        {
+            var received = transport.TryReceive(out var packet);
+            packet?.Dispose();
+            Assert.That(received, Is.False, reason);
         }
 
         private static void AssertReconstructedSnapshot(NetworkBufferPool pool,
