@@ -12,6 +12,8 @@ namespace UniGame.StaticEcs.Network
     {
         private static readonly long SnapshotAssemblyTimeoutTicks =
             Stopwatch.Frequency * 2L;
+        private static readonly long AcknowledgementSendTimeoutTicks =
+            Stopwatch.Frequency * 5L;
         private readonly INetworkTransport _transport;
         private readonly NetworkSchema<TWorld> _schema;
         private readonly NetworkReplicator<TWorld> _replicator;
@@ -54,6 +56,11 @@ namespace UniGame.StaticEcs.Network
         private long _snapshotAssemblyDeadline;
         private uint _snapshotDiscardThroughTick;
         private uint _resyncCorrelationId;
+        private bool _hasPendingAcknowledgement;
+        private uint _pendingAcknowledgementEpoch;
+        private uint _pendingAcknowledgementTick;
+        private uint _pendingAcknowledgementCorrelationId;
+        private long _pendingAcknowledgementSince;
 
         /// <param name="unchangedApplySkipPolicy">
         /// Opt-in, off by default. See <see cref="NetworkReplicaSkipPolicy{TWorld}"/> for the
@@ -266,6 +273,8 @@ namespace UniGame.StaticEcs.Network
             _recoveryTransition = default;
             _hasRecoveryTransition = false;
             _resyncCorrelationId = 0;
+            _hasPendingAcknowledgement = false;
+            _pendingAcknowledgementSince = 0;
             _session.ReportSession(0, 0, 0, _packetSequence);
         }
 
@@ -329,6 +338,9 @@ namespace UniGame.StaticEcs.Network
 
         internal void Process(long timestamp)
         {
+            RetryPendingAcknowledgement(timestamp);
+            if (_session.State == NetworkSessionState.Closed)
+                return;
             InspectSnapshotAssemblyTimeout(timestamp);
             while (true)
             {
@@ -1130,6 +1142,20 @@ namespace UniGame.StaticEcs.Network
                 resyncCorrelationId: payloadKind == SnapshotPayloadKind.Keyframe
                     ? resyncCorrelationId
                     : 0);
+            if (acknowledged)
+                _hasPendingAcknowledgement = false;
+            else
+            {
+                var failureStarted = _hasPendingAcknowledgement &&
+                    _pendingAcknowledgementEpoch == _session.Epoch
+                    ? _pendingAcknowledgementSince : Stopwatch.GetTimestamp();
+                _hasPendingAcknowledgement = true;
+                _pendingAcknowledgementEpoch = _session.Epoch;
+                _pendingAcknowledgementTick = AcknowledgedSnapshotTick;
+                _pendingAcknowledgementCorrelationId =
+                    payloadKind == SnapshotPayloadKind.Keyframe ? resyncCorrelationId : 0;
+                _pendingAcknowledgementSince = failureStarted;
+            }
             if (completesRecovery)
             {
                 RequestRecovery(NetworkRecoveryPhase.None,
@@ -1139,6 +1165,34 @@ namespace UniGame.StaticEcs.Network
             }
             staged.Dispose();
             return true;
+        }
+
+        private void RetryPendingAcknowledgement(long timestamp)
+        {
+            if (!_hasPendingAcknowledgement)
+                return;
+            if (_session.State != NetworkSessionState.Established ||
+                _session.Epoch != _pendingAcknowledgementEpoch)
+            {
+                _hasPendingAcknowledgement = false;
+                return;
+            }
+            if (timestamp - _pendingAcknowledgementSince >=
+                AcknowledgementSendTimeoutTicks)
+            {
+                _hasPendingAcknowledgement = false;
+                RequestDisconnect(NetworkRecoveryReason.AcknowledgementSendFailed);
+                return;
+            }
+            if (!Send(PacketKind.Ack, _pendingAcknowledgementEpoch,
+                    PacketHeader.NoneTick, _pendingAcknowledgementTick,
+                    ReadOnlySpan<byte>.Empty,
+                    resyncCorrelationId: _pendingAcknowledgementCorrelationId))
+                return;
+            if (_pendingAcknowledgementCorrelationId != 0 &&
+                _resyncCorrelationId == _pendingAcknowledgementCorrelationId)
+                _resyncCorrelationId = 0;
+            _hasPendingAcknowledgement = false;
         }
 
         private void RequestResync(uint serverTick, NetworkRecoveryReason reason,

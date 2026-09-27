@@ -142,15 +142,8 @@ namespace UniGame.StaticEcs.Network
             entityCount = 0;
             recordCount = 0;
             hooks = hooks ?? NetworkComponentDeltaHooks.Empty;
-            if (pool == null || baseline == null ||
-                header.PayloadKind != SnapshotPayloadKind.Delta ||
-                baseline.ServerTick == 0 || header.BaselineTick != baseline.ServerTick ||
-                header.SnapshotTick <= baseline.ServerTick ||
-                header.TotalLength == 0 ||
-                header.TotalLength > ProtocolLimits.MaxDecodedPayloadBytes ||
-                header.ChunkCount == 0 || header.ChunkIndex >= header.ChunkCount ||
-                baseline.SchemaFingerprint != schema || baseline.Scope != scope ||
-                delta.Length > ProtocolLimits.MaxDecodedPayloadBytes)
+            if (!IsValidReconstructionInput(pool, baseline, delta.Length,
+                    in header, schema, scope))
                 return false;
 
             var measure = new SnapshotWriter(true);
@@ -182,6 +175,19 @@ namespace UniGame.StaticEcs.Network
                 lease?.Dispose();
             }
         }
+
+        internal static bool IsValidReconstructionInput(NetworkBufferPool pool,
+            NetworkSnapshot baseline, int deltaLength, in SnapshotChunkHeader header,
+            SchemaFingerprint schema, ScopeId scope) =>
+            pool != null && baseline != null &&
+            header.PayloadKind == SnapshotPayloadKind.Delta &&
+            baseline.ServerTick != 0 && header.BaselineTick == baseline.ServerTick &&
+            header.SnapshotTick > baseline.ServerTick &&
+            header.TotalLength != 0 &&
+            header.TotalLength <= ProtocolLimits.MaxDecodedPayloadBytes &&
+            header.ChunkCount != 0 && header.ChunkIndex < header.ChunkCount &&
+            baseline.SchemaFingerprint == schema && baseline.Scope == scope &&
+            deltaLength <= ProtocolLimits.MaxDecodedPayloadBytes;
 
         internal static bool TryInspectCanonical(ReadOnlySpan<byte> bytes,
             out int entityCount, out int recordCount)

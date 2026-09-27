@@ -34,14 +34,10 @@ namespace UniGame.StaticEcs.Network
     /// </para>
     /// <para>
     /// Reconstructing and hash-verifying a delta against a baseline is a pure function of the
-    /// baseline bytes and the delta bytes: the same pair always produces the same canonical bytes or
-    /// always fails the same way. The cache key folds in the baseline's own verified payload hash
-    /// (not just its tick) and a hash of the exact received delta bytes, so a corrupted delta — even
-    /// one that happens to reuse a baseline/target tick pair another client already reconstructed
-    /// successfully — has a different key and always falls through to a real, independent
-    /// <see cref="SnapshotDeltaCodec.TryReconstruct"/> call, which fails exactly as it would without
-    /// the cache. A cache hit therefore only ever returns bytes this cache already verified against
-    /// the wire's declared hash for this exact (baseline, delta) input pair.
+    /// baseline bytes, delta bytes, and declared snapshot header: the same inputs always produce
+    /// the same canonical bytes or fail the same way. The key includes the verified baseline hash,
+    /// the exact delta hash, and every wire header field, including the declared total hash and
+    /// length. A modified declaration cannot hit a result verified under a different declaration.
     /// </para>
     /// </summary>
     public sealed class NetworkReconstructionCache
@@ -54,29 +50,63 @@ namespace UniGame.StaticEcs.Network
             private readonly ulong _baselineHash;
             private readonly uint _snapshotTick;
             private readonly ulong _deltaHash;
+            private readonly SnapshotPayloadKind _payloadKind;
+            private readonly uint _totalLength;
+            private readonly ulong _totalHash;
+            private readonly uint _chunkIndex;
+            private readonly uint _chunkCount;
+            private readonly uint _resyncCorrelationId;
+            private readonly ulong _scopeValue;
 
             internal Key(SchemaFingerprint schema, ScopeId scope, uint baselineTick,
-                ulong baselineHash, uint snapshotTick, ulong deltaHash)
+                ulong baselineHash, in SnapshotChunkHeader header, ulong deltaHash)
             {
                 _schema = schema;
                 _scope = scope;
                 _baselineTick = baselineTick;
                 _baselineHash = baselineHash;
-                _snapshotTick = snapshotTick;
+                _snapshotTick = header.SnapshotTick;
                 _deltaHash = deltaHash;
+                _payloadKind = header.PayloadKind;
+                _totalLength = header.TotalLength;
+                _totalHash = header.TotalHash;
+                _chunkIndex = header.ChunkIndex;
+                _chunkCount = header.ChunkCount;
+                _resyncCorrelationId = header.ResyncCorrelationId;
+                _scopeValue = header.ScopeValue;
             }
 
             public bool Equals(Key other) =>
                 _schema.Equals(other._schema) && _scope.Equals(other._scope) &&
                 _baselineTick == other._baselineTick && _baselineHash == other._baselineHash &&
-                _snapshotTick == other._snapshotTick && _deltaHash == other._deltaHash;
+                _snapshotTick == other._snapshotTick && _deltaHash == other._deltaHash &&
+                _payloadKind == other._payloadKind && _totalLength == other._totalLength &&
+                _totalHash == other._totalHash && _chunkIndex == other._chunkIndex &&
+                _chunkCount == other._chunkCount &&
+                _resyncCorrelationId == other._resyncCorrelationId &&
+                _scopeValue == other._scopeValue;
 
             public override bool Equals(object obj) => obj is Key other && Equals(other);
 
-            public override int GetHashCode() => unchecked(
-                (((((_schema.GetHashCode() * 397) ^ _scope.GetHashCode()) * 397) ^
-                  (int)_baselineTick) * 397 ^ _baselineHash.GetHashCode()) * 397 ^
-                ((int)_snapshotTick * 397 ^ _deltaHash.GetHashCode()));
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    var hash = _schema.GetHashCode();
+                    hash = hash * 397 ^ _scope.GetHashCode();
+                    hash = hash * 397 ^ (int)_baselineTick;
+                    hash = hash * 397 ^ _baselineHash.GetHashCode();
+                    hash = hash * 397 ^ (int)_snapshotTick;
+                    hash = hash * 397 ^ _deltaHash.GetHashCode();
+                    hash = hash * 397 ^ (int)_payloadKind;
+                    hash = hash * 397 ^ (int)_totalLength;
+                    hash = hash * 397 ^ _totalHash.GetHashCode();
+                    hash = hash * 397 ^ (int)_chunkIndex;
+                    hash = hash * 397 ^ (int)_chunkCount;
+                    hash = hash * 397 ^ (int)_resyncCorrelationId;
+                    return hash * 397 ^ _scopeValue.GetHashCode();
+                }
+            }
         }
 
         private sealed class Entry
@@ -133,12 +163,13 @@ namespace UniGame.StaticEcs.Network
             canonical = null;
             entityCount = 0;
             recordCount = 0;
-            if (baseline == null)
+            if (!SnapshotDeltaCodec.IsValidReconstructionInput(pool, baseline,
+                    delta.Length, in header, schema, scope))
                 return false;
 
             var deltaHash = Hashing.XxHash64(delta);
             var key = new Key(schema, scope, header.BaselineTick, baseline.PayloadHash,
-                header.SnapshotTick, deltaHash);
+                in header, deltaHash);
             if (_entries.TryGetValue(key, out var cached))
             {
                 _hits++;

@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using FFS.Libraries.StaticEcs;
 using NUnit.Framework;
 
@@ -192,6 +193,138 @@ namespace UniGame.StaticEcs.Network.Tests
                 if (World<LightClientWorld>.Status == WorldStatus.Initialized)
                     World<LightClientWorld>.Destroy();
             }
+        }
+
+        [Test]
+        public void ApplicationAckRetriesRejectedClientAcknowledgementAndReleasesNextSnapshot()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var authoritySchema = Schema<AuthorityWorld>(true);
+                var lightSchema = Schema<LightClientWorld>(false);
+                var authority = World<AuthorityWorld>.NewEntity<TestEntity>();
+                authority.Set(new TestComponent { Value = 1 });
+                MemoryNetworkTransport.CreatePair(new ConnectionId(205),
+                    out var clientEndpoint, out var serverEndpoint);
+                using (var transport = new RejectAcknowledgementTransport(clientEndpoint))
+                using (serverEndpoint)
+                using (var pool = new NetworkBufferPool(1024 * 1024))
+                using (var server = new NetworkServer<AuthorityWorld>(authoritySchema,
+                           static (_, _) => true,
+                           snapshotAdmissionMode: NetworkSnapshotAdmissionMode.ApplicationAck))
+                using (var client = new NetworkClient<LightClientWorld>(transport,
+                           lightSchema, new ScopeId(1), bufferPool: pool,
+                           canonicalOnlyApply: true))
+                {
+                    server.AddConnection(serverEndpoint, 1, 1, new ScopeId(1));
+                    Assert.That(client.BeginHandshake(), Is.True);
+                    server.Receive();
+                    transport.RejectNextAcknowledgements = 2;
+                    server.Tick(_ => { });
+                    client.Process();
+                    Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(1));
+                    Assert.That(transport.RejectedAcknowledgements, Is.EqualTo(1));
+
+                    server.Receive();
+                    server.Tick(_ => { });
+                    Assert.That(server.CaptureSnapshotAdmissionDiagnostics()
+                        .SuppressedSnapshots, Is.GreaterThan(0));
+                    client.Process();
+                    Assert.That(transport.RejectedAcknowledgements, Is.EqualTo(2));
+                    client.Process();
+                    Assert.That(transport.AcceptedAcknowledgements, Is.EqualTo(1));
+
+                    authority.Set(new TestComponent { Value = 2 });
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+                    Assert.That(client.AcknowledgedSnapshotTick,
+                        Is.EqualTo(server.ServerTick));
+                    Assert.That(transport.AcceptedAcknowledgements, Is.EqualTo(2));
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void PersistentAcknowledgementSendFailureClosesSessionAfterFiveSeconds()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var authoritySchema = Schema<AuthorityWorld>(true);
+                var lightSchema = Schema<LightClientWorld>(false);
+                var authority = World<AuthorityWorld>.NewEntity<TestEntity>();
+                authority.Set(new TestComponent { Value = 1 });
+                MemoryNetworkTransport.CreatePair(new ConnectionId(206),
+                    out var clientEndpoint, out var serverEndpoint);
+                using (var transport = new RejectAcknowledgementTransport(clientEndpoint))
+                using (serverEndpoint)
+                using (var server = new NetworkServer<AuthorityWorld>(authoritySchema,
+                           static (_, _) => true,
+                           snapshotAdmissionMode: NetworkSnapshotAdmissionMode.ApplicationAck))
+                using (var client = new NetworkClient<LightClientWorld>(transport,
+                           lightSchema, new ScopeId(1), canonicalOnlyApply: true))
+                {
+                    server.AddConnection(serverEndpoint, 1, 1, new ScopeId(1));
+                    Assert.That(client.BeginHandshake(), Is.True);
+                    server.Receive();
+                    transport.RejectNextAcknowledgements = int.MaxValue;
+                    server.Tick(_ => { });
+                    client.Process();
+                    client.Process(Stopwatch.GetTimestamp() + 6L * Stopwatch.Frequency);
+                    Assert.That(client.Session.State, Is.EqualTo(NetworkSessionState.Closed));
+                    Assert.That(client.TryConsumeRecoveryTransition(out var recovery), Is.True);
+                    Assert.That(recovery.Phase,
+                        Is.EqualTo(NetworkRecoveryPhase.DisconnectRequired));
+                    Assert.That(recovery.Reason,
+                        Is.EqualTo(NetworkRecoveryReason.AcknowledgementSendFailed));
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        private sealed class RejectAcknowledgementTransport : INetworkTransport
+        {
+            private readonly INetworkTransport _inner;
+
+            internal RejectAcknowledgementTransport(INetworkTransport inner) =>
+                _inner = inner;
+
+            internal int RejectNextAcknowledgements { get; set; }
+            internal int RejectedAcknowledgements { get; private set; }
+            internal int AcceptedAcknowledgements { get; private set; }
+            public ConnectionId Connection => _inner.Connection;
+            public int MaxReliablePayloadBytes => _inner.MaxReliablePayloadBytes;
+            public int MaxUnreliablePayloadBytes => _inner.MaxUnreliablePayloadBytes;
+
+            public bool TrySend(NetworkBufferLease packet)
+            {
+                if (!NetworkPacket.TryDecode(packet, out var header, out _) ||
+                    header.Kind != PacketKind.Ack)
+                    return _inner.TrySend(packet);
+                if (RejectNextAcknowledgements > 0)
+                {
+                    RejectNextAcknowledgements--;
+                    RejectedAcknowledgements++;
+                    packet.Dispose();
+                    return false;
+                }
+                AcceptedAcknowledgements++;
+                return _inner.TrySend(packet);
+            }
+
+            public bool TryReceive(out NetworkBufferLease packet) =>
+                _inner.TryReceive(out packet);
+
+            public void Dispose() => _inner.Dispose();
         }
     }
 }

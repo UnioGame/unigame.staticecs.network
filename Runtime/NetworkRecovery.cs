@@ -29,6 +29,8 @@ namespace UniGame.StaticEcs.Network
         SnapshotApplyFailed,
         /// <summary>The remote protocol is incompatible with this endpoint.</summary>
         ProtocolIncompatible,
+        /// <summary>A snapshot ACK could not enter the transport for five seconds.</summary>
+        AcknowledgementSendFailed,
     }
 
     /// <summary>Stores the durable client recovery state on the local connection entity.</summary>

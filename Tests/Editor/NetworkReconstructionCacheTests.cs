@@ -98,6 +98,57 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void CacheHitCannotBypassDeclaredHashOrLengthValidation()
+        {
+            var pool = new NetworkBufferPool(1L << 20);
+            try
+            {
+                var baseline = Snapshot(pool, 1, Entities(Position(1, 0f, 0f, 0f)));
+                var target = Snapshot(pool, 2, Entities(Position(1, 1f, 2f, 3f)));
+                Assert.That(SnapshotDeltaCodec.TryEncode(pool, baseline, target,
+                    out var delta), Is.True);
+                using (delta)
+                {
+                    var header = Header(baseline, target);
+                    var cache = new NetworkReconstructionCache();
+                    Assert.That(cache.TryReconstruct(pool, baseline, delta.Span,
+                        in header, Fingerprint, Scope, out var first, out _, out _,
+                        NetworkComponentDeltaHooks.Empty), Is.True);
+                    first.Dispose();
+
+                    var wrongHash = header;
+                    wrongHash.TotalHash ^= 1;
+                    Assert.That(cache.TryReconstruct(pool, baseline, delta.Span,
+                        in wrongHash, Fingerprint, Scope, out var hashResult, out _, out _,
+                        NetworkComponentDeltaHooks.Empty), Is.False);
+                    Assert.That(hashResult, Is.Null);
+
+                    var wrongLength = header;
+                    wrongLength.TotalLength++;
+                    Assert.That(cache.TryReconstruct(pool, baseline, delta.Span,
+                        in wrongLength, Fingerprint, Scope, out var lengthResult, out _, out _,
+                        NetworkComponentDeltaHooks.Empty), Is.False);
+                    Assert.That(lengthResult, Is.Null);
+                    var wrongKind = header;
+                    wrongKind.PayloadKind = SnapshotPayloadKind.Keyframe;
+                    Assert.That(cache.TryReconstruct(pool, baseline, delta.Span,
+                        in wrongKind, Fingerprint, Scope, out var kindResult, out _, out _,
+                        NetworkComponentDeltaHooks.Empty), Is.False);
+                    Assert.That(kindResult, Is.Null);
+                    Assert.That(cache.CaptureDiagnostics().Hits, Is.Zero);
+                    cache.Clear();
+                }
+                baseline.Dispose();
+                target.Dispose();
+            }
+            finally
+            {
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                pool.Dispose();
+            }
+        }
+
+        [Test]
         public void CacheHitDoesNotReReadTheBaselineBytes()
         {
             // Corrupting the baseline after the first (miss) reconstruction, without touching
