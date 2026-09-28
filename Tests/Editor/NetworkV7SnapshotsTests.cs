@@ -911,7 +911,6 @@ namespace UniGame.StaticEcs.Network.Tests
                     NetworkPacketKind.ResyncRequest).ResyncCorrelationId;
                 Assert.That(correlationId, Is.Not.Zero);
                 server.Receive();
-                clientTransport.MaxReliablePayloadBytes = exactPacketBytes - 1;
                 serverTransport.MaxReliablePayloadBytes = exactPacketBytes - 1;
                 serverTransport.ResetSentPackets();
                 server.Tick(_ => { });
@@ -1051,6 +1050,75 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
                     Is.Zero);
                 pool.Dispose();
+                if (World<AuthorityWorld>.Status == WorldStatus.Initialized)
+                    World<AuthorityWorld>.Destroy();
+                if (World<ClientAWorld>.Status == WorldStatus.Initialized)
+                    World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void DeltaChunksAcceptSmallerServerPayloadBudget()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            using var pool = new NetworkBufferPool(0);
+            try
+            {
+                var authoritySchema = Schema<AuthorityWorld>(true);
+                var clientSchema = Schema<ClientAWorld>(false);
+                var scope = new ScopeId(48);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(842),
+                    out var clientEndpoint, out var serverEndpoint);
+                using (clientEndpoint)
+                using (var serverTransport = new LimitedNetworkTransport(
+                           serverEndpoint,
+                           serverEndpoint.MaxUnreliablePayloadBytes))
+                using (var server = new NetworkServer<AuthorityWorld>(
+                           authoritySchema, static (_, _) => true,
+                           bufferPool: pool))
+                using (var client = new NetworkClient<ClientAWorld>(
+                           clientEndpoint, clientSchema, scope,
+                           bufferPool: pool))
+                {
+                    server.AddConnection(serverTransport, 1, 1, scope);
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    var unchanged =
+                        World<AuthorityWorld>.NewEntity<SecondEntity>();
+                    unchanged.Set(new TestComponent { Value = 10 });
+                    Assert.That(client.BeginHandshake(), Is.True);
+                    server.Receive();
+                    client.Process();
+                    server.Tick(_ => { });
+                    client.Process();
+                    server.Receive();
+                    Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(1));
+
+                    entity.Set(new TestComponent { Value = 2 });
+                    serverTransport.MaxReliablePayloadBytes =
+                        PacketHeader.Size + SnapshotChunkHeader.Size + 1;
+                    serverTransport.ResetSentPackets();
+                    server.Tick(_ => { });
+                    Assert.That(serverTransport.SentPacketCount,
+                        Is.GreaterThan(1));
+                    Assert.That(clientEndpoint.TryReceive(out var first),
+                        Is.True);
+                    var delta = InspectSnapshotChunk(first, out _);
+                    Assert.That(delta.PayloadKind,
+                        Is.EqualTo(SnapshotPayloadKind.Delta));
+                    Assert.That(delta.ChunkCount, Is.GreaterThan(1));
+                    Assert.That(serverTransport.TrySend(first), Is.True);
+                    client.Process();
+                    server.Receive();
+                    Assert.That(client.AcknowledgedSnapshotTick, Is.EqualTo(2));
+                    Assert.That(ReadReplicaValue(), Is.EqualTo(2));
+                }
+            }
+            finally
+            {
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
                 if (World<AuthorityWorld>.Status == WorldStatus.Initialized)
                     World<AuthorityWorld>.Destroy();
                 if (World<ClientAWorld>.Status == WorldStatus.Initialized)

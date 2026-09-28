@@ -53,6 +53,7 @@ namespace UniGame.StaticEcs.Network
         private SnapshotChunkHeader _snapshotAssemblyChunk;
         private int _snapshotAssemblyReceived;
         private int _snapshotAssemblyBytes;
+        private int _snapshotAssemblyStride;
         private long _snapshotAssemblyDeadline;
         private uint _snapshotDiscardThroughTick;
         private uint _resyncCorrelationId;
@@ -954,13 +955,9 @@ namespace UniGame.StaticEcs.Network
             var maxBody = Math.Min(
                 reliableLimit - PacketHeader.Size - SnapshotChunkHeader.Size,
                 ProtocolLimits.MaxWirePayloadBytes - SnapshotChunkHeader.Size);
-            var maximumChunkCount =
-                (chunk.TotalLength + (long)maxBody - 1L) / maxBody;
             var body = payload.Slice(SnapshotChunkHeader.Size);
-            if (chunk.ChunkCount > maximumChunkCount ||
+            if (chunk.ChunkCount > chunk.TotalLength ||
                 body.Length == 0 || body.Length > maxBody ||
-                chunk.ChunkIndex + 1 < chunk.ChunkCount &&
-                body.Length != maxBody ||
                 header.PacketSequence != chunk.ChunkIndex + 1)
                 return false;
             if (chunk.SnapshotTick <= AcknowledgedSnapshotTick)
@@ -1017,6 +1014,24 @@ namespace UniGame.StaticEcs.Network
                 awaitingChunks = true;
                 return true;
             }
+            if (chunk.ChunkCount > 1)
+            {
+                if (index + 1 < chunk.ChunkCount)
+                {
+                    if (_snapshotAssemblyStride != 0 &&
+                        body.Length != _snapshotAssemblyStride)
+                        return false;
+                    var last = _snapshotChunks[checked((int)chunk.ChunkCount - 1)];
+                    if (last != null && last.Length > body.Length)
+                        return false;
+                    _snapshotAssemblyStride = body.Length;
+                }
+                else if (_snapshotAssemblyStride != 0 &&
+                         body.Length > _snapshotAssemblyStride)
+                {
+                    return false;
+                }
+            }
             if ((long)_snapshotAssemblyBytes + body.Length >
                 chunk.TotalLength)
                 return false;
@@ -1032,6 +1047,15 @@ namespace UniGame.StaticEcs.Network
 
             var assemblyChunk = _snapshotAssemblyChunk;
             var assemblyCount = checked((int)assemblyChunk.ChunkCount);
+            if (assemblyCount > 1 &&
+                (_snapshotAssemblyStride == 0 ||
+                 _snapshotAssemblyBytes !=
+                 (long)(assemblyCount - 1) * _snapshotAssemblyStride +
+                 _snapshotChunks[assemblyCount - 1].Length))
+                return false;
+            if (assemblyChunk.PayloadKind == SnapshotPayloadKind.Keyframe &&
+                _snapshotAssemblyBytes != assemblyChunk.TotalLength)
+                return false;
             NetworkBufferLease assembled = null;
             try
             {
@@ -1086,6 +1110,7 @@ namespace UniGame.StaticEcs.Network
             _snapshotAssemblyChunk = default;
             _snapshotAssemblyReceived = 0;
             _snapshotAssemblyBytes = 0;
+            _snapshotAssemblyStride = 0;
             _snapshotAssemblyDeadline = 0;
         }
 
