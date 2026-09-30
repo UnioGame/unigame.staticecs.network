@@ -15,6 +15,7 @@ namespace UniGame.StaticEcs.Network
         private readonly bool[] _occupied;
         private int _count;
         private long _bytes;
+        private long _limitEvictions;
         /// <summary>Creates a bounded history.</summary>
         public NetworkHistory(int capacity) : this(capacity, long.MaxValue, _ => 0) { }
         /// <summary>Creates a history bounded simultaneously by ticks and retained bytes.</summary>
@@ -36,6 +37,8 @@ namespace UniGame.StaticEcs.Network
         public int Count => _count;
         /// <summary>Gets retained byte count.</summary>
         public long Bytes => _bytes;
+        /// <summary>Items evicted by capacity or byte limits, excluding explicit cleanup.</summary>
+        public long LimitEvictions => _limitEvictions;
         /// <summary>Gets the configured maximum retained item count.</summary>
         public int Capacity => _capacity;
         /// <summary>Gets the configured maximum retained byte count.</summary>
@@ -52,7 +55,10 @@ namespace UniGame.StaticEcs.Network
             if (maxBytes < 1) throw new ArgumentOutOfRangeException(nameof(maxBytes));
             _maxBytes = maxBytes;
             while (_bytes > _maxBytes && _count > 0)
+            {
                 Evict((int)(FindBoundary(false) % (uint)_capacity));
+                _limitEvictions++;
+            }
         }
         /// <summary>Gets the oldest retained tick, or zero when empty.</summary>
         public uint OldestTick => BoundaryTick(false);
@@ -68,6 +74,7 @@ namespace UniGame.StaticEcs.Network
             {
                 _bytes -= _sizes[index];
                 _release?.Invoke(_values[index]);
+                _limitEvictions++;
             }
             else
             {
@@ -82,6 +89,7 @@ namespace UniGame.StaticEcs.Network
             {
                 var oldest = FindBoundary(false);
                 Evict((int)(oldest % (uint)_capacity));
+                _limitEvictions++;
             }
         }
         /// <summary>Finds one retained tick.</summary>

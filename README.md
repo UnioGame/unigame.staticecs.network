@@ -84,6 +84,11 @@ flowchart TB
   scope's entities. Without a provider there is one global scope.
 - **`INetworkCellularScopeProvider<TWorld>`** also exposes a scope's cells. Capture then
   serializes each cell once per tick and builds every scope by merging cell blocks.
+- Cellular merge capture rents the exact merged-payload size by default (including the canonical
+  entity-count header), bounded by `ProtocolLimits.MaxDecodedPayloadBytes`. This changes only pool
+  sizing: bytes, ordering, AOI selection and the wire contract stay unchanged. Each returned
+  snapshot owns its lease until `Dispose()`; the internal test switch can select the baseline
+  capacity path when comparing allocation behavior.
 - **Scope change:** the peer gets a keyframe of the new scope; the scope travels in the chunk
   header. All scope histories share one byte budget.
 - **`INetworkUpdatePolicy<TWorld>`** can hold an entity: its previous bytes are reused, so it

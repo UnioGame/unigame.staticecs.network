@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using FFS.Libraries.StaticEcs;
+using FFS.Libraries.StaticPack;
 using NUnit.Framework;
 
 namespace UniGame.StaticEcs.Network.Tests
@@ -175,6 +176,8 @@ namespace UniGame.StaticEcs.Network.Tests
                     client.BeginHandshake();
                     server.Receive();
                     server.Tick(_ => { });
+                    Assert.That(server.CaptureMemoryDiagnostics().HistoryScopes,
+                        Is.EqualTo(1));
                     // Applies the forced first keyframe (baselineTick == 0) and sends the client's
                     // own ACK for it -- no need to fabricate one.
                     client.Process();
@@ -187,6 +190,9 @@ namespace UniGame.StaticEcs.Network.Tests
                     provider.Assignments[7] = new ScopeId(2);
                     server.Tick(_ => { });
                     client.Process();
+
+                    Assert.That(server.CaptureMemoryDiagnostics().HistoryScopes,
+                        Is.EqualTo(1), "the last peer leaving a scope must release its history");
 
                     Assert.That(server.TryGetConnection(0, out var connection), Is.True);
                     Assert.That(connection.Connection.Scope.Value, Is.EqualTo(2u));
@@ -654,6 +660,10 @@ namespace UniGame.StaticEcs.Network.Tests
                         Is.EqualTo(SnapshotCaptureResult.Success));
                     Assert.That(replicator.Capture(1, scopeTwo, out var snapshotTwo),
                         Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(replicator.CellCacheSweepCount, Is.EqualTo(1),
+                        "overlapping scopes in one tick share the eviction sweep");
+                    Assert.That(replicator.CellCaptureCount, Is.EqualTo(3));
+                    Assert.That(replicator.CellCacheEntryCount, Is.EqualTo(3));
 
                     Assert.That(GetOrZero(provider.CollectCellCallCounts, sharedCell),
                         Is.EqualTo(1),
@@ -674,7 +684,17 @@ namespace UniGame.StaticEcs.Network.Tests
                         Is.EqualTo(SnapshotCaptureResult.Success));
                     Assert.That(GetOrZero(provider.CollectCellCallCounts, sharedCell),
                         Is.EqualTo(2));
+                    Assert.That(replicator.CellCacheSweepCount, Is.EqualTo(2));
+                    Assert.That(replicator.CellCaptureCount, Is.EqualTo(5));
                     snapshotOneAgain.Dispose();
+
+                    provider.ScopeCells[scopeOne] = new[] { cellOne };
+                    Assert.That(replicator.Capture(67, scopeOne, out var afterEviction),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(replicator.CellCacheSweepCount, Is.EqualTo(3));
+                    Assert.That(replicator.CellCacheEntryCount, Is.EqualTo(1),
+                        "inactive cell entries are still evicted after 64 ticks");
+                    afterEviction.Dispose();
                 }
                 finally
                 {
@@ -684,6 +704,160 @@ namespace UniGame.StaticEcs.Network.Tests
             finally
             {
                 World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ExactCellMergeBufferDefaultsOnAcrossEmptyGrowAndShrinkTransitions()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var first = World<AuthorityWorld>.NewEntity<TestEntity>();
+                first.Set(new TestComponent { Value = 7 });
+                var second = World<AuthorityWorld>.NewEntity<TestEntity>();
+                second.Set(new TestComponent { Value = 8 });
+                var occupiedCell = new ScopeId(601);
+                var emptyCell = new ScopeId(602);
+                var scope = new ScopeId(603);
+                var provider = new StubCellularScopeProvider();
+                provider.CellEntities[occupiedCell] =
+                    new List<World<AuthorityWorld>.Entity> { first };
+                provider.ScopeCells[scope] = new[] { occupiedCell, emptyCell };
+
+                using var pool = new NetworkBufferPool(1L << 20);
+                using var baseline = new NetworkReplicator<AuthorityWorld>(schema,
+                    static (_, _) => true, scopeProvider: provider, bufferPool: pool)
+                {
+                    UseExactCellMergeBufferForDiagnostics = false
+                };
+                using var exact = new NetworkReplicator<AuthorityWorld>(schema,
+                    static (_, _) => true, scopeProvider: provider, bufferPool: pool);
+                Assert.That(exact.UseExactCellMergeBufferForDiagnostics, Is.True,
+                    "cell merge must use exact pooled sizing by default");
+
+                Assert.That(baseline.Capture(1, scope, out var baselineSnapshot),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(exact.Capture(1, scope, out var exactSnapshot),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(exactSnapshot.Bytes.ToArray(),
+                    Is.EqualTo(baselineSnapshot.Bytes.ToArray()));
+                Assert.That(baselineSnapshot.Buffer.Length, Is.EqualTo(4096),
+                    "the diagnostic baseline retains the legacy merge capacity");
+                Assert.That(exactSnapshot.Buffer.Length,
+                    Is.LessThan(baselineSnapshot.Buffer.Length),
+                    "the exact request must use a smaller bucket than the legacy 4096-byte " +
+                    "merge buffer");
+                var firstExactByteLength = exactSnapshot.ByteLength;
+                var firstExactBytes = exactSnapshot.Bytes.ToArray();
+                baselineSnapshot.Dispose();
+                exactSnapshot.Dispose();
+
+                provider.CellEntities[occupiedCell].Clear();
+                Assert.That(baseline.Capture(2, scope, out baselineSnapshot),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(exact.Capture(2, scope, out exactSnapshot),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(exactSnapshot.Bytes.ToArray(),
+                    Is.EqualTo(baselineSnapshot.Bytes.ToArray()));
+                Assert.That(exactSnapshot.EntityCount, Is.Zero);
+                Assert.That(exactSnapshot.ByteLength, Is.EqualTo(sizeof(int)));
+                Assert.That(exactSnapshot.Buffer.Length,
+                    Is.GreaterThanOrEqualTo(exactSnapshot.ByteLength),
+                    "pool capacity is bucket-rounded while ByteLength is the canonical payload");
+                baselineSnapshot.Dispose();
+                exactSnapshot.Dispose();
+
+                provider.CellEntities[occupiedCell].Add(first);
+                provider.CellEntities[occupiedCell].Add(second);
+                Assert.That(baseline.Capture(3, scope, out baselineSnapshot),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(exact.Capture(3, scope, out exactSnapshot),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(exactSnapshot.Bytes.ToArray(),
+                    Is.EqualTo(baselineSnapshot.Bytes.ToArray()));
+                Assert.That(exactSnapshot.EntityCount, Is.EqualTo(2));
+                Assert.That(exactSnapshot.ByteLength, Is.GreaterThan(firstExactByteLength),
+                    "adding a second entity must grow the logical canonical payload even when " +
+                    "both payloads fit the same pool bucket");
+                Assert.That(exactSnapshot.Buffer.Length,
+                    Is.GreaterThanOrEqualTo(exactSnapshot.ByteLength),
+                    "pool capacity is bucket-rounded while ByteLength is the canonical payload");
+                Assert.That(exactSnapshot.Buffer.Length,
+                    Is.LessThan(baselineSnapshot.Buffer.Length),
+                    "the exact request must stay below the legacy 4096-byte merge buffer");
+                baselineSnapshot.Dispose();
+                exactSnapshot.Dispose();
+
+                provider.CellEntities[occupiedCell].Remove(second);
+                Assert.That(baseline.Capture(4, scope, out baselineSnapshot),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(exact.Capture(4, scope, out exactSnapshot),
+                    Is.EqualTo(SnapshotCaptureResult.Success));
+                Assert.That(exactSnapshot.Bytes.ToArray(),
+                    Is.EqualTo(baselineSnapshot.Bytes.ToArray()));
+                Assert.That(exactSnapshot.EntityCount, Is.EqualTo(1));
+                Assert.That(exactSnapshot.ByteLength, Is.EqualTo(firstExactByteLength),
+                    "removing the second entity must restore the first logical payload size");
+                Assert.That(exactSnapshot.Bytes.ToArray(), Is.EqualTo(firstExactBytes),
+                    "removing the second entity must restore the first canonical payload");
+                Assert.That(exactSnapshot.Buffer.Length,
+                    Is.GreaterThanOrEqualTo(exactSnapshot.ByteLength),
+                    "pool capacity is bucket-rounded while ByteLength is the canonical payload");
+                baselineSnapshot.Dispose();
+                exactSnapshot.Dispose();
+
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero,
+                    "all transition snapshots must return their pooled leases");
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ExactCellMergeRejectsAggregatePayloadOverDecodedLimitBeforeRentingMergeLease()
+        {
+            World<LargePayloadWorld>.Create(WorldConfig.Default());
+            var types = World<LargePayloadWorld>.Types();
+            types.RegisterAll(typeof(NetworkOwnerComponent).Assembly);
+            types.EntityType<LargePayloadEntity>();
+            types.Component<LargePayloadComponent>();
+            World<LargePayloadWorld>.Initialize();
+            try
+            {
+                var schema = LargePayloadSchema();
+                var first = World<LargePayloadWorld>.NewEntity<LargePayloadEntity>();
+                first.Set(default(LargePayloadComponent));
+                var second = World<LargePayloadWorld>.NewEntity<LargePayloadEntity>();
+                second.Set(default(LargePayloadComponent));
+                var firstCell = new ScopeId(701);
+                var secondCell = new ScopeId(702);
+                var scope = new ScopeId(703);
+                var provider = new LargePayloadCellularScopeProvider();
+                provider.CellEntities[firstCell] =
+                    new List<World<LargePayloadWorld>.Entity> { first };
+                provider.CellEntities[secondCell] =
+                    new List<World<LargePayloadWorld>.Entity> { second };
+                provider.ScopeCells[scope] = new[] { firstCell, secondCell };
+
+                using var pool = new NetworkBufferPool(0);
+                using var replicator = new NetworkReplicator<LargePayloadWorld>(schema,
+                    static (_, _) => true, scopeProvider: provider, bufferPool: pool);
+                Assert.That(replicator.UseExactCellMergeBufferForDiagnostics, Is.True);
+
+                Assert.That(replicator.Capture(1, scope, out var snapshot),
+                    Is.EqualTo(SnapshotCaptureResult.LimitExceeded));
+                Assert.That(snapshot, Is.Null,
+                    "aggregate payload rejection must not publish a partial snapshot");
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero,
+                    "aggregate payload rejection must not retain a merge lease");
+            }
+            finally
+            {
+                World<LargePayloadWorld>.Destroy();
             }
         }
 
@@ -736,6 +910,41 @@ namespace UniGame.StaticEcs.Network.Tests
         private static int GetOrZero(Dictionary<ScopeId, int> counts, ScopeId key) =>
             counts.TryGetValue(key, out var value) ? value : 0;
 
+        private static NetworkSchema<LargePayloadWorld> LargePayloadSchema()
+        {
+            var factory = NetworkCompilerSupport.Create<LargePayloadWorld>();
+            factory.Entity<LargePayloadEntity>(new NetworkTypeId(1));
+            factory.Component<LargePayloadComponent>(new NetworkTypeId(2),
+                maxBytes: (uint)(LargePayloadBytesPerCell + 64));
+            return factory.Freeze();
+        }
+
+        private const int LargePayloadBytesPerCell = ProtocolLimits.MaxDecodedPayloadBytes / 2;
+
+        public struct LargePayloadWorld : IWorldType { }
+
+        public struct LargePayloadEntity : IEntityType, INetworkType
+        {
+            public byte Id() => 1;
+        }
+
+        public struct LargePayloadComponent : IComponent, INetworkType
+        {
+            public void Write<TWorld>(ref BinaryPackWriter writer,
+                World<TWorld>.Entity self) where TWorld : struct, IWorldType
+            {
+                writer.EnsureSize((uint)LargePayloadBytesPerCell);
+                for (var i = 0; i < LargePayloadBytesPerCell; i++)
+                    writer.WriteByte(0);
+            }
+
+            public void Read<TWorld>(ref BinaryPackReader reader,
+                World<TWorld>.Entity self, byte version, bool disabled)
+                where TWorld : struct, IWorldType
+            {
+            }
+        }
+
         /// <summary>Deterministic stand-in for a real spatial provider that also decomposes a
         /// scope into cells (NCORE-15b test double).</summary>
         private sealed class StubCellularScopeProvider : INetworkScopeProvider<AuthorityWorld>,
@@ -769,6 +978,42 @@ namespace UniGame.StaticEcs.Network.Tests
                 List<World<AuthorityWorld>.Entity> buffer, HashSet<EntityGID> seen)
             {
                 CollectCellCallCounts[cellId] = GetOrZero(CollectCellCallCounts, cellId) + 1;
+                if (!CellEntities.TryGetValue(cellId, out var entities))
+                    return;
+                for (var i = 0; i < entities.Count; i++)
+                    if (seen.Add(entities[i].GID))
+                        buffer.Add(entities[i]);
+            }
+        }
+
+        private sealed class LargePayloadCellularScopeProvider :
+            INetworkScopeProvider<LargePayloadWorld>,
+            INetworkCellularScopeProvider<LargePayloadWorld>
+        {
+            internal readonly Dictionary<ScopeId, List<World<LargePayloadWorld>.Entity>>
+                CellEntities = new Dictionary<ScopeId, List<World<LargePayloadWorld>.Entity>>();
+            internal readonly Dictionary<ScopeId, ScopeId[]> ScopeCells =
+                new Dictionary<ScopeId, ScopeId[]>();
+
+            public void RefreshTick(uint serverTick) { }
+
+            public bool TryUpdateScope(uint peerId, ref ScopeId scope) => false;
+
+            public void CollectEntities(ScopeId scope,
+                List<World<LargePayloadWorld>.Entity> buffer, HashSet<EntityGID> seen) =>
+                throw new InvalidOperationException(
+                    "NetworkReplicator must prefer the cellular path for this fixture.");
+
+            public int CollectScopeCells(ScopeId scope, Span<ScopeId> cells)
+            {
+                var members = ScopeCells[scope];
+                members.AsSpan().CopyTo(cells);
+                return members.Length;
+            }
+
+            public void CollectCellEntities(ScopeId cellId,
+                List<World<LargePayloadWorld>.Entity> buffer, HashSet<EntityGID> seen)
+            {
                 if (!CellEntities.TryGetValue(cellId, out var entities))
                     return;
                 for (var i = 0; i < entities.Count; i++)
