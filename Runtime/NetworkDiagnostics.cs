@@ -87,6 +87,10 @@ namespace UniGame.StaticEcs.Network
 
         public long HistoryBytes;
 
+        public int HistoryScopes;
+
+        public long HistoryLimitEvictions;
+
         public int PendingCommands;
 
         public long PendingCommandBytes;

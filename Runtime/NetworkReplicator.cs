@@ -3,6 +3,7 @@ namespace UniGame.StaticEcs.Network
     using System;
     using System.Buffers;
     using System.Collections.Generic;
+    using System.Diagnostics;
     using FFS.Libraries.StaticEcs;
     using FFS.Libraries.StaticPack;
 
@@ -43,12 +44,20 @@ namespace UniGame.StaticEcs.Network
         private readonly ScopeCaptureCache[] _cellCacheRefs =
             new ScopeCaptureCache[NetworkCellularScopeLimits.MaxCellsPerScope];
         private readonly List<ScopeId> _staleCellIds = new List<ScopeId>();
+        internal long CellCacheSweepCount { get; private set; }
+        internal long CellCacheSweepStopwatchTicks { get; private set; }
+        internal int CellCacheEntryCount => _cellCache.Count;
+        internal long CellCaptureCount { get; private set; }
+        internal long CellCaptureStopwatchTicks { get; private set; }
+        internal long CellMergeStopwatchTicks { get; private set; }
         // Cells not touched by any scope for this many ticks are evicted from _cellCache so a
         // world with many transient cells (players passing through) does not grow it forever.
         private const uint CellCacheStaleAfterTicks = 64;
+        private uint _lastCellCacheSweepTick = uint.MaxValue;
         private readonly NetworkSnapshotPool _snapshotPool;
         private int _captureCapacity = 4096;
         private int _cellCaptureCapacity = 4096;
+        internal bool UseExactCellMergeBufferForDiagnostics = true;
         // NCORE-16: 4 (typeId) + 1 (schema kind) + 1 (version) + 1 (disabled) + 4 (payload length),
         // exactly the fixed record header Capture() itself writes below, before the payload bytes.
         private const int RecordHeaderSize = 11;
@@ -389,10 +398,25 @@ namespace UniGame.StaticEcs.Network
             if ((uint)cellCount > (uint)NetworkCellularScopeLimits.MaxCellsPerScope)
                 return SnapshotCaptureResult.LimitExceeded;
 
-            EvictStaleCellCache(serverTick);
+            if (_lastCellCacheSweepTick != serverTick)
+            {
+                var sweepStarted = Stopwatch.GetTimestamp();
+                try
+                {
+                    EvictStaleCellCache(serverTick);
+                    _lastCellCacheSweepTick = serverTick;
+                }
+                finally
+                {
+                    CellCacheSweepStopwatchTicks += Stopwatch.GetTimestamp() -
+                        sweepStarted;
+                    CellCacheSweepCount++;
+                }
+            }
 
             var totalEntities = 0;
             var totalRecords = 0;
+            long exactMergeBytes = sizeof(int);
             for (var i = 0; i < cellCount; i++)
             {
                 if (!_cellCache.TryGetValue(cellIds[i], out var cache))
@@ -402,21 +426,39 @@ namespace UniGame.StaticEcs.Network
                 }
                 if (!cache.HasCapturedTick || cache.CapturedTick != serverTick)
                 {
-                    var cellResult = CaptureCellInto(serverTick, cellIds[i], cache);
+                    var cellCaptureStarted = Stopwatch.GetTimestamp();
+                    SnapshotCaptureResult cellResult;
+                    try
+                    {
+                        cellResult = CaptureCellInto(serverTick, cellIds[i], cache);
+                    }
+                    finally
+                    {
+                        CellCaptureStopwatchTicks += Stopwatch.GetTimestamp() -
+                            cellCaptureStarted;
+                        CellCaptureCount++;
+                    }
                     if (cellResult != SnapshotCaptureResult.Success)
                         return cellResult;
                 }
                 _cellCacheRefs[i] = cache;
                 totalEntities += cache.Blocks.Count;
                 totalRecords += cache.RecordCount;
+                exactMergeBytes += cache.Length;
                 _cellCursors[i] = 0;
             }
             if (totalEntities > ProtocolLimits.MaxEntities)
                 return SnapshotCaptureResult.LimitExceeded;
+            if (UseExactCellMergeBufferForDiagnostics &&
+                exactMergeBytes > ProtocolLimits.MaxDecodedPayloadBytes)
+                return SnapshotCaptureResult.LimitExceeded;
 
-            var buffer = _bufferPool.Rent(_captureCapacity);
+            var buffer = _bufferPool.Rent(UseExactCellMergeBufferForDiagnostics
+                ? checked((int)exactMergeBytes)
+                : _captureCapacity);
             var writer = BinaryPackWriter.Create(buffer.Buffer);
             var merged = 0;
+            var mergeStarted = Stopwatch.GetTimestamp();
             try
             {
                 writer.WriteInt(totalEntities);
@@ -460,6 +502,11 @@ namespace UniGame.StaticEcs.Network
             {
                 return FailCapture(buffer, writer.Buffer, SnapshotCaptureResult.HookFailed);
             }
+            finally
+            {
+                CellMergeStopwatchTicks += Stopwatch.GetTimestamp() -
+                    mergeStarted;
+            }
             if (merged != totalEntities)
                 return FailCapture(buffer, writer.Buffer, SnapshotCaptureResult.InvalidEntity);
             if (writer.Position > ProtocolLimits.MaxDecodedPayloadBytes)
@@ -502,6 +549,7 @@ namespace UniGame.StaticEcs.Network
             if (_captureEntities.Count == 0)
             {
                 cache.Blocks.Clear();
+                cache.Length = 0;
                 cache.RecordCount = 0;
                 cache.CapturedTick = serverTick;
                 cache.HasCapturedTick = true;

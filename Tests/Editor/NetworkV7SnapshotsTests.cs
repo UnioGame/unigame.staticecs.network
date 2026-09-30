@@ -121,10 +121,15 @@ namespace UniGame.StaticEcs.Network.Tests
             var history = new NetworkHistory<string>(2);
             history.Store(2, "two"); history.Store(1, "one"); history.Store(3, "three");
             Assert.That(history.TryGet(1, out _), Is.False);
+            Assert.That(history.LimitEvictions, Is.EqualTo(1));
             var bytes = new NetworkHistory<byte[]>(4, 3, value => value.Length);
             bytes.Store(1, new byte[] { 1, 2 }); bytes.Store(2, new byte[] { 3, 4 });
             Assert.That(bytes.TryGet(1, out _), Is.False);
             Assert.That(bytes.Bytes, Is.EqualTo(2));
+            Assert.That(bytes.LimitEvictions, Is.EqualTo(1));
+            bytes.Clear();
+            Assert.That(bytes.LimitEvictions, Is.EqualTo(1),
+                "explicit cleanup must not be counted as a capacity eviction");
             var coordinator = new NetworkServerCoordinator<TestWorld>(2);
             var capture = new NetworkSnapshot(7, default, new ScopeId(9),
                 Lease(new byte[] { 1 }), 0, 0);
@@ -1238,9 +1243,10 @@ namespace UniGame.StaticEcs.Network.Tests
             {
                 var schema = Schema<AuthorityWorld>(true);
                 MemoryNetworkTransport.CreatePair(new ConnectionId(826),
-                    out var clientTransport, out var serverTransport);
+                    out var clientTransport, out var serverEndpoint);
                 using (clientTransport)
-                using (serverTransport)
+                using (var serverTransport = new PreflightNetworkTransport(
+                           serverEndpoint))
                 using (var server = new NetworkServer<AuthorityWorld>(schema,
                            static (_, _) => true,
                            snapshotAdmissionMode:
@@ -1261,17 +1267,27 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(ReceiveChunk(clientTransport).SnapshotTick,
                         Is.EqualTo(1));
 
+                    serverTransport.HasPendingReliablePackets = true;
+                    server.Tick(_ => { });
+                    AssertNoPacket(clientTransport,
+                        "current admission must wait for native reliable delivery");
+                    Assert.That(server.CaptureSnapshotAdmissionDiagnostics()
+                        .PendingReliableDeferrals, Is.EqualTo(1));
+
+                    serverTransport.HasPendingReliablePackets = false;
                     server.Tick(_ => { });
                     var second = ReceiveChunk(clientTransport);
                     Assert.That(second.PayloadKind,
                         Is.EqualTo(SnapshotPayloadKind.Keyframe));
-                    Assert.That(second.SnapshotTick, Is.EqualTo(2));
+                    Assert.That(second.SnapshotTick, Is.EqualTo(3));
 
                     var diagnostics =
                         server.CaptureSnapshotAdmissionDiagnostics();
                     Assert.That(diagnostics.Mode,
                         Is.EqualTo(NetworkSnapshotAdmissionMode.Current));
                     Assert.That(diagnostics.SuppressedSnapshots, Is.Zero);
+                    Assert.That(diagnostics.SnapshotBatchesAccepted,
+                        Is.EqualTo(2));
                     Assert.That(diagnostics.AcknowledgementGaps, Is.Zero);
                 }
             }
@@ -2022,6 +2038,14 @@ namespace UniGame.StaticEcs.Network.Tests
                             SnapshotChunkHeader.Size + 1));
                     Assert.That(serverTransport.SentPacketCount, Is.Zero);
                     Assert.That(clientTransport.TryReceive(out _), Is.False);
+                    var admission = server.CaptureSnapshotAdmissionDiagnostics();
+                    Assert.That(admission.PreflightRejections, Is.EqualTo(1));
+                    Assert.That(admission.SnapshotOfferAttempts,
+                        Is.EqualTo(admission.SnapshotBatchesAccepted +
+                            admission.CaptureFailures +
+                            admission.PreparationFailures +
+                            admission.PreflightRejections +
+                            admission.ChunkSendFailures));
 
                     serverTransport.CanAccept = true;
                     server.Tick(_ => { });
@@ -2077,6 +2101,10 @@ namespace UniGame.StaticEcs.Network.Tests
                         "the hard reliable limit must be checked first");
                     Assert.That(serverTransport.SentPacketCount, Is.Zero);
                     Assert.That(clientTransport.TryReceive(out _), Is.False);
+                    var admission = server.CaptureSnapshotAdmissionDiagnostics();
+                    Assert.That(admission.PreparationFailures, Is.EqualTo(1));
+                    Assert.That(admission.SnapshotOfferAttempts,
+                        Is.EqualTo(admission.PreparationFailures));
 
                     serverTransport.MaxReliablePayloadBytes =
                         serverEndpoint.MaxReliablePayloadBytes;
@@ -2142,6 +2170,14 @@ namespace UniGame.StaticEcs.Network.Tests
                         Is.EqualTo(1));
                     Assert.That(clientTransport.TryReceive(out _), Is.False,
                         "a raced TrySend rejection must consume its lease");
+                    var admission = server.CaptureSnapshotAdmissionDiagnostics();
+                    Assert.That(admission.ChunkSendFailures, Is.EqualTo(1));
+                    Assert.That(admission.SnapshotOfferAttempts,
+                        Is.EqualTo(admission.SnapshotBatchesAccepted +
+                            admission.CaptureFailures +
+                            admission.PreparationFailures +
+                            admission.PreflightRejections +
+                            admission.ChunkSendFailures));
 
                     serverTransport.FailOnSendNumber = 0;
                     server.Tick(_ => { });
@@ -2883,7 +2919,7 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         private sealed class PreflightNetworkTransport : INetworkTransport,
-            INetworkReliableSendPreflight
+            INetworkReliableSendPreflight, INetworkReliableSendState
         {
             private readonly INetworkTransport _inner;
 
@@ -2895,6 +2931,7 @@ namespace UniGame.StaticEcs.Network.Tests
             }
 
             internal bool CanAccept { get; set; } = true;
+            public bool HasPendingReliablePackets { get; set; }
             internal int PreflightCalls { get; private set; }
             internal int LastRequestedBytes { get; private set; }
             internal int SentPacketCount { get; private set; }

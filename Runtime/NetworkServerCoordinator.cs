@@ -34,6 +34,7 @@ namespace UniGame.StaticEcs.Network
         private long _pendingCommandBytesTotal;
         private int _pendingCommandsHighWater;
         private long _pendingCommandBytesHighWater;
+        private long _retiredHistoryEvictions;
 
         /// <summary>Creates a server coordinator with bounded per-scope history.</summary>
         internal NetworkServerCoordinator(int historyCapacity = 64,
@@ -86,13 +87,34 @@ namespace UniGame.StaticEcs.Network
             _pendingCommandBytes.Remove(connection);
             _processedCommands.Remove(connection);
             var removed = _sessions.Remove(connection);
-            if (removed && !ScopeIsActive(scope) && _history.TryGetValue(scope, out var history))
+            if (removed)
+                ForgetInactiveScope(scope);
+            return removed;
+        }
+        internal int HistoryScopeCount => _history.Count;
+        internal long HistoryLimitEvictions
+        {
+            get
             {
+                var count = _retiredHistoryEvictions;
+                foreach (var history in _history.Values)
+                    count += history.LimitEvictions;
+                return count;
+            }
+        }
+
+        internal bool ForgetInactiveScope(ScopeId scope)
+        {
+            if (ScopeIsActive(scope))
+                return false;
+            if (_history.TryGetValue(scope, out var history))
+            {
+                _retiredHistoryEvictions += history.LimitEvictions;
                 history.Clear();
                 _history.Remove(scope);
                 RebudgetHistories();
             }
-            return removed;
+            return true;
         }
 
         /// <summary>Validates and queues one command for canonical cross-peer ordering.</summary>
