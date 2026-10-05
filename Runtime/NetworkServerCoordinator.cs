@@ -402,6 +402,107 @@ namespace UniGame.StaticEcs.Network
         internal void Add(NetworkCommandResult result) { Total++; if (result == NetworkCommandResult.Dispatched) Accepted++; else if (result == NetworkCommandResult.PolicyRejected) Rejected++; }
     }
 
+    /// <summary>Contains a bounded duration distribution without retaining a per-sample collection.</summary>
+    public readonly struct NetworkTimingHistogram
+    {
+        public NetworkTimingHistogram(long samples, long sumMicroseconds,
+            long maxMicroseconds, long upTo25Milliseconds,
+            long upTo50Milliseconds, long upTo100Milliseconds,
+            long upTo200Milliseconds, long upTo400Milliseconds,
+            long upTo800Milliseconds, long overflow)
+        {
+            Samples = samples;
+            SumMicroseconds = sumMicroseconds;
+            MaxMicroseconds = maxMicroseconds;
+            UpTo25Milliseconds = upTo25Milliseconds;
+            UpTo50Milliseconds = upTo50Milliseconds;
+            UpTo100Milliseconds = upTo100Milliseconds;
+            UpTo200Milliseconds = upTo200Milliseconds;
+            UpTo400Milliseconds = upTo400Milliseconds;
+            UpTo800Milliseconds = upTo800Milliseconds;
+            Overflow = overflow;
+        }
+
+        public long Samples { get; }
+        public long SumMicroseconds { get; }
+        public long MaxMicroseconds { get; }
+        public long UpTo25Milliseconds { get; }
+        public long UpTo50Milliseconds { get; }
+        public long UpTo100Milliseconds { get; }
+        public long UpTo200Milliseconds { get; }
+        public long UpTo400Milliseconds { get; }
+        public long UpTo800Milliseconds { get; }
+        public long Overflow { get; }
+    }
+
+    internal struct NetworkTimingHistogramAccumulator
+    {
+        private long _samples;
+        private long _sumMicroseconds;
+        private long _maxMicroseconds;
+        private long _upTo25Milliseconds;
+        private long _upTo50Milliseconds;
+        private long _upTo100Milliseconds;
+        private long _upTo200Milliseconds;
+        private long _upTo400Milliseconds;
+        private long _upTo800Milliseconds;
+        private long _overflow;
+
+        internal void AddStopwatchTicks(long elapsedTicks)
+        {
+            if (elapsedTicks < 0)
+                return;
+            var microseconds = ToMicroseconds(elapsedTicks);
+            if (_samples < long.MaxValue)
+                _samples++;
+            if (_sumMicroseconds > long.MaxValue - microseconds)
+                _sumMicroseconds = long.MaxValue;
+            else
+                _sumMicroseconds += microseconds;
+            if (microseconds > _maxMicroseconds)
+                _maxMicroseconds = microseconds;
+            if (microseconds <= 25_000)
+                _upTo25Milliseconds = SaturatingIncrement(_upTo25Milliseconds);
+            else if (microseconds <= 50_000)
+                _upTo50Milliseconds = SaturatingIncrement(_upTo50Milliseconds);
+            else if (microseconds <= 100_000)
+                _upTo100Milliseconds = SaturatingIncrement(_upTo100Milliseconds);
+            else if (microseconds <= 200_000)
+                _upTo200Milliseconds = SaturatingIncrement(_upTo200Milliseconds);
+            else if (microseconds <= 400_000)
+                _upTo400Milliseconds = SaturatingIncrement(_upTo400Milliseconds);
+            else if (microseconds <= 800_000)
+                _upTo800Milliseconds = SaturatingIncrement(_upTo800Milliseconds);
+            else
+                _overflow = SaturatingIncrement(_overflow);
+        }
+
+        internal NetworkTimingHistogram Capture() => new NetworkTimingHistogram(
+            _samples, _sumMicroseconds, _maxMicroseconds,
+            _upTo25Milliseconds, _upTo50Milliseconds,
+            _upTo100Milliseconds, _upTo200Milliseconds,
+            _upTo400Milliseconds, _upTo800Milliseconds, _overflow);
+
+        private static long SaturatingIncrement(long value) =>
+            value == long.MaxValue ? value : value + 1;
+
+        private static long ToMicroseconds(long stopwatchTicks)
+        {
+            if (stopwatchTicks <= 0)
+                return 0;
+            var frequency = Stopwatch.Frequency;
+            var seconds = stopwatchTicks / frequency;
+            var remainder = stopwatchTicks % frequency;
+            if (seconds > long.MaxValue / 1_000_000L)
+                return long.MaxValue;
+            var microseconds = seconds * 1_000_000L;
+            var fraction = remainder * 1_000_000L / frequency;
+            return microseconds > long.MaxValue - fraction
+                ? long.MaxValue
+                : microseconds + fraction;
+        }
+    }
+
     /// <summary>Names the server work phases that the load profiler measures separately.</summary>
     public enum NetworkDiagnosticPhase
     {
@@ -435,8 +536,16 @@ namespace UniGame.StaticEcs.Network
         /// measurement to attribute that cost separately from send-side work.
         /// </summary>
         SnapshotCapture = 11,
+        /// <summary>Transport receive dequeue, including empty polls.</summary>
+        ReceiveDequeue = 12,
+        /// <summary>Packet framing and header decode.</summary>
+        DecodeHeader = 13,
+        /// <summary>Packet validation, duplicate classification, and fingerprint gate.</summary>
+        DecodeValidate = 14,
+        /// <summary>Dispatch of one network observer callback.</summary>
+        ObserverCallback = 15,
         /// <summary>Number of measured phases; not a valid phase value.</summary>
-        Count = 12,
+        Count = 16,
     }
 
     /// <summary>Receives allocation-free begin/end notifications for measured server phases.</summary>

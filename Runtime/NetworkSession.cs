@@ -276,7 +276,39 @@ namespace UniGame.StaticEcs.Network
         internal void Trace(NetworkPhase phase, NetworkTraceKind kind, NetworkResultCategory result, NetworkPacketKind packetKind, uint serverTick, uint targetTick, int bytes, int historyTicks, long historyBytes, int tickGap, long durationNanoseconds, int entities = 0, int records = 0, int commands = 0, int queueSize = 0, int activeConnections = -1, int activePeers = -1, int acceptedCommands = 0, int rejectedCommands = 0, NetworkResyncReason resyncReason = NetworkResyncReason.None, NetworkResyncSource resyncSource = NetworkResyncSource.None, uint resyncCorrelationId = 0, NetworkCommandResult? commandResult = null, SnapshotApplyResult? snapshotResult = null, PacketValidationResult? packetValidationResult = null, uint sequence = 0, uint acknowledgedSnapshotTick = 0, uint oldestHistoryTick = 0, uint newestHistoryTick = 0)
         {
             if (_observer == null) return;
-            try { var packets = phase == NetworkPhase.Receive || phase == NetworkPhase.Decode || phase == NetworkPhase.Send ? 1 : 0; var connections = activeConnections < 0 ? State == NetworkSessionState.Closed ? 0 : 1 : activeConnections; var peers = activePeers < 0 ? State == NetworkSessionState.Established ? 1 : 0 : activePeers; var value = new NetworkTraceEvent(phase, kind, result, Role, Connection.Value, PeerId, Epoch, serverTick, targetTick, bytes, packets, entities, records, commands, queueSize, historyTicks, connections, peers, Stopwatch.GetTimestamp(), packetKind, historyBytes, tickGap, durationNanoseconds, _schema.Fingerprint, acceptedCommands, rejectedCommands, resyncReason: resyncReason, resyncSource: resyncSource, resyncCorrelationId: resyncCorrelationId, commandResult: commandResult, snapshotResult: snapshotResult, packetValidationResult: packetValidationResult, sequence: sequence, acknowledgedSnapshotTick: acknowledgedSnapshotTick, oldestHistoryTick: oldestHistoryTick, newestHistoryTick: newestHistoryTick); _observer.Observe(in value); }
+            try
+            {
+                var packets = phase == NetworkPhase.Receive ||
+                    phase == NetworkPhase.Decode || phase == NetworkPhase.Send
+                    ? 1 : 0;
+                var connections = activeConnections < 0
+                    ? State == NetworkSessionState.Closed ? 0 : 1
+                    : activeConnections;
+                var peers = activePeers < 0
+                    ? State == NetworkSessionState.Established ? 1 : 0
+                    : activePeers;
+                var value = new NetworkTraceEvent(phase, kind, result, Role,
+                    Connection.Value, PeerId, Epoch, serverTick, targetTick,
+                    bytes, packets, entities, records, commands, queueSize,
+                    historyTicks, connections, peers, Stopwatch.GetTimestamp(),
+                    packetKind, historyBytes, tickGap, durationNanoseconds,
+                    _schema.Fingerprint, acceptedCommands, rejectedCommands,
+                    resyncReason: resyncReason, resyncSource: resyncSource,
+                    resyncCorrelationId: resyncCorrelationId,
+                    commandResult: commandResult, snapshotResult: snapshotResult,
+                    packetValidationResult: packetValidationResult,
+                    sequence: sequence,
+                    acknowledgedSnapshotTick: acknowledgedSnapshotTick,
+                    oldestHistoryTick: oldestHistoryTick,
+                    newestHistoryTick: newestHistoryTick);
+#if UNITY_EDITOR || GAME_DEBUG
+                using (NetworkDiagnosticMarkers.Measure(
+                           NetworkDiagnosticPhase.ObserverCallback))
+                    _observer.Observe(in value);
+#else
+                _observer.Observe(in value);
+#endif
+            }
             catch { }
         }
 
@@ -289,7 +321,13 @@ namespace UniGame.StaticEcs.Network
                 var value = new NetworkSessionDiagnostics(Role, State, Connection.Value, PeerId, Epoch, Scope, serverTick,
                     acknowledgedSnapshotTick, serverProcessedCommandSequence, _nextSendSequence, _nextReceiveSequence,
                     _nextReceivePacketSequence, nextSendPacketSequence);
+#if UNITY_EDITOR || GAME_DEBUG
+                using (NetworkDiagnosticMarkers.Measure(
+                           NetworkDiagnosticPhase.ObserverCallback))
+                    diagnostics.ObserveSession(in value);
+#else
                 diagnostics.ObserveSession(in value);
+#endif
             }
             catch { }
         }
@@ -303,7 +341,13 @@ namespace UniGame.StaticEcs.Network
                     snapshot.ServerTick, snapshot.SchemaFingerprint, snapshot.PayloadHash, snapshot.ByteLength,
                     snapshot.EntityCount, snapshot.RecordCount, history.Count, history.Bytes, history.OldestTick,
                     history.NewestTick, history.Capacity, history.MaxBytes);
+#if UNITY_EDITOR || GAME_DEBUG
+                using (NetworkDiagnosticMarkers.Measure(
+                           NetworkDiagnosticPhase.ObserverCallback))
+                    diagnostics.ObserveSnapshot(in value);
+#else
                 diagnostics.ObserveSnapshot(in value);
+#endif
             }
             catch { }
         }

@@ -165,6 +165,27 @@ namespace UniGame.StaticEcs.Network
         internal int RecordCount { get; }
     }
 
+    /// <summary>
+    /// Exact encoded-delta bytes associated with game-owned attributed entities. The total is the
+    /// encoded delta body length, excluding packet/chunk framing which the server reports apart.
+    /// </summary>
+    internal readonly struct SnapshotDeltaAttribution
+    {
+        internal SnapshotDeltaAttribution(long attributedRecordBytes,
+            long encodedSnapshotBytes, bool complete)
+        {
+            AttributedRecordBytes = attributedRecordBytes;
+            EncodedSnapshotBytes = encodedSnapshotBytes;
+            Complete = complete;
+        }
+
+        internal long AttributedRecordBytes { get; }
+        internal long EncodedSnapshotBytes { get; }
+        internal bool Complete { get; }
+        internal bool IsReconciled => Complete && AttributedRecordBytes >= 0 &&
+            AttributedRecordBytes <= EncodedSnapshotBytes;
+    }
+
     /// <summary>Owns one immutable pooled canonical full-snapshot buffer.</summary>
     public sealed class NetworkSnapshot : IDisposable
     {
@@ -175,6 +196,9 @@ namespace UniGame.StaticEcs.Network
         private ISnapshotLayoutPool _layoutPool;
         private int _layoutEntityCount;
         private int _layoutRecordCount;
+        private ulong[] _attributedEntityGids = Array.Empty<ulong>();
+        private int _attributedEntityCount;
+        private long _attributedCanonicalRecordBytes;
 
         internal NetworkSnapshot()
         {
@@ -201,6 +225,8 @@ namespace UniGame.StaticEcs.Network
             PayloadHash = Hashing.XxHash64(bytes.Span);
             EntityCount = entities;
             RecordCount = records;
+            _attributedEntityCount = 0;
+            _attributedCanonicalRecordBytes = 0;
         }
 
         /// <summary>Gets authoritative simulation time.</summary>
@@ -222,6 +248,26 @@ namespace UniGame.StaticEcs.Network
 
         internal byte[] Buffer => _bytes?.Buffer;
         internal int Offset => _bytes?.Offset ?? 0;
+        internal bool HasAttributedEntities => _attributedEntityCount > 0;
+        internal long AttributedCanonicalRecordBytes => _attributedCanonicalRecordBytes;
+
+        internal bool HasAttributedEntity(ulong gid) => _attributedEntityCount > 0 &&
+            Array.BinarySearch(_attributedEntityGids, 0, _attributedEntityCount, gid) >= 0;
+
+        internal void SetAttributedEntities(List<ulong> gids, long canonicalRecordBytes)
+        {
+            if (gids == null || gids.Count == 0)
+            {
+                _attributedEntityCount = 0;
+                _attributedCanonicalRecordBytes = 0;
+                return;
+            }
+            if (_attributedEntityGids.Length < gids.Count)
+                Array.Resize(ref _attributedEntityGids, gids.Count);
+            gids.CopyTo(_attributedEntityGids, 0);
+            _attributedEntityCount = gids.Count;
+            _attributedCanonicalRecordBytes = canonicalRecordBytes;
+        }
 
         // Creates an independently disposable, ref-counted view over one byte range of
         // this snapshot's canonical bytes. The caller owns the returned lease and may
@@ -305,6 +351,8 @@ namespace UniGame.StaticEcs.Network
             _layoutRecords = null;
             _layoutEntityCount = 0;
             _layoutRecordCount = 0;
+            _attributedEntityCount = 0;
+            _attributedCanonicalRecordBytes = 0;
             layoutPool?.ReturnEntities(layoutEntities);
             layoutPool?.ReturnRecords(layoutRecords);
 

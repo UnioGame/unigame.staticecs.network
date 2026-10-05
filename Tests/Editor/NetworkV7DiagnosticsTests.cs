@@ -567,7 +567,15 @@ namespace UniGame.StaticEcs.Network.Tests
                 Is.EqualTo(10));
             Assert.That((int)NetworkDiagnosticPhase.SnapshotCapture,
                 Is.EqualTo(11));
-            Assert.That((int)NetworkDiagnosticPhase.Count, Is.EqualTo(12));
+            Assert.That((int)NetworkDiagnosticPhase.ReceiveDequeue,
+                Is.EqualTo(12));
+            Assert.That((int)NetworkDiagnosticPhase.DecodeHeader,
+                Is.EqualTo(13));
+            Assert.That((int)NetworkDiagnosticPhase.DecodeValidate,
+                Is.EqualTo(14));
+            Assert.That((int)NetworkDiagnosticPhase.ObserverCallback,
+                Is.EqualTo(15));
+            Assert.That((int)NetworkDiagnosticPhase.Count, Is.EqualTo(16));
 
             CreateReplicationWorld<AuthorityWorld>(true);
             CreateReplicationWorld<ClientAWorld>(false);
@@ -610,6 +618,139 @@ namespace UniGame.StaticEcs.Network.Tests
                 NetworkDiagnosticMarkers.Sink = original;
                 World<AuthorityWorld>.Destroy();
                 World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ReceiveDecodeAndObserverDiagnosticScopesRemainBalanced()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            MemoryNetworkTransport.CreatePair(new ConnectionId(926),
+                out var clientTransport, out var serverTransport);
+            var original = NetworkDiagnosticMarkers.Sink;
+            var sink = new RecordingMarkerSink();
+            var observer = new TraceCollector();
+            try
+            {
+                NetworkDiagnosticMarkers.Sink = sink;
+                using (clientTransport)
+                using (serverTransport)
+                using (var server = new NetworkServer<AuthorityWorld>(
+                           Schema<AuthorityWorld>(true), static (_, _) => true,
+                           observer: observer))
+                using (var client = new NetworkClient<ClientAWorld>(
+                           clientTransport, Schema<ClientAWorld>(false),
+                           new ScopeId(1)))
+                {
+                    server.AddConnection(serverTransport, 1, 1,
+                        new ScopeId(1));
+                    client.BeginHandshake();
+                    server.Receive();
+
+                    var phases = new[]
+                    {
+                        NetworkDiagnosticPhase.ReceiveDequeue,
+                        NetworkDiagnosticPhase.DecodeHeader,
+                        NetworkDiagnosticPhase.DecodeValidate,
+                        NetworkDiagnosticPhase.ObserverCallback,
+                    };
+                    for (var i = 0; i < phases.Length; i++)
+                    {
+                        Assert.That(PhaseEventCount(sink, phases[i], true),
+                            Is.GreaterThan(0), "begin count for " + phases[i]);
+                        Assert.That(PhaseEventCount(sink, phases[i], false),
+                            Is.EqualTo(PhaseEventCount(sink, phases[i], true)),
+                            "end count for " + phases[i]);
+                    }
+                    Assert.That(sink.Begins, Is.EqualTo(sink.Ends));
+                }
+            }
+            finally
+            {
+                NetworkDiagnosticMarkers.Sink = original;
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void SnapshotApplicationAckTimingTracksOnlyExactOutstandingAck()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(927),
+                    out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                using (var server = new NetworkServer<AuthorityWorld>(schema,
+                           static (_, _) => true,
+                           snapshotAdmissionMode:
+                               NetworkSnapshotAdmissionMode.ApplicationAck))
+                {
+                    server.AddConnection(serverTransport, 1, 1,
+                        new ScopeId(72));
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(clientTransport.TryReceive(out var ready),
+                        Is.True);
+                    ready.Dispose();
+
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).SnapshotTick,
+                        Is.EqualTo(1));
+
+                    var initial = server.CaptureSnapshotAdmissionDiagnostics()
+                        .ApplicationAck;
+                    Assert.That(initial.Samples, Is.Zero);
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 2, 1);
+                    server.Receive();
+                    var first = server.CaptureSnapshotAdmissionDiagnostics()
+                        .ApplicationAck;
+                    Assert.That(first.Samples, Is.EqualTo(1));
+
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(clientTransport).SnapshotTick,
+                        Is.EqualTo(2));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 3, 1);
+                    server.Receive();
+                    var old = server.CaptureSnapshotAdmissionDiagnostics()
+                        .ApplicationAck;
+                    Assert.That(old.Samples, Is.EqualTo(1),
+                        "an old ACK must not consume the newer submission");
+
+                    server.Tick(_ => { });
+                    AssertNoPacket(clientTransport,
+                        "an old ACK must leave the newer batch outstanding");
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 4, 2);
+                    server.Receive();
+                    var current = server.CaptureSnapshotAdmissionDiagnostics()
+                        .ApplicationAck;
+                    Assert.That(current.Samples, Is.EqualTo(2));
+
+                    SendPeerPacket(clientTransport, schema.Fingerprint,
+                        PacketKind.Ack, 1, 5, 2);
+                    server.Receive();
+                    var duplicate = server.CaptureSnapshotAdmissionDiagnostics()
+                        .ApplicationAck;
+                    Assert.That(duplicate.Samples, Is.EqualTo(2),
+                        "a duplicate ACK must not be counted twice");
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
             }
         }
 

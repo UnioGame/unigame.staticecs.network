@@ -652,8 +652,9 @@ namespace UniGame.StaticEcs.Network.Tests
                 provider.ScopeCells[scopeOne] = new[] { sharedCell, cellOne };
                 provider.ScopeCells[scopeTwo] = new[] { sharedCell, cellTwo };
 
+                using var pool = new NetworkBufferPool(1L << 20);
                 var replicator = new NetworkReplicator<AuthorityWorld>(schema,
-                    static (_, _) => true, scopeProvider: provider);
+                    static (_, _) => true, scopeProvider: provider, bufferPool: pool);
                 try
                 {
                     Assert.That(replicator.Capture(1, scopeOne, out var snapshotOne),
@@ -695,10 +696,16 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(replicator.CellCacheEntryCount, Is.EqualTo(1),
                         "inactive cell entries are still evicted after 64 ticks");
                     afterEviction.Dispose();
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1),
+                        "eviction must return every old cell lease while the current cell keeps " +
+                        "its published canonical bytes");
                 }
                 finally
                 {
                     replicator.Dispose();
+                    replicator.Dispose();
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero,
+                        "repeated replicator disposal must release the remaining cell cache lease");
                 }
             }
             finally
@@ -808,8 +815,12 @@ namespace UniGame.StaticEcs.Network.Tests
                 baselineSnapshot.Dispose();
                 exactSnapshot.Dispose();
 
+                baseline.Dispose();
+                exact.Dispose();
+                baseline.Dispose();
+                exact.Dispose();
                 Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero,
-                    "all transition snapshots must return their pooled leases");
+                    "disposing both cell caches must return every pooled lease exactly once");
             }
             finally
             {
@@ -852,8 +863,13 @@ namespace UniGame.StaticEcs.Network.Tests
                     Is.EqualTo(SnapshotCaptureResult.LimitExceeded));
                 Assert.That(snapshot, Is.Null,
                     "aggregate payload rejection must not publish a partial snapshot");
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(2),
+                    "aggregate payload rejection must retain only its two published cell leases, " +
+                    "never a merge lease");
+                replicator.Dispose();
+                replicator.Dispose();
                 Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero,
-                    "aggregate payload rejection must not retain a merge lease");
+                    "disposing the rejected capture's cell caches returns both leases");
             }
             finally
             {
@@ -878,33 +894,219 @@ namespace UniGame.StaticEcs.Network.Tests
                 provider.ScopeCells[scope] = new[] { cell };
 
                 var policy = new StubHoldEverythingPolicy();
+                using var pool = new NetworkBufferPool(1L << 20);
                 var replicator = new NetworkReplicator<AuthorityWorld>(schema,
-                    static (_, _) => true, scopeProvider: provider, updatePolicy: policy);
+                    static (_, _) => true, scopeProvider: provider, bufferPool: pool,
+                    updatePolicy: policy);
                 try
                 {
                     Assert.That(replicator.Capture(1, scope, out var first),
                         Is.EqualTo(SnapshotCaptureResult.Success));
+                    var firstBytes = first.Bytes.ToArray();
+                    first.Dispose();
+
                     entity.Set(new TestComponent { Value = 999 });
-                    Assert.That(replicator.Capture(2, scope, out var second),
+                    provider.CellEntities[cell].Clear();
+                    Assert.That(replicator.Capture(2, scope, out var empty),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(empty.EntityCount, Is.Zero);
+                    empty.Dispose();
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1),
+                        "an empty capture keeps the prior cell lease for a future hold");
+
+                    provider.CellEntities[cell].Add(entity);
+                    Assert.That(replicator.Capture(3, scope, out var reappeared),
                         Is.EqualTo(SnapshotCaptureResult.Success));
 
-                    Assert.That(second.Bytes.Span.SequenceEqual(first.Bytes.Span), Is.True,
+                    Assert.That(reappeared.Bytes.Span.SequenceEqual(firstBytes), Is.True,
                         "the NCORE-16 hold policy must still apply per cell under merge-capture: " +
                         "a held entity's captured bytes must not move even though the live ECS " +
                         "value did");
 
-                    first.Dispose();
-                    second.Dispose();
+                    reappeared.Dispose();
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1),
+                        "the replacement cache lease remains live until its cell is released");
                 }
                 finally
                 {
                     replicator.Dispose();
+                    replicator.Dispose();
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero,
+                        "cell cache disposal must release the held baseline lease");
                 }
             }
             finally
             {
                 World<AuthorityWorld>.Destroy();
             }
+        }
+
+        [Test]
+        public void CaptureViaCellsKeepsPublishedLeaseAcrossHookFailureAndRecovery()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                entity.Set(new TestComponent { Value = 1 });
+
+                var cell = new ScopeId(511);
+                var scope = new ScopeId(512);
+                var provider = new StubCellularScopeProvider();
+                provider.CellEntities[cell] = new List<World<AuthorityWorld>.Entity> { entity };
+                provider.ScopeCells[scope] = new[] { cell };
+
+                var policy = new ThrowingHoldPolicy();
+                using var pool = new NetworkBufferPool(1L << 20);
+                var replicator = new NetworkReplicator<AuthorityWorld>(schema,
+                    static (_, _) => true, scopeProvider: provider, bufferPool: pool,
+                    updatePolicy: policy);
+                try
+                {
+                    Assert.That(replicator.Capture(1, scope, out var first),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    var firstBytes = first.Bytes.ToArray();
+                    first.Dispose();
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1));
+
+                    entity.Set(new TestComponent { Value = 999 });
+                    policy.Throw = true;
+                    Assert.That(replicator.Capture(2, scope, out var failed),
+                        Is.EqualTo(SnapshotCaptureResult.HookFailed));
+                    Assert.That(failed, Is.Null,
+                        "a failed capture must not publish a partial cell cache");
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1),
+                        "the unpublished lease returns while the prior cache stays available");
+
+                    policy.Throw = false;
+                    Assert.That(replicator.Capture(3, scope, out var recovered),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(recovered.Bytes.Span.SequenceEqual(firstBytes), Is.True,
+                        "the recovery hold must read the last successfully published cell bytes");
+                    recovered.Dispose();
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1));
+                }
+                finally
+                {
+                    replicator.Dispose();
+                    replicator.Dispose();
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero,
+                        "the recovery cache lease must be released exactly once");
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void CaptureViaCellsShrinksLeaseFromPriorLogicalLength()
+        {
+            World<LargePayloadWorld>.Create(WorldConfig.Default());
+            var types = World<LargePayloadWorld>.Types();
+            types.RegisterAll(typeof(NetworkOwnerComponent).Assembly);
+            types.EntityType<LargePayloadEntity>();
+            types.Component<LargePayloadComponent>();
+            World<LargePayloadWorld>.Initialize();
+            try
+            {
+                var schema = LargePayloadSchema();
+                var entity = World<LargePayloadWorld>.NewEntity<LargePayloadEntity>();
+                entity.Set(new LargePayloadComponent { PayloadBytes = 8192 });
+
+                var cell = new ScopeId(721);
+                var scope = new ScopeId(723);
+                var provider = new LargePayloadCellularScopeProvider();
+                provider.CellEntities[cell] = new List<World<LargePayloadWorld>.Entity> { entity };
+                provider.ScopeCells[scope] = new[] { cell };
+
+                using var pool = new NetworkBufferPool(1L << 20);
+                var replicator = new NetworkReplicator<LargePayloadWorld>(schema,
+                    static (_, _) => true, scopeProvider: provider, bufferPool: pool);
+                try
+                {
+                    Assert.That(replicator.Capture(1, scope, out var largeSnapshot),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    largeSnapshot.Dispose();
+
+                    entity.Set(new LargePayloadComponent { PayloadBytes = 1 });
+                    Assert.That(replicator.Capture(2, scope, out var firstSmallSnapshot),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    firstSmallSnapshot.Dispose();
+
+                    Assert.That(replicator.Capture(3, scope, out var smallSnapshot),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    smallSnapshot.Dispose();
+
+                    var diagnostics = pool.CaptureDiagnostics();
+                    Assert.That(replicator.CellCacheEntryCount, Is.EqualTo(1));
+                    Assert.That(diagnostics.OutstandingLeases, Is.EqualTo(1),
+                        "only the small cell's published lease remains live");
+                    Assert.That(diagnostics.OutstandingBytes, Is.EqualTo(256),
+                        "the live cell cache capacity is rounded from its prior logical payload, " +
+                        "not from a retained capacity or global high-water mark");
+                }
+                finally
+                {
+                    replicator.Dispose();
+                    replicator.Dispose();
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                }
+            }
+            finally
+            {
+                World<LargePayloadWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void CaptureViaCellsKeepsPublishedLeaseAcrossInvalidEntityAndRecovery()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                entity.Set(new TestComponent { Value = 1 });
+                var cell = new ScopeId(801);
+                var scope = new ScopeId(802);
+                var provider = new StubCellularScopeProvider();
+                provider.CellEntities[cell] = new List<World<AuthorityWorld>.Entity> { entity };
+                provider.ScopeCells[scope] = new[] { cell };
+                using var pool = new NetworkBufferPool(1L << 20);
+                var replicator = new NetworkReplicator<AuthorityWorld>(schema,
+                    static (_, _) => true, scopeProvider: provider, bufferPool: pool,
+                    updatePolicy: new ThrowingHoldPolicy());
+                try
+                {
+                    Assert.That(replicator.Capture(1, scope, out var first), Is.EqualTo(SnapshotCaptureResult.Success));
+                    var canonical = first.Bytes.ToArray();
+                    first.Dispose();
+                    var publishedBytes = pool.CaptureDiagnostics().OutstandingBytes;
+                    entity.Set(new TestComponent { Value = 999 });
+                    provider.AllowDuplicateEntities = true;
+                    provider.CellEntities[cell].Add(entity);
+                    Assert.That(replicator.Capture(2, scope, out var invalid), Is.EqualTo(SnapshotCaptureResult.InvalidEntity));
+                    Assert.That(invalid, Is.Null);
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1));
+                    Assert.That(pool.CaptureDiagnostics().OutstandingBytes, Is.EqualTo(publishedBytes));
+                    provider.CellEntities[cell].RemoveAt(1);
+                    Assert.That(replicator.Capture(3, scope, out var recovered), Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(recovered.Bytes.Span.SequenceEqual(canonical), Is.True);
+                    recovered.Dispose();
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1));
+                }
+                finally
+                {
+                    replicator.Dispose();
+                    replicator.Dispose();
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                    Assert.That(pool.CaptureDiagnostics().OutstandingBytes, Is.Zero);
+                }
+            }
+            finally { World<AuthorityWorld>.Destroy(); }
         }
 
         private static int GetOrZero(Dictionary<ScopeId, int> counts, ScopeId key) =>
@@ -930,11 +1132,14 @@ namespace UniGame.StaticEcs.Network.Tests
 
         public struct LargePayloadComponent : IComponent, INetworkType
         {
+            public int PayloadBytes;
+
             public void Write<TWorld>(ref BinaryPackWriter writer,
                 World<TWorld>.Entity self) where TWorld : struct, IWorldType
             {
-                writer.EnsureSize((uint)LargePayloadBytesPerCell);
-                for (var i = 0; i < LargePayloadBytesPerCell; i++)
+                var payloadBytes = PayloadBytes == 0 ? LargePayloadBytesPerCell : PayloadBytes;
+                writer.EnsureSize((uint)payloadBytes);
+                for (var i = 0; i < payloadBytes; i++)
                     writer.WriteByte(0);
             }
 
@@ -956,6 +1161,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 new Dictionary<ScopeId, ScopeId[]>();
             internal readonly Dictionary<ScopeId, int> CollectCellCallCounts =
                 new Dictionary<ScopeId, int>();
+            internal bool AllowDuplicateEntities;
 
             public void RefreshTick(uint serverTick) { }
 
@@ -981,7 +1187,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 if (!CellEntities.TryGetValue(cellId, out var entities))
                     return;
                 for (var i = 0; i < entities.Count; i++)
-                    if (seen.Add(entities[i].GID))
+                    if (seen.Add(entities[i].GID) || AllowDuplicateEntities)
                         buffer.Add(entities[i]);
             }
         }
@@ -1026,6 +1232,19 @@ namespace UniGame.StaticEcs.Network.Tests
         {
             public bool ShouldHold(uint serverTick, ScopeId scope,
                 in World<AuthorityWorld>.Entity entity, EntityGID gid) => true;
+        }
+
+        private sealed class ThrowingHoldPolicy : INetworkUpdatePolicy<AuthorityWorld>
+        {
+            internal bool Throw;
+
+            public bool ShouldHold(uint serverTick, ScopeId scope,
+                in World<AuthorityWorld>.Entity entity, EntityGID gid)
+            {
+                if (Throw)
+                    throw new InvalidOperationException("test capture failure");
+                return true;
+            }
         }
     }
 }

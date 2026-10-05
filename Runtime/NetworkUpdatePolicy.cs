@@ -42,4 +42,28 @@ namespace UniGame.StaticEcs.Network
         bool ShouldHold(uint serverTick, ScopeId scope, in World<TWorld>.Entity entity,
             EntityGID gid);
     }
+
+    /// <summary>
+    /// Marks an update policy whose hold decision depends on the observing scope. The immutable
+    /// epoch becomes part of the cellular capture-cache identity, so captures from distinct
+    /// scopes never reuse bytes selected for another observer relationship.
+    /// </summary>
+    public interface INetworkScopeCaptureVariantPolicy<TWorld> : INetworkUpdatePolicy<TWorld>
+        where TWorld : struct, IWorldType
+    {
+        /// <summary>Gets the immutable startup policy identity for cached capture variants.</summary>
+        ulong CapturePolicyEpoch { get; }
+    }
+
+    /// <summary>
+    /// Lets a game-owned update policy identify records for aggregate transport attribution.
+    /// The shared network package only asks this question while capturing an authority snapshot;
+    /// it never references gameplay types or components itself.
+    /// </summary>
+    public interface INetworkSnapshotAttributionPolicy<TWorld>
+        where TWorld : struct, IWorldType
+    {
+        /// <summary>Returns whether this entity's encoded snapshot records belong to the metric.</summary>
+        bool ShouldAttribute(in World<TWorld>.Entity entity, EntityGID gid);
+    }
 }
