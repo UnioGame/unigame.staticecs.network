@@ -30,6 +30,26 @@ namespace UniGame.StaticEcs.Network
         bool HasPendingReliablePackets { get; }
     }
 
+    /// <summary>Identifies the latest snapshot delivery callback observed by the transport owner.</summary>
+    public readonly struct NetworkReliableDeliveryObservation
+    {
+        public NetworkReliableDeliveryObservation(uint snapshotServerTick, long observedStopwatchTicks)
+        {
+            SnapshotServerTick = snapshotServerTick;
+            ObservedStopwatchTicks = observedStopwatchTicks;
+        }
+
+        public uint SnapshotServerTick { get; }
+        /// <summary>Owner callback time in Stopwatch ticks; zero means unavailable, not native ACK time.</summary>
+        public long ObservedStopwatchTicks { get; }
+    }
+
+    /// <summary>Exposes snapshot delivery observations on the transport owner thread.</summary>
+    public interface INetworkReliableDeliveryObservation
+    {
+        NetworkReliableDeliveryObservation LastSnapshotDeliveryObservation { get; }
+    }
+
     /// <summary>Allows a reliable transport to advertise whether a complete packet can currently be accepted.</summary>
     public interface INetworkReliableSendPreflight
     {

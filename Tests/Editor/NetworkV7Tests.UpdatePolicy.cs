@@ -327,6 +327,175 @@ namespace UniGame.StaticEcs.Network.Tests
             }
         }
 
+        [Test]
+        public void ScopeCaptureVariantsIsolateHeldBytesAndBoundTheirCacheLifetime()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                entity.Set(new TestComponent { Value = 1 });
+                var cell = new ScopeId(701);
+                var heldScope = new ScopeId(702);
+                var freshScope = new ScopeId(703);
+                var provider = new StubCellularScopeProvider();
+                provider.CellEntities[cell] = new List<World<AuthorityWorld>.Entity> { entity };
+                provider.ScopeCells[heldScope] = new[] { cell };
+                provider.ScopeCells[freshScope] = new[] { cell };
+                var policy = new ScopeVariantStubPolicy(heldScope);
+                using var pool = new NetworkBufferPool(1L << 20);
+                var replicator = new NetworkReplicator<AuthorityWorld>(schema,
+                    static (_, _) => true, scopeProvider: provider, updatePolicy: policy,
+                    bufferPool: pool);
+                try
+                {
+                    Assert.That(replicator.Capture(1, heldScope, out var heldFirst),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(replicator.Capture(1, freshScope, out var freshFirst),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(replicator.CellCaptureVariantCount, Is.EqualTo(2),
+                        "the same cell needs distinct capture state for distinct observing scopes");
+                    Assert.That(GetOrZero(provider.CollectCellCallCounts, cell), Is.EqualTo(2),
+                        "a scope-relative policy must not reuse one scope's held bytes for another");
+                    heldFirst.Dispose();
+                    freshFirst.Dispose();
+
+                    entity.Set(new TestComponent { Value = 2 });
+                    Assert.That(replicator.Capture(2, heldScope, out var heldSecond),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(replicator.Capture(2, freshScope, out var freshSecond),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(ContainsIntValue(heldSecond.Bytes.Span, 1), Is.True,
+                        "the held scope keeps its own cached entity bytes");
+                    Assert.That(ContainsIntValue(freshSecond.Bytes.Span, 2), Is.True,
+                        "another scope must capture the live entity when its policy refreshes it");
+                    heldSecond.Dispose();
+                    freshSecond.Dispose();
+
+                    replicator.ForgetScope(heldScope);
+                    Assert.That(replicator.CellCaptureVariantCount, Is.EqualTo(1),
+                        "last-consumer cleanup removes only the departed scope variant");
+
+                    entity.Set(new TestComponent { Value = 3 });
+                    Assert.That(replicator.Capture(3, heldScope, out var rejoined),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(ContainsIntValue(rejoined.Bytes.Span, 3), Is.True,
+                        "a rejoined scope starts from a fresh capture, even when it would hold");
+                    rejoined.Dispose();
+
+                    Assert.That(replicator.Capture(68, freshScope, out var afterStaleBound),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    afterStaleBound.Dispose();
+                    Assert.That(replicator.CellCaptureVariantCount, Is.EqualTo(1),
+                        "the 64-tick stale bound releases inactive capture variants");
+                    Assert.That(replicator.CellCaptureVariantEvictions, Is.GreaterThanOrEqualTo(3));
+                }
+                finally
+                {
+                    replicator.Dispose();
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void SnapshotAttributionLeavesDeltaRecoveryWireIdentical()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var marked = World<AuthorityWorld>.NewEntity<TestEntity>();
+                marked.Set(new TestComponent { Value = 1 });
+                var unmarked = World<AuthorityWorld>.NewEntity<TestEntity>();
+                unmarked.Set(new TestComponent { Value = 10 });
+                var scope = new ScopeId(801);
+                var policy = new AttributionStubPolicy(marked.GID.Raw);
+                using var pool = new NetworkBufferPool(1L << 20);
+                var plain = new NetworkReplicator<AuthorityWorld>(schema,
+                    static (_, _) => true);
+                var attributed = new NetworkReplicator<AuthorityWorld>(schema,
+                    static (_, _) => true, updatePolicy: policy);
+                NetworkSnapshot plainBaseline = null;
+                NetworkSnapshot plainTarget = null;
+                NetworkSnapshot attributedBaseline = null;
+                NetworkSnapshot attributedTarget = null;
+                NetworkBufferLease plainDelta = null;
+                NetworkBufferLease attributedDelta = null;
+                NetworkBufferLease reconstructed = null;
+                try
+                {
+                    Assert.That(plain.Capture(1, scope, out plainBaseline),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(attributed.Capture(1, scope, out attributedBaseline),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(plainBaseline.Bytes.Span.SequenceEqual(
+                        attributedBaseline.Bytes.Span), Is.True);
+
+                    marked.Set(new TestComponent { Value = 2 });
+                    Assert.That(plain.Capture(2, scope, out plainTarget),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(attributed.Capture(2, scope, out attributedTarget),
+                        Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(plainTarget.Bytes.Span.SequenceEqual(
+                        attributedTarget.Bytes.Span), Is.True);
+
+                    Assert.That(SnapshotDeltaCodec.TryEncode(pool, plainBaseline,
+                        plainTarget, out plainDelta, schema.DeltaHooks), Is.True);
+                    Assert.That(SnapshotDeltaCodec.TryEncode(pool, attributedBaseline,
+                        attributedTarget, out attributedDelta, schema.DeltaHooks,
+                        out var attribution), Is.True);
+                    Assert.That(attributedDelta.Span.SequenceEqual(plainDelta.Span), Is.True,
+                        "attribution is observational and must not change the ordinary delta wire");
+                    // This fixture has one changed TestComponent. The delta body is its
+                    // one-byte version plus three uint32 header fields, followed by the
+                    // zero skip, PatchFast opcode, one-byte mask, four-byte payload length,
+                    // and the four-byte TestComponent value.
+                    const int deltaHeaderBytes = 1 + sizeof(uint) * 3;
+                    const int markedPatchBytes = 1 + 1 + 1 + 1 + sizeof(int);
+                    var expectedEncodedDeltaBytes = deltaHeaderBytes + markedPatchBytes;
+                    Assert.That(attribution.AttributedRecordBytes,
+                        Is.EqualTo(markedPatchBytes),
+                        "attribution covers only the marked PatchFast operation");
+                    Assert.That(attribution.EncodedSnapshotBytes,
+                        Is.EqualTo(expectedEncodedDeltaBytes),
+                        "encoded attribution total is the complete delta body");
+                    Assert.That(attributedDelta.Length,
+                        Is.EqualTo(expectedEncodedDeltaBytes));
+                    Assert.That(attribution.IsReconciled, Is.True);
+
+                    var header = DeltaHeader(attributedBaseline, attributedTarget);
+                    Assert.That(SnapshotDeltaCodec.TryReconstruct(pool, attributedBaseline,
+                        attributedDelta.Span, in header, schema.Fingerprint, scope,
+                        out reconstructed, out _, out _, schema.DeltaHooks), Is.True);
+                    Assert.That(reconstructed.Span.SequenceEqual(attributedTarget.Bytes.Span),
+                        Is.True, "attribution must preserve ordinary baseline recovery");
+                }
+                finally
+                {
+                    reconstructed?.Dispose();
+                    attributedDelta?.Dispose();
+                    plainDelta?.Dispose();
+                    attributedTarget?.Dispose();
+                    attributedBaseline?.Dispose();
+                    plainTarget?.Dispose();
+                    plainBaseline?.Dispose();
+                    attributed.Dispose();
+                    plain.Dispose();
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
         // Looks for a little-endian int32 anywhere in a canonical snapshot's bytes. Good enough to
         // distinguish "the held/frozen value" from "the live value" in these tests without decoding
         // the whole wire format by hand.
@@ -362,6 +531,39 @@ namespace UniGame.StaticEcs.Network.Tests
                     return serverTick % RefreshEveryNthTick != 0;
                 return HoldEverything || HoldGids.Contains(gid.Raw);
             }
+        }
+
+        private sealed class ScopeVariantStubPolicy :
+            INetworkScopeCaptureVariantPolicy<AuthorityWorld>
+        {
+            private readonly ScopeId _heldScope;
+
+            internal ScopeVariantStubPolicy(ScopeId heldScope)
+            {
+                _heldScope = heldScope;
+            }
+
+            public ulong CapturePolicyEpoch => 1;
+
+            public bool ShouldHold(uint serverTick, ScopeId scope,
+                in World<AuthorityWorld>.Entity entity, EntityGID gid) => scope == _heldScope;
+        }
+
+        private sealed class AttributionStubPolicy : INetworkUpdatePolicy<AuthorityWorld>,
+            INetworkSnapshotAttributionPolicy<AuthorityWorld>
+        {
+            private readonly ulong _markedGid;
+
+            internal AttributionStubPolicy(ulong markedGid)
+            {
+                _markedGid = markedGid;
+            }
+
+            public bool ShouldHold(uint serverTick, ScopeId scope,
+                in World<AuthorityWorld>.Entity entity, EntityGID gid) => false;
+
+            public bool ShouldAttribute(in World<AuthorityWorld>.Entity entity,
+                EntityGID gid) => gid.Raw == _markedGid;
         }
     }
 }

@@ -1236,6 +1236,156 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
+        public void DeliveryCallbackTimingSurvivesDeferralPreflightAndSendFailure()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(1826), out var client, out var endpoint);
+                var now = 12 * Stopwatch.Frequency;
+                using (client)
+                using (var transport = new PreflightNetworkTransport(endpoint))
+                using (var server = new NetworkServer<AuthorityWorld>(schema, static (_, _) => true,
+                           monotonicTimestamp: () => now))
+                {
+                    server.AddConnection(transport, 1, 1, new ScopeId(71));
+                    SendPeerPacket(client, schema.Fingerprint, PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(client.TryReceive(out var ready), Is.True);
+                    ready.Dispose();
+                    var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    entity.Set(new TestComponent { Value = 1 });
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(client).SnapshotTick, Is.EqualTo(1));
+                    SendPeerPacket(client, schema.Fingerprint, PacketKind.Ack, 1, 2, 1);
+                    server.Receive();
+                    transport.LastSnapshotDeliveryObservation = new NetworkReliableDeliveryObservation(
+                        1, 10 * Stopwatch.Frequency);
+                    transport.HasPendingReliablePackets = true;
+                    server.Tick(_ => { });
+                    AssertNoPacket(client, "pending reliable must still defer");
+                    transport.HasPendingReliablePackets = false;
+                    transport.CanAccept = false;
+                    server.Tick(_ => { });
+                    AssertNoPacket(client, "preflight rejected");
+                    transport.CanAccept = true;
+                    transport.ResetSentPackets();
+                    transport.FailOnSendNumber = 1;
+                    server.Tick(_ => { });
+                    AssertNoPacket(client, "send rejected");
+                    Assert.That(server.CaptureSnapshotAdmissionDiagnostics()
+                        .CallbackToSnapshotAdmission.Samples, Is.Zero);
+                    transport.FailOnSendNumber = 0;
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(client).SnapshotTick, Is.EqualTo(5));
+                    var timing = server.CaptureSnapshotAdmissionDiagnostics().CallbackToSnapshotAdmission;
+                    Assert.That(timing.Samples, Is.EqualTo(1));
+                    Assert.That(timing.SumMicroseconds, Is.EqualTo(2_000_000));
+                    server.Tick(_ => { });
+                    ReceiveChunk(client);
+                    Assert.That(server.CaptureSnapshotAdmissionDiagnostics()
+                        .CallbackToSnapshotAdmission.Samples, Is.EqualTo(1), "Observation cannot be reused.");
+                }
+            }
+            finally { World<AuthorityWorld>.Destroy(); }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void RecoveryAdmissionDoesNotConsumePreRecoveryCallback(bool acknowledgementGap)
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(1828), out var client, out var endpoint);
+                using (client)
+                using (var transport = new PreflightNetworkTransport(endpoint))
+                using (var server = new NetworkServer<AuthorityWorld>(schema, static (_, _) => true,
+                           snapshotAdmissionMode: NetworkSnapshotAdmissionMode.ApplicationAck,
+                           monotonicTimestamp: () => 12 * Stopwatch.Frequency))
+                {
+                    server.AddConnection(transport, 1, 1, new ScopeId(71));
+                    SendPeerPacket(client, schema.Fingerprint, PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(client.TryReceive(out var ready), Is.True);
+                    ready.Dispose();
+                    server.Tick(_ => { });
+                    ReceiveChunk(client);
+                    SendPeerPacket(client, schema.Fingerprint, PacketKind.Ack, 1, 2, 1);
+                    server.Receive();
+                    server.Tick(_ => { });
+                    Assert.That(ReceiveChunk(client).SnapshotTick, Is.EqualTo(2));
+                    transport.LastSnapshotDeliveryObservation = new NetworkReliableDeliveryObservation(
+                        2, 10 * Stopwatch.Frequency);
+                    if (acknowledgementGap)
+                        SendPeerPacket(client, schema.Fingerprint, PacketKind.Ack, 1, 3, 99);
+                    else
+                        SendResyncRequest(client, schema.Fingerprint, 1, 3, 7);
+                    server.Receive();
+                    for (var index = 0; index < 11; index++)
+                    {
+                        server.Tick(_ => { });
+                        while (client.TryReceive(out var packet)) packet.Dispose();
+                    }
+                    Assert.That(server.CaptureSnapshotAdmissionDiagnostics()
+                        .CallbackToSnapshotAdmission.Samples, Is.Zero);
+                    Assert.That(server.CaptureSnapshotAdmissionDiagnostics()
+                        .RecoveryBatchesAccepted, Is.GreaterThan(1));
+                }
+            }
+            finally { World<AuthorityWorld>.Destroy(); }
+        }
+
+        [TestCase(0u, 1, false)]
+        [TestCase(99u, 1, false)]
+        [TestCase(1u, 0, false)]
+        [TestCase(1u, 13, false)]
+        [TestCase(1u, 1, true)]
+        public void DeliveryCallbackTimingRejectsUnavailableWrongTickFutureAndOldScope(
+            uint observedTick, int observedSeconds, bool changeScope)
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var schema = Schema<AuthorityWorld>(true);
+                var provider = new StubScopeProvider();
+                provider.ScopeEntities[new ScopeId(71)] = new List<World<AuthorityWorld>.Entity>();
+                provider.ScopeEntities[new ScopeId(72)] = new List<World<AuthorityWorld>.Entity>();
+                MemoryNetworkTransport.CreatePair(new ConnectionId(1827), out var client, out var endpoint);
+                using (client)
+                using (var transport = new PreflightNetworkTransport(endpoint))
+                using (var server = new NetworkServer<AuthorityWorld>(schema, static (_, _) => true,
+                           scopeProvider: provider, monotonicTimestamp: () => 12 * Stopwatch.Frequency))
+                {
+                    server.AddConnection(transport, 1, 1, new ScopeId(71));
+                    SendPeerPacket(client, schema.Fingerprint, PacketKind.Hello, 0, 1, 0);
+                    server.Receive();
+                    Assert.That(client.TryReceive(out var ready), Is.True);
+                    ready.Dispose();
+                    server.Tick(_ => { });
+                    ReceiveChunk(client);
+                    transport.LastSnapshotDeliveryObservation = new NetworkReliableDeliveryObservation(
+                        observedTick, observedSeconds * Stopwatch.Frequency);
+                    if (changeScope)
+                    {
+                        provider.Assignments[1] = new ScopeId(72);
+                        transport.HasPendingReliablePackets = true;
+                        server.Tick(_ => { });
+                        AssertNoPacket(client, "scope change must preserve transport pending admission");
+                        transport.HasPendingReliablePackets = false;
+                    }
+                    server.Tick(_ => { });
+                    ReceiveChunk(client);
+                    Assert.That(server.CaptureSnapshotAdmissionDiagnostics()
+                        .CallbackToSnapshotAdmission.Samples, Is.Zero);
+                }
+            }
+            finally { World<AuthorityWorld>.Destroy(); }
+        }
+
+        [Test]
         public void CurrentSnapshotAdmissionRemainsTransportPendingDriven()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
@@ -2919,7 +3069,7 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         private sealed class PreflightNetworkTransport : INetworkTransport,
-            INetworkReliableSendPreflight, INetworkReliableSendState
+            INetworkReliableSendPreflight, INetworkReliableSendState, INetworkReliableDeliveryObservation
         {
             private readonly INetworkTransport _inner;
 
@@ -2932,6 +3082,7 @@ namespace UniGame.StaticEcs.Network.Tests
 
             internal bool CanAccept { get; set; } = true;
             public bool HasPendingReliablePackets { get; set; }
+            public NetworkReliableDeliveryObservation LastSnapshotDeliveryObservation { get; set; }
             internal int PreflightCalls { get; private set; }
             internal int LastRequestedBytes { get; private set; }
             internal int SentPacketCount { get; private set; }

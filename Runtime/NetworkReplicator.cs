@@ -29,24 +29,32 @@ namespace UniGame.StaticEcs.Network
         private readonly INetworkCellularScopeProvider<TWorld> _cellularProvider;
         private readonly NetworkReplicaSkipPolicy<TWorld> _skipPolicy;
         private readonly INetworkUpdatePolicy<TWorld> _updatePolicy;
+        private readonly INetworkScopeCaptureVariantPolicy<TWorld> _scopeCaptureVariantPolicy;
+        private readonly INetworkSnapshotAttributionPolicy<TWorld> _attributionPolicy;
         private readonly Dictionary<ScopeId, ScopeCaptureCache> _updateCache =
             new Dictionary<ScopeId, ScopeCaptureCache>();
         // NCORE-15b: cell-level capture cache for the merge-capture path (see CaptureViaCells).
         // Reuses ScopeCaptureCache's shape (bytes + per-entity index for the NCORE-16 hold
         // policy) keyed by cell id instead of by peer scope id; CapturedTick lets a scope built
         // later in the same tick from an already-captured cell skip re-serializing it entirely.
-        private readonly Dictionary<ScopeId, ScopeCaptureCache> _cellCache =
-            new Dictionary<ScopeId, ScopeCaptureCache>();
+        private readonly Dictionary<CellCaptureVariantKey, ScopeCaptureCache> _cellCache =
+            new Dictionary<CellCaptureVariantKey, ScopeCaptureCache>();
         private readonly int[] _cellCursors = new int[NetworkCellularScopeLimits.MaxCellsPerScope];
         // Resolved once per cell per Capture call (see CaptureViaCells) so the k-way merge below
         // indexes a plain array instead of repeating a Dictionary<ScopeId, _> lookup (hash +
         // bucket walk) for every single entity it merges.
         private readonly ScopeCaptureCache[] _cellCacheRefs =
             new ScopeCaptureCache[NetworkCellularScopeLimits.MaxCellsPerScope];
-        private readonly List<ScopeId> _staleCellIds = new List<ScopeId>();
+        private readonly List<CellCaptureVariantKey> _staleCellIds =
+            new List<CellCaptureVariantKey>();
         internal long CellCacheSweepCount { get; private set; }
         internal long CellCacheSweepStopwatchTicks { get; private set; }
         internal int CellCacheEntryCount => _cellCache.Count;
+        internal int CellCaptureVariantCount => _cellCache.Count;
+        internal long CellCaptureVariantBytes { get; private set; }
+        internal long CellCaptureVariantHits { get; private set; }
+        internal long CellCaptureVariantMisses { get; private set; }
+        internal long CellCaptureVariantEvictions { get; private set; }
         internal long CellCaptureCount { get; private set; }
         internal long CellCaptureStopwatchTicks { get; private set; }
         internal long CellMergeStopwatchTicks { get; private set; }
@@ -117,6 +125,9 @@ namespace UniGame.StaticEcs.Network
             _scopeProvider = scopeProvider;
             _cellularProvider = scopeProvider as INetworkCellularScopeProvider<TWorld>;
             _updatePolicy = updatePolicy;
+            _scopeCaptureVariantPolicy = updatePolicy as
+                INetworkScopeCaptureVariantPolicy<TWorld>;
+            _attributionPolicy = updatePolicy as INetworkSnapshotAttributionPolicy<TWorld>;
         }
 
         /// <summary>
@@ -126,7 +137,19 @@ namespace UniGame.StaticEcs.Network
         /// shared capture history is dropped, so an abandoned scope's held-entity cache does not
         /// linger for the life of the server.
         /// </summary>
-        internal void ForgetScope(ScopeId scope) => _updateCache.Remove(scope);
+        internal void ForgetScope(ScopeId scope)
+        {
+            _updateCache.Remove(scope);
+            if (_scopeCaptureVariantPolicy == null || _cellCache.Count == 0)
+                return;
+
+            _staleCellIds.Clear();
+            foreach (var pair in _cellCache)
+                if (pair.Key.Scope == scope)
+                    _staleCellIds.Add(pair.Key);
+            for (var i = 0; i < _staleCellIds.Count; i++)
+                RemoveCellCache(_staleCellIds[i]);
+        }
 
         /// <summary>Gets the isolated replication scope.</summary>
         public ScopeId Scope { get; private set; }
@@ -146,6 +169,9 @@ namespace UniGame.StaticEcs.Network
         public void Dispose()
         {
             History.Clear();
+            _updateCache.Clear();
+            _cellCache.Clear();
+            CellCaptureVariantBytes = 0;
             if (_ownsBufferPool)
                 _bufferPool.Dispose();
         }
@@ -198,6 +224,10 @@ namespace UniGame.StaticEcs.Network
             var buffer = _bufferPool.Rent(_captureCapacity);
             var writer = BinaryPackWriter.Create(buffer.Buffer);
             var records = 0;
+            List<ulong> attributedGids = null;
+            long attributedBytes = 0;
+            if (_attributionPolicy != null)
+                attributedGids = new List<ulong>();
 
             // NCORE-16: read side of the update-policy hold cache. `previousBytes`/`previousIndex`
             // are this scope's own last successful capture, untouched for the rest of this call, so
@@ -245,6 +275,7 @@ namespace UniGame.StaticEcs.Network
                         return FailCapture(buffer, writer.Buffer,
                             SnapshotCaptureResult.InvalidEntity);
 
+                    var entityStart = writer.Position;
                     writer.WriteUlong(entity.GID.Raw);
                     writer.WriteUint(kind.TypeId.Value);
                     writer.WriteBool(entity.IsDisabled);
@@ -335,6 +366,12 @@ namespace UniGame.StaticEcs.Network
                         freshIndex[entity.GID] = new HeldRecordRange(kind.TypeId,
                             checked((int)recordsStart),
                             checked((ushort)entityRecords));
+                    if (attributedGids != null &&
+                        _attributionPolicy.ShouldAttribute(entity, entity.GID))
+                    {
+                        attributedGids.Add(entity.GID.Raw);
+                        attributedBytes += writer.Position - entityStart;
+                    }
                 }
             }
             catch
@@ -372,6 +409,7 @@ namespace UniGame.StaticEcs.Network
             _captureCapacity = Math.Max(_captureCapacity, buffer.Capacity);
             snapshot = _snapshotPool.Rent(serverTick, _schema.Fingerprint, scope,
                 buffer, _captureEntities.Count, records);
+            snapshot.SetAttributedEntities(attributedGids, attributedBytes);
             return SnapshotCaptureResult.Success;
         }
 
@@ -417,12 +455,26 @@ namespace UniGame.StaticEcs.Network
             var totalEntities = 0;
             var totalRecords = 0;
             long exactMergeBytes = sizeof(int);
+            List<ulong> attributedGids = null;
+            long attributedBytes = 0;
+            if (_attributionPolicy != null)
+                attributedGids = new List<ulong>();
             for (var i = 0; i < cellCount; i++)
             {
-                if (!_cellCache.TryGetValue(cellIds[i], out var cache))
+                var cacheKey = GetCellCaptureKey(cellIds[i], scope);
+                if (!_cellCache.TryGetValue(cacheKey, out var cache))
                 {
                     cache = new ScopeCaptureCache();
-                    _cellCache.Add(cellIds[i], cache);
+                    _cellCache.Add(cacheKey, cache);
+                    CellCaptureVariantMisses++;
+                }
+                else if (cache.HasCapturedTick && cache.CapturedTick == serverTick)
+                {
+                    CellCaptureVariantHits++;
+                }
+                else
+                {
+                    CellCaptureVariantMisses++;
                 }
                 if (!cache.HasCapturedTick || cache.CapturedTick != serverTick)
                 {
@@ -430,7 +482,7 @@ namespace UniGame.StaticEcs.Network
                     SnapshotCaptureResult cellResult;
                     try
                     {
-                        cellResult = CaptureCellInto(serverTick, cellIds[i], cache);
+                        cellResult = CaptureCellInto(serverTick, cellIds[i], scope, cache);
                     }
                     finally
                     {
@@ -495,6 +547,11 @@ namespace UniGame.StaticEcs.Network
                     Array.Copy(bestCache.Bytes, block.Offset, writer.Buffer,
                         (int)writer.Position, block.Length);
                     writer.Position += (uint)block.Length;
+                    if (block.Attributed)
+                    {
+                        attributedGids.Add(block.Gid.Raw);
+                        attributedBytes += block.Length;
+                    }
                     merged++;
                 }
             }
@@ -524,6 +581,7 @@ namespace UniGame.StaticEcs.Network
             _captureCapacity = Math.Max(_captureCapacity, buffer.Capacity);
             snapshot = _snapshotPool.Rent(serverTick, _schema.Fingerprint, scope,
                 buffer, totalEntities, totalRecords);
+            snapshot.SetAttributedEntities(attributedGids, attributedBytes);
             return SnapshotCaptureResult.Success;
         }
 
@@ -534,7 +592,7 @@ namespace UniGame.StaticEcs.Network
         // is entirely in what gets cached (per cell, with an ascending-GID block index for
         // merging) rather than in how a single entity gets serialized.
         private SnapshotCaptureResult CaptureCellInto(uint serverTick, ScopeId cellId,
-            ScopeCaptureCache cache)
+            ScopeId scope, ScopeCaptureCache cache)
         {
             _captureEntities.Clear();
             _captureSeen.Clear();
@@ -549,6 +607,8 @@ namespace UniGame.StaticEcs.Network
             if (_captureEntities.Count == 0)
             {
                 cache.Blocks.Clear();
+                cache.Index.Clear();
+                SetCellCacheBytes(cache, Array.Empty<byte>());
                 cache.Length = 0;
                 cache.RecordCount = 0;
                 cache.CapturedTick = serverTick;
@@ -619,7 +679,7 @@ namespace UniGame.StaticEcs.Network
                     if (previousIndex != null &&
                         previousIndex.TryGetValue(entity.GID, out var previousRange) &&
                         previousRange.Kind == kind.TypeId &&
-                        _updatePolicy.ShouldHold(serverTick, cellId, entity, entity.GID))
+                        _updatePolicy.ShouldHold(serverTick, scope, entity, entity.GID))
                     {
                         holdCandidate = true;
                         previousRecordCursor = previousRange.RecordsOffset;
@@ -687,7 +747,9 @@ namespace UniGame.StaticEcs.Network
                             checked((int)recordsStart),
                             checked((ushort)entityRecords));
                     blocks.Add(new EntityBlockRange(entity.GID, checked((int)blockStart),
-                        checked((int)(writer.Position - blockStart))));
+                        checked((int)(writer.Position - blockStart)),
+                        _attributionPolicy != null &&
+                        _attributionPolicy.ShouldAttribute(entity, entity.GID)));
                 }
             }
             catch
@@ -700,7 +762,7 @@ namespace UniGame.StaticEcs.Network
 
             var finalLength = checked((int)writer.Position);
             if (cache.Bytes.Length < finalLength)
-                cache.Bytes = new byte[finalLength];
+                SetCellCacheBytes(cache, new byte[finalLength]);
             Array.Copy(writer.Buffer, 0, cache.Bytes, 0, finalLength);
             cache.Length = finalLength;
             // `blocks` is `cache.Blocks` itself (cleared and repopulated above), not a separate
@@ -728,6 +790,29 @@ namespace UniGame.StaticEcs.Network
             return SnapshotCaptureResult.Success;
         }
 
+        private CellCaptureVariantKey GetCellCaptureKey(ScopeId cell, ScopeId scope)
+        {
+            if (_scopeCaptureVariantPolicy == null)
+                return new CellCaptureVariantKey(cell, default, 0);
+            return new CellCaptureVariantKey(cell, scope,
+                _scopeCaptureVariantPolicy.CapturePolicyEpoch);
+        }
+
+        private void SetCellCacheBytes(ScopeCaptureCache cache, byte[] bytes)
+        {
+            CellCaptureVariantBytes += bytes.Length - cache.Bytes.Length;
+            cache.Bytes = bytes;
+        }
+
+        private void RemoveCellCache(CellCaptureVariantKey key)
+        {
+            if (!_cellCache.TryGetValue(key, out var cache))
+                return;
+            CellCaptureVariantBytes -= cache.Bytes.Length;
+            _cellCache.Remove(key);
+            CellCaptureVariantEvictions++;
+        }
+
         private void EvictStaleCellCache(uint serverTick)
         {
             if (serverTick <= CellCacheStaleAfterTicks || _cellCache.Count == 0)
@@ -738,7 +823,7 @@ namespace UniGame.StaticEcs.Network
                 if (!pair.Value.HasCapturedTick || pair.Value.CapturedTick < threshold)
                     _staleCellIds.Add(pair.Key);
             for (var i = 0; i < _staleCellIds.Count; i++)
-                _cellCache.Remove(_staleCellIds[i]);
+                RemoveCellCache(_staleCellIds[i]);
         }
 
         internal NetworkSnapshot CreateSnapshot(uint serverTick,
@@ -1177,6 +1262,27 @@ namespace UniGame.StaticEcs.Network
                 NetworkReplicator<TWorld>.Compare(left.GID, right.GID);
         }
 
+        private readonly struct CellCaptureVariantKey : IEquatable<CellCaptureVariantKey>
+        {
+            internal CellCaptureVariantKey(ScopeId cell, ScopeId scope, ulong epoch)
+            {
+                Cell = cell;
+                Scope = scope;
+                Epoch = epoch;
+            }
+
+            internal readonly ScopeId Cell;
+            internal readonly ScopeId Scope;
+            internal readonly ulong Epoch;
+
+            public bool Equals(CellCaptureVariantKey other) => Cell == other.Cell &&
+                Scope == other.Scope && Epoch == other.Epoch;
+            public override bool Equals(object obj) =>
+                obj is CellCaptureVariantKey other && Equals(other);
+            public override int GetHashCode() => unchecked(Cell.GetHashCode() * 397 ^
+                Scope.GetHashCode() * 31 ^ Epoch.GetHashCode());
+        }
+
         // NCORE-16: one scope's held-entity cache for the update-policy hold path. `Bytes[0..Length)`
         // is that scope's last successfully captured canonical buffer (the same wire format Capture
         // itself writes); `Index` locates each entity's record block within it. Both are replaced
@@ -1203,16 +1309,18 @@ namespace UniGame.StaticEcs.Network
         // merged scope buffer without touching a single record.
         private readonly struct EntityBlockRange
         {
-            internal EntityBlockRange(EntityGID gid, int offset, int length)
+            internal EntityBlockRange(EntityGID gid, int offset, int length, bool attributed)
             {
                 Gid = gid;
                 Offset = offset;
                 Length = length;
+                Attributed = attributed;
             }
 
             internal readonly EntityGID Gid;
             internal readonly int Offset;
             internal readonly int Length;
+            internal readonly bool Attributed;
         }
 
         // Locates one entity's record block (the bytes starting right after its 2-byte record-count

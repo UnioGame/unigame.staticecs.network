@@ -68,6 +68,13 @@ policy only: it does not change packet ordering, flags, snapshot contents, or th
 protocol. The game's runtime config restricts this experiment to UTP; production remains on
 the default `Current` mode unless a separate change is approved.
 
+Transports may implement `INetworkReliableDeliveryObservation` to expose the latest
+snapshot callback's server tick and owner-side Stopwatch timestamp. Zero timestamp means
+unavailable. `CallbackToSnapshotAdmission` measures that matching callback to the next
+fully accepted batch; rejected and partial submissions do not consume an observation.
+Scope/recovery resets discard diagnostic correlation without changing admission behavior.
+These timestamps describe owner callback processing, not native ACK completion.
+
 ## Interest management
 
 ```mermaid

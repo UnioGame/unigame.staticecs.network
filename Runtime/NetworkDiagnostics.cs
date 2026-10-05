@@ -29,7 +29,9 @@ namespace UniGame.StaticEcs.Network
         SnapshotApply,
         SnapshotCapture,
         Send,
-        ServerTick
+        ServerTick,
+        SnapshotReceive,
+        SnapshotAssembly
     }
     /// <summary>Identifies trace event timing semantics.</summary>
     public enum NetworkTraceKind : byte

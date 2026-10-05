@@ -51,6 +51,7 @@ namespace UniGame.StaticEcs.Network
         private bool _hasRecoveryTransition;
         private PacketHeader _snapshotAssemblyHeader;
         private SnapshotChunkHeader _snapshotAssemblyChunk;
+        private bool _deliveryPhaseDiagnosticsEnabled;
         private int _snapshotAssemblyReceived;
         private int _snapshotAssemblyBytes;
         private int _snapshotAssemblyStride;
@@ -127,6 +128,10 @@ namespace UniGame.StaticEcs.Network
         }
 
         public NetworkSession<TWorld> Session => _session;
+
+        /// <summary>Enables bounded load-worker delivery-stage traces for this client.</summary>
+        public void EnableDeliveryPhaseDiagnostics() =>
+            _deliveryPhaseDiagnosticsEnabled = true;
         /// <summary>Gets bounded successfully applied snapshot history.</summary>
         public NetworkHistory<NetworkSnapshot> History => _replicator.History;
         /// <summary>Gets the latest acknowledged authoritative tick.</summary>
@@ -368,6 +373,19 @@ namespace UniGame.StaticEcs.Network
                             NetworkResyncSource.ClientSnapshotValidation);
                         continue;
                     }
+                    if (_deliveryPhaseDiagnosticsEnabled &&
+                        header.Kind == PacketKind.SnapshotChunk)
+                        _session.Trace(NetworkPhase.SnapshotReceive,
+                            NetworkTraceKind.Point, NetworkResultCategory.Success,
+                            NetworkPacketKind.SnapshotChunk, header.ServerTick, 0,
+                            packet.Length, History.Count, History.Bytes,
+                            unchecked((int)(header.ServerTick -
+                                AcknowledgedSnapshotTick)),
+                            ElapsedNanoseconds(started),
+                            sequence: header.PacketSequence,
+                            acknowledgedSnapshotTick: AcknowledgedSnapshotTick,
+                            oldestHistoryTick: History.OldestTick,
+                            newestHistoryTick: History.NewestTick);
                     if (header.Kind != PacketKind.Disconnect &&
                         (header.SchemaFingerprint != _schema.Fingerprint ||
                          header.SimulationFingerprint != _simulationFingerprint ||
@@ -813,6 +831,8 @@ namespace UniGame.StaticEcs.Network
             payloadKind = default;
             discardRejectedTick = false;
             NetworkBufferLease body = null;
+            var assemblyStarted = _deliveryPhaseDiagnosticsEnabled
+                ? Stopwatch.GetTimestamp() : 0L;
             if (!TryAssembleSnapshot(packet, in header, payload, out var chunk,
                     out body, out awaitingChunks))
             {
@@ -821,6 +841,16 @@ namespace UniGame.StaticEcs.Network
             }
             if (awaitingChunks)
                 return SnapshotApplyResult.Success;
+            if (_deliveryPhaseDiagnosticsEnabled)
+                _session.Trace(NetworkPhase.SnapshotAssembly,
+                    NetworkTraceKind.Point, NetworkResultCategory.Success,
+                    NetworkPacketKind.SnapshotChunk, header.ServerTick, 0,
+                    body?.Length ?? 0, History.Count, History.Bytes,
+                    unchecked((int)(header.ServerTick - AcknowledgedSnapshotTick)),
+                    ElapsedNanoseconds(assemblyStarted), sequence: header.PacketSequence,
+                    acknowledgedSnapshotTick: AcknowledgedSnapshotTick,
+                    oldestHistoryTick: History.OldestTick,
+                    newestHistoryTick: History.NewestTick);
             payloadKind = chunk.PayloadKind;
             try
             {
