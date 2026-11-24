@@ -172,14 +172,21 @@ namespace UniGame.StaticEcs.Network
     internal readonly struct SnapshotDeltaAttribution
     {
         internal SnapshotDeltaAttribution(long attributedRecordBytes,
-            long encodedSnapshotBytes, bool complete)
+            long encodedSnapshotBytes, bool complete, int entityAdds = 0,
+            int entityRemoves = 0, int entityPatches = 0)
         {
             AttributedRecordBytes = attributedRecordBytes;
             EncodedSnapshotBytes = encodedSnapshotBytes;
             Complete = complete;
+            EntityAdds = entityAdds;
+            EntityRemoves = entityRemoves;
+            EntityPatches = entityPatches;
         }
 
         internal long AttributedRecordBytes { get; }
+        internal int EntityAdds { get; }
+        internal int EntityRemoves { get; }
+        internal int EntityPatches { get; }
         internal long EncodedSnapshotBytes { get; }
         internal bool Complete { get; }
         internal bool IsReconciled => Complete && AttributedRecordBytes >= 0 &&

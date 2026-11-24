@@ -26,7 +26,14 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Carries one reliable client transaction command.</summary>
         TransactionCommand = 11,
         /// <summary>Returns one reliable transaction receipt.</summary>
-        TransactionReceipt = 12
+        TransactionReceipt = 12,
+        /// <summary>Carries the full list of entities only their owner sees.</summary>
+        OwnerState = 13,
+        /// <summary>
+        /// Carries the current state of the receiving peer's own entity for one snapshot tick whose
+        /// shared scope snapshot still holds an older state of it.
+        /// </summary>
+        OwnedEntityRefresh = 14
     }
 
     /// <summary>Declares packet delivery requirements.</summary>
@@ -35,7 +42,11 @@ namespace UniGame.StaticEcs.Network
     {
         /// <summary>Requests exactly-once, in-order delivery.</summary>
         ReliableOrdered = 1,
-        /// <summary>Keeps only packets newer than the last accepted sequence.</summary>
+        /// <summary>
+        /// Requests delivery without resends. The receiver sequences such packets itself: a command
+        /// batch by its packet sequence, a snapshot chunk and an acknowledgement by their tick. A
+        /// transport may deliver them out of order.
+        /// </summary>
         UnreliableSequenced = 2
     }
 
@@ -192,8 +203,16 @@ namespace UniGame.StaticEcs.Network
         /// (spatial-cell interest management). The field is fixed length and only
         /// ever populated on a keyframe; a delta chunk always carries the sender's
         /// current scope, which must already match the client's session scope.
+        /// Bumped 14 -&gt; 15: a delta <see cref="PacketKind.SnapshotChunk"/> may carry
+        /// <see cref="PacketFlags.UnreliableSequenced"/>. The bytes are unchanged; a peer of
+        /// version 14 would end the session on the first such packet.
+        /// Bumped 15 -&gt; 16: a client acknowledges such a delta with an unreliable
+        /// <see cref="PacketKind.Ack"/>, which a server of version 15 would reject.
+        /// Bumped 16 -&gt; 17: the LiteNetLib adapter sends unreliable packets with plain
+        /// unreliable native delivery instead of the sequenced one. The bytes are unchanged; an
+        /// adapter of version 16 would reject every such packet on receive.
         /// </remarks>
-        public const ushort Version = 10;
+        public const ushort Version = 17;
         /// <summary>Maximum encoded payload length.</summary>
         public const int MaxWirePayloadBytes = 8 * 1024 * 1024;
         /// <summary>Maximum decoded payload length.</summary>

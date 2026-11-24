@@ -30,6 +30,17 @@ namespace UniGame.StaticEcs.Network
         bool HasPendingReliablePackets { get; }
     }
 
+    /// <summary>
+    /// Distinguishes reliable packets the transport has not yet submitted to its native layer from
+    /// packets merely awaiting a delivery callback. <see cref="NetworkSnapshotAdmissionMode.Windowed"/>
+    /// treats only the former as backpressure.
+    /// </summary>
+    public interface INetworkReliableBacklogState
+    {
+        /// <summary>Gets whether at least one reliable packet is still queued ahead of native submission.</summary>
+        bool HasQueuedReliablePackets { get; }
+    }
+
     /// <summary>Identifies the latest snapshot delivery callback observed by the transport owner.</summary>
     public readonly struct NetworkReliableDeliveryObservation
     {

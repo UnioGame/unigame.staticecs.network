@@ -53,8 +53,15 @@ namespace UniGame.StaticEcs.Network
     public sealed class NetworkSchema<TWorld> where TWorld : struct, IWorldType
     {
         private readonly NetworkSchemaEntry[] _entries;
+        private readonly IEntityNetworkInvoker<TWorld>[] _entityInvokers;
         internal NetworkSchema(SchemaFingerprint fingerprint, NetworkSchemaEntry[] entries, NetworkComponentDeltaHooks deltaHooks)
-        { Fingerprint = fingerprint; _entries = entries; DeltaHooks = deltaHooks; }
+        {
+            Fingerprint = fingerprint; _entries = entries; DeltaHooks = deltaHooks;
+            var entityInvokers = new List<IEntityNetworkInvoker<TWorld>>();
+            foreach (var entry in entries)
+                if (entry.Invoker is IEntityNetworkInvoker<TWorld> invoker) entityInvokers.Add(invoker);
+            _entityInvokers = entityInvokers.ToArray();
+        }
         /// <summary>Gets the first 128 bits of SHA-256 over the canonical sorted manifest.</summary>
         public SchemaFingerprint Fingerprint { get; }
         /// <summary>Gets canonical records ordered by kind and identifier.</summary>
@@ -66,6 +73,15 @@ namespace UniGame.StaticEcs.Network
         {
             for (var i = 0; i < _entries.Length; i++) if (_entries[i].TypeId == id) { entry = _entries[i]; return true; }
             entry = null;
+            return false;
+        }
+        /// <summary>
+        /// Whether <paramref name="entity"/> has an entity type this schema replicates; capture fails
+        /// on any other entity, so a scope provider must not hand one back.
+        /// </summary>
+        public bool Replicates(World<TWorld>.Entity entity)
+        {
+            for (var i = 0; i < _entityInvokers.Length; i++) if (_entityInvokers[i].Matches(entity)) return true;
             return false;
         }
         internal ReadOnlySpan<NetworkSchemaEntry> RetainedEntries => _entries;
@@ -231,6 +247,7 @@ namespace UniGame.StaticEcs.Network
     internal interface IEntityNetworkInvoker<TWorld> where TWorld : struct, IWorldType
     {
         void Collect(List<World<TWorld>.Entity> entities, HashSet<EntityGID> seen);
+        byte EntityTypeId { get; }
         bool Matches(World<TWorld>.Entity entity);
         World<TWorld>.Entity Create();
     }
@@ -257,6 +274,7 @@ namespace UniGame.StaticEcs.Network
                 if (entity.EntityType == entityType && seen.Add(entity.GID)) entities.Add(entity);
         }
 
+        public byte EntityTypeId => default(TEntity).Id();
         public bool Matches(World<TWorld>.Entity entity) => entity.EntityType == default(TEntity).Id();
         public World<TWorld>.Entity Create() => World<TWorld>.NewEntity<TEntity>();
     }

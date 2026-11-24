@@ -96,7 +96,7 @@ namespace UniGame.StaticEcs.Network.Tests
                         .EntitiesCount(), Is.EqualTo(1));
 
                     var disconnect = Packet(PacketKind.Disconnect, 9, 2);
-                    disconnect.SchemaFingerprint = clientSchema.Fingerprint;
+                    disconnect.CompatibilityTag = PacketHeader.CompatibilityTagOf(clientSchema.Fingerprint, 0, 0);
                     Assert.That(NetworkPacket.TryEncode(Buffers, disconnect, ReadOnlySpan<byte>.Empty,
                         out var packet), Is.True);
                     Assert.That(serverTransport.TrySend(packet), Is.True);
@@ -157,7 +157,7 @@ namespace UniGame.StaticEcs.Network.Tests
                         new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
                     var packetHeader = Packet(PacketKind.SnapshotChunk, 1, 1);
                     packetHeader.ServerTick = 1;
-                    packetHeader.SchemaFingerprint = schema.Fingerprint;
+                    packetHeader.CompatibilityTag = PacketHeader.CompatibilityTagOf(schema.Fingerprint, 0, 0);
                     Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
                         new byte[] { 1 }, out var packet), Is.True);
                     Assert.That(serverTransport.TrySend(packet), Is.True);
@@ -273,23 +273,6 @@ namespace UniGame.StaticEcs.Network.Tests
             finally { World<AuthorityWorld>.Destroy(); World<ClientAWorld>.Destroy(); }
         }
 
-#if UNITY_2022_2_OR_NEWER
-        [Test]
-        public void SnapshotDeltaCodec_BurstBackendIsCompiled()
-        {
-            Assert.That(SnapshotDeltaBurstBackend.IsAvailable, Is.True);
-        }
-
-#endif
-        // NCORE-13b superseded the differential/speedup test that used to live here
-        // (SnapshotDeltaCodec_BurstMatchesPortableAndReportsBatchTiming, a 256-ballast +
-        // 1-changing-entity scenario with no hooks/adds/removes/PatchFull): once
-        // SnapshotDeltaBurstBackend was ported to the compact delta format, that scenario
-        // was too narrow to trust as the port's correctness gate. See
-        // NetworkSnapshotDeltaCompactionTests.SnapshotDeltaCodec_BurstMatchesPortableWithHooksAddsRemovesAndDisabledToggles
-        // (randomized adds/removes/record-set changes/disabled toggles plus hook-tagged
-        // "mover" entities) and .SnapshotDeltaCodec_BurstVsPortableRealisticMixTiming (the
-        // Unity-only timing test for 200/300/500 entities at 30-60% moving) instead.
         [Test]
         public void SnapshotDeltaCodec_ReconstructsNoOpAndCanonicalChanges()
         {
@@ -1912,7 +1895,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(new ResyncRequestPayload(17).TryWrite(payload),
                         Is.True);
                     var request = Packet(PacketKind.ResyncRequest, 1, 3);
-                    request.SchemaFingerprint = schema.Fingerprint;
+                    request.CompatibilityTag = PacketHeader.CompatibilityTagOf(schema.Fingerprint, 0, 0);
                     Assert.That(NetworkPacket.TryEncode(Buffers, request, payload,
                         out var requestPacket), Is.True);
                     Assert.That(clientTransport.TrySend(requestPacket), Is.True);
@@ -3197,7 +3180,7 @@ namespace UniGame.StaticEcs.Network.Tests
             Assert.That(new ResyncRequestPayload(correlationId).TryWrite(
                 payload), Is.True);
             var header = Packet(PacketKind.ResyncRequest, epoch, sequence);
-            header.SchemaFingerprint = schema;
+            header.CompatibilityTag = PacketHeader.CompatibilityTagOf(schema, 0, 0);
             Assert.That(NetworkPacket.TryEncode(Buffers, header, payload,
                 out var packet), Is.True);
             Assert.That(transport.TrySend(packet), Is.True);

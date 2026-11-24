@@ -15,7 +15,8 @@ namespace UniGame.StaticEcs.Network
     public struct SnapshotChunkHeader
     {
         /// <summary>Fixed encoded header length.</summary>
-        public const int Size = 41;
+        public const int Size = 37;
+        public const uint MaxChunkCount = ushort.MaxValue;
 
         /// <summary>Gets or sets the snapshot payload encoding.</summary>
         public SnapshotPayloadKind PayloadKind;
@@ -55,10 +56,10 @@ namespace UniGame.StaticEcs.Network
             Hashing.Write32(bytes, 5, BaselineTick);
             Hashing.Write32(bytes, 9, TotalLength);
             Hashing.Write64(bytes, 13, TotalHash);
-            Hashing.Write32(bytes, 21, ChunkIndex);
-            Hashing.Write32(bytes, 25, ChunkCount);
-            Hashing.Write32(bytes, 29, ResyncCorrelationId);
-            Hashing.Write64(bytes, 33, ScopeValue);
+            Write16(bytes, 21, ChunkIndex);
+            Write16(bytes, 23, ChunkCount);
+            Hashing.Write32(bytes, 25, ResyncCorrelationId);
+            Hashing.Write64(bytes, 29, ScopeValue);
             return true;
         }
 
@@ -75,10 +76,10 @@ namespace UniGame.StaticEcs.Network
                 BaselineTick = Hashing.Read32(source, 5),
                 TotalLength = Hashing.Read32(source, 9),
                 TotalHash = Hashing.Read64(source, 13),
-                ChunkIndex = Hashing.Read32(source, 21),
-                ChunkCount = Hashing.Read32(source, 25),
-                ResyncCorrelationId = Hashing.Read32(source, 29),
-                ScopeValue = Hashing.Read64(source, 33)
+                ChunkIndex = Read16(source, 21),
+                ChunkCount = Read16(source, 23),
+                ResyncCorrelationId = Hashing.Read32(source, 25),
+                ScopeValue = Hashing.Read64(source, 29)
             };
             if (!IsValid(value)) return false;
             header = value;
@@ -87,11 +88,21 @@ namespace UniGame.StaticEcs.Network
 
         private static bool IsValid(SnapshotChunkHeader value) =>
             IsKnownPayloadKind(value.PayloadKind) && value.TotalLength > 0 &&
-            value.ChunkCount > 0 && value.ChunkIndex < value.ChunkCount &&
+            value.ChunkCount > 0 && value.ChunkCount <= MaxChunkCount &&
+            value.ChunkIndex < value.ChunkCount &&
             (value.PayloadKind == SnapshotPayloadKind.Keyframe
                 ? value.BaselineTick == 0
                 : value.BaselineTick != 0 && value.BaselineTick < value.SnapshotTick &&
                   value.ResyncCorrelationId == 0);
+
+        private static void Write16(Span<byte> bytes, int offset, uint value)
+        {
+            bytes[offset] = (byte)value;
+            bytes[offset + 1] = (byte)(value >> 8);
+        }
+
+        private static uint Read16(ReadOnlySpan<byte> source, int offset) =>
+            (uint)(source[offset] | source[offset + 1] << 8);
 
         private static bool IsKnownPayloadKind(SnapshotPayloadKind kind) =>
             kind == SnapshotPayloadKind.Keyframe || kind == SnapshotPayloadKind.Delta;

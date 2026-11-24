@@ -32,10 +32,22 @@ namespace UniGame.StaticEcs.Network.Tests
             };
             var bytes = new byte[SnapshotChunkHeader.Size];
             Assert.That(header.TryWrite(bytes), Is.True);
-            Assert.That(SnapshotChunkHeader.Size, Is.EqualTo(41),
-                "wire size grew by 8 bytes (NCORE-15, protocol v10) to carry the scope");
+            Assert.That(SnapshotChunkHeader.Size, Is.EqualTo(37),
+                "8 bytes carry the scope (protocol v10); chunk index and count take 2 bytes each (v12)");
             Assert.That(SnapshotChunkHeader.TryRead(bytes, out var decoded), Is.True);
             Assert.That(decoded.ScopeValue, Is.EqualTo(header.ScopeValue));
+
+            header.ChunkIndex = 4094;
+            header.ChunkCount = 4096;
+            Assert.That(header.TryWrite(bytes), Is.True);
+            Assert.That(SnapshotChunkHeader.TryRead(bytes, out var lastChunk), Is.True);
+            Assert.That(lastChunk.ChunkIndex, Is.EqualTo(4094));
+            Assert.That(lastChunk.ChunkCount, Is.EqualTo(4096));
+            header.ChunkCount = SnapshotChunkHeader.MaxChunkCount + 1;
+            Assert.That(header.TryWrite(bytes), Is.False,
+                "a count that does not fit 16 bits is not written truncated");
+            header.ChunkIndex = 0;
+            header.ChunkCount = 1;
 
             header.ScopeValue = 0;
             Assert.That(header.TryWrite(bytes), Is.True);
@@ -519,6 +531,302 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         /// <summary>Deterministic stand-in for a real spatial provider (NCORE-15 test double).</summary>
+        private sealed class StubOwnerStateProvider : INetworkOwnerStateProvider<AuthorityWorld>
+        {
+            internal readonly Dictionary<uint, List<World<AuthorityWorld>.Entity>> Owned =
+                new Dictionary<uint, List<World<AuthorityWorld>.Entity>>();
+
+            public bool IsPrivate(World<AuthorityWorld>.Entity entity)
+            {
+                foreach (var list in Owned.Values)
+                    for (var i = 0; i < list.Count; i++)
+                        if (list[i].GID == entity.GID)
+                            return true;
+                return false;
+            }
+
+            public void CollectOwned(uint peerId, List<World<AuthorityWorld>.Entity> buffer)
+            {
+                if (Owned.TryGetValue(peerId, out var list))
+                    buffer.AddRange(list);
+            }
+        }
+
+        private static void RunOwnerStateTicks(NetworkServer<AuthorityWorld> server,
+            params NetworkClient<ClientAWorld>[] clients)
+        {
+            for (var i = 0; i < 6; i++)
+            {
+                server.Receive();
+                server.Tick(_ => { });
+                for (var c = 0; c < clients.Length; c++)
+                    clients[c].Process();
+            }
+        }
+
+        private static int CountReplicas<TWorld>(int value) where TWorld : struct, IWorldType
+        {
+            var count = 0;
+            foreach (World<TWorld>.Entity entity in World<TWorld>.Query(default(All<TestComponent>)).Entities())
+                if (entity.Read<TestComponent>().Value == value)
+                    count++;
+            return count;
+        }
+
+        [Test]
+        public void OwnerStateReachesOnlyItsOwnerAndFollowsChanges()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            CreateReplicationWorld<ClientBWorld>(false);
+            try
+            {
+                var publicEntity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                publicEntity.Set(new TestComponent { Value = 1 });
+                var privateEntity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                privateEntity.Set(new TestComponent { Value = 2 });
+                var ownerState = new StubOwnerStateProvider();
+                ownerState.Owned[7] = new List<World<AuthorityWorld>.Entity> { privateEntity };
+                World<AuthorityWorld>.SetResource(new NetworkOwnerStateResource<AuthorityWorld> { Provider = ownerState });
+
+                var server = new NetworkServer<AuthorityWorld>(Schema<AuthorityWorld>(true), static (_, _) => true);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(401), out var clientA, out var serverA);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(402), out var clientB, out var serverB);
+                using (clientA)
+                using (serverA)
+                using (clientB)
+                using (serverB)
+                {
+                    server.AddConnection(serverA, 7, 21, new ScopeId(1));
+                    server.AddConnection(serverB, 8, 22, new ScopeId(1));
+                    var owner = new NetworkClient<ClientAWorld>(clientA, Schema<ClientAWorld>(false), new ScopeId(1));
+                    var other = new NetworkClient<ClientBWorld>(clientB, Schema<ClientBWorld>(false), new ScopeId(1));
+                    owner.BeginHandshake();
+                    other.BeginHandshake();
+                    for (var i = 0; i < 6; i++)
+                    {
+                        server.Receive();
+                        server.Tick(_ => { });
+                        owner.Process();
+                        other.Process();
+                    }
+
+                    Assert.That(CountReplicas<ClientAWorld>(1), Is.EqualTo(1));
+                    Assert.That(CountReplicas<ClientAWorld>(2), Is.EqualTo(1), "the owner sees its private entity");
+                    Assert.That(CountReplicas<ClientBWorld>(1), Is.EqualTo(1));
+                    Assert.That(CountReplicas<ClientBWorld>(2), Is.EqualTo(0), "nobody else receives it");
+                    var sent = server.OwnerStatePackets;
+                    Assert.That(sent, Is.EqualTo(1), "the empty state of the other peer sends nothing");
+
+                    for (var i = 0; i < 6; i++)
+                    {
+                        server.Receive();
+                        server.Tick(_ => { });
+                        owner.Process();
+                        other.Process();
+                    }
+                    Assert.That(server.OwnerStatePackets, Is.EqualTo(sent), "unchanged state is not resent");
+                    Assert.That(CountReplicas<ClientAWorld>(2), Is.EqualTo(1),
+                        "public snapshots must not remove a private replica");
+
+                    privateEntity.Set(new TestComponent { Value = 3 });
+                    for (var i = 0; i < 6; i++)
+                    {
+                        server.Receive();
+                        server.Tick(_ => { });
+                        owner.Process();
+                        other.Process();
+                    }
+                    Assert.That(CountReplicas<ClientAWorld>(3), Is.EqualTo(1), "a change reaches the owner");
+                    Assert.That(server.OwnerStatePackets, Is.EqualTo(sent + 1));
+
+                    // Handing it back to the public world: the next snapshot keeps the same replica.
+                    ownerState.Owned[7].Clear();
+                    for (var i = 0; i < 6; i++)
+                    {
+                        server.Receive();
+                        server.Tick(_ => { });
+                        owner.Process();
+                        other.Process();
+                    }
+                    Assert.That(CountReplicas<ClientAWorld>(3), Is.EqualTo(1));
+                    Assert.That(CountReplicas<ClientBWorld>(3), Is.EqualTo(1), "a released entity is public again");
+
+                    // Destroying a private entity: leaving owner state lets the snapshot remove it.
+                    var second = World<AuthorityWorld>.NewEntity<TestEntity>();
+                    second.Set(new TestComponent { Value = 4 });
+                    ownerState.Owned[7].Add(second);
+                    for (var i = 0; i < 6; i++)
+                    {
+                        server.Receive();
+                        server.Tick(_ => { });
+                        owner.Process();
+                        other.Process();
+                    }
+                    Assert.That(CountReplicas<ClientAWorld>(4), Is.EqualTo(1));
+                    ownerState.Owned[7].Clear();
+                    second.Destroy();
+                    for (var i = 0; i < 6; i++)
+                    {
+                        server.Receive();
+                        server.Tick(_ => { });
+                        owner.Process();
+                        other.Process();
+                    }
+                    Assert.That(CountReplicas<ClientAWorld>(4), Is.EqualTo(0));
+                    Assert.That(server.OwnerStateFailures, Is.EqualTo(0));
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+                World<ClientBWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void OwnerStateIsResentAfterAResyncRequest()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var privateEntity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                privateEntity.Set(new TestComponent { Value = 2 });
+                var ownerState = new StubOwnerStateProvider();
+                ownerState.Owned[7] = new List<World<AuthorityWorld>.Entity> { privateEntity };
+                World<AuthorityWorld>.SetResource(new NetworkOwnerStateResource<AuthorityWorld> { Provider = ownerState });
+
+                var server = new NetworkServer<AuthorityWorld>(Schema<AuthorityWorld>(true), static (_, _) => true);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(403), out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    server.AddConnection(serverTransport, 7, 21, new ScopeId(1));
+                    var client = new NetworkClient<ClientAWorld>(clientTransport, Schema<ClientAWorld>(false), new ScopeId(1));
+                    client.BeginHandshake();
+                    RunOwnerStateTicks(server, client);
+                    Assert.That(server.OwnerStatePackets, Is.EqualTo(1));
+
+                    client.RequestFullResync(NetworkRecoveryReason.SnapshotRejected);
+                    RunOwnerStateTicks(server, client);
+                    Assert.That(server.OwnerStatePackets, Is.EqualTo(2));
+                    Assert.That(CountReplicas<ClientAWorld>(2), Is.EqualTo(1));
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void AcknowledgementsOfTheOldScopeDoNotRepeatTheKeyframeOfTheNewOne()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                entity.Set(new TestComponent { Value = 1 });
+                var provider = new StubScopeProvider();
+                provider.ScopeEntities[new ScopeId(1)] = new List<World<AuthorityWorld>.Entity> { entity };
+                provider.ScopeEntities[new ScopeId(2)] = new List<World<AuthorityWorld>.Entity> { entity };
+                var server = new NetworkServer<AuthorityWorld>(Schema<AuthorityWorld>(true),
+                    static (_, _) => true, scopeProvider: provider);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(405), out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    server.AddConnection(serverTransport, 7, 21, new ScopeId(1));
+                    var client = new NetworkClient<ClientAWorld>(clientTransport, Schema<ClientAWorld>(false), new ScopeId(1));
+                    client.BeginHandshake();
+                    for (var i = 0; i < 3; i++)
+                    {
+                        server.Receive();
+                        server.Tick(_ => { });
+                        client.Process();
+                    }
+                    server.Receive();
+                    // Leaves a delta of the old scope unacknowledged on the wire.
+                    server.Tick(_ => { });
+
+                    provider.Assignments[7] = new ScopeId(2);
+                    server.Tick(_ => { });
+                    var keyframes = server.CaptureScopeDiagnostics().KeyframeBatches;
+
+                    // The client applies both and its ack of the old-scope delta arrives first.
+                    client.Process();
+                    server.Receive();
+                    server.Tick(_ => { });
+
+                    var diagnostics = server.CaptureScopeDiagnostics();
+                    Assert.That(diagnostics.StaleScopeAcknowledgements, Is.EqualTo(1));
+                    Assert.That(diagnostics.KeyframeBatches, Is.EqualTo(keyframes),
+                        "one scope change costs one keyframe");
+                    Assert.That(diagnostics.LostBaselineAcknowledgements, Is.EqualTo(0));
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ResyncRequestedWhileAForcedKeyframeIsInFlightStillGetsItsOwnKeyframe()
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            CreateReplicationWorld<ClientAWorld>(false);
+            try
+            {
+                var entity = World<AuthorityWorld>.NewEntity<TestEntity>();
+                entity.Set(new TestComponent { Value = 1 });
+                var provider = new StubScopeProvider();
+                provider.ScopeEntities[new ScopeId(1)] = new List<World<AuthorityWorld>.Entity> { entity };
+                provider.ScopeEntities[new ScopeId(2)] = new List<World<AuthorityWorld>.Entity> { entity };
+                var server = new NetworkServer<AuthorityWorld>(Schema<AuthorityWorld>(true),
+                    static (_, _) => true, scopeProvider: provider);
+                MemoryNetworkTransport.CreatePair(new ConnectionId(404), out var clientTransport, out var serverTransport);
+                using (clientTransport)
+                using (serverTransport)
+                {
+                    server.AddConnection(serverTransport, 7, 21, new ScopeId(1));
+                    var client = new NetworkClient<ClientAWorld>(clientTransport, Schema<ClientAWorld>(false), new ScopeId(1));
+                    client.BeginHandshake();
+                    server.Receive();
+                    server.Tick(_ => { });
+                    client.Process();
+                    server.Receive();
+
+                    // The scope change sends a keyframe without a correlation; the client asks for
+                    // a resync before that keyframe reaches it, so its ack arrives after the request.
+                    provider.Assignments[7] = new ScopeId(2);
+                    server.Tick(_ => { });
+                    client.RequestFullResync(NetworkRecoveryReason.SnapshotRejected);
+                    client.Process();
+                    server.Receive();
+
+                    server.Tick(_ => { });
+                    client.Process();
+
+                    var last = NetworkRecoveryPhase.AwaitingKeyframe;
+                    while (client.TryConsumeRecoveryTransition(out var transition))
+                        last = transition.Phase;
+                    Assert.That(last, Is.EqualTo(NetworkRecoveryPhase.None),
+                        "the client must not wait forever for a keyframe the ack cancelled");
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+                World<ClientAWorld>.Destroy();
+            }
+        }
+
         private sealed class StubScopeProvider : INetworkScopeProvider<AuthorityWorld>
         {
             internal readonly Dictionary<uint, ScopeId> Assignments = new Dictionary<uint, ScopeId>();
@@ -696,16 +1004,17 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(replicator.CellCacheEntryCount, Is.EqualTo(1),
                         "inactive cell entries are still evicted after 64 ticks");
                     afterEviction.Dispose();
-                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1),
-                        "eviction must return every old cell lease while the current cell keeps " +
+                    AssertCellCacheOwnership(replicator, pool, 1,
+                        "eviction must remove old cell bytes while the current cell keeps " +
                         "its published canonical bytes");
                 }
                 finally
                 {
                     replicator.Dispose();
                     replicator.Dispose();
+                    Assert.That(replicator.CellCaptureVariantBytes, Is.Zero);
                     Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero,
-                        "repeated replicator disposal must release the remaining cell cache lease");
+                        "repeated replicator disposal must release the remaining cell cache bytes");
                 }
             }
             finally
@@ -863,13 +1172,14 @@ namespace UniGame.StaticEcs.Network.Tests
                     Is.EqualTo(SnapshotCaptureResult.LimitExceeded));
                 Assert.That(snapshot, Is.Null,
                     "aggregate payload rejection must not publish a partial snapshot");
-                Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(2),
-                    "aggregate payload rejection must retain only its two published cell leases, " +
+                AssertCellCacheOwnership(replicator, pool, 2,
+                    "aggregate payload rejection must retain only its two published cell bytess, " +
                     "never a merge lease");
                 replicator.Dispose();
                 replicator.Dispose();
+                Assert.That(replicator.CellCaptureVariantBytes, Is.Zero);
                 Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero,
-                    "disposing the rejected capture's cell caches returns both leases");
+                    "disposing the rejected capture releases both managed cell caches");
             }
             finally
             {
@@ -911,8 +1221,8 @@ namespace UniGame.StaticEcs.Network.Tests
                         Is.EqualTo(SnapshotCaptureResult.Success));
                     Assert.That(empty.EntityCount, Is.Zero);
                     empty.Dispose();
-                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1),
-                        "an empty capture keeps the prior cell lease for a future hold");
+                    AssertCellCacheOwnership(replicator, pool, 1,
+                        "an empty capture keeps the prior cell bytes for a future hold");
 
                     provider.CellEntities[cell].Add(entity);
                     Assert.That(replicator.Capture(3, scope, out var reappeared),
@@ -924,15 +1234,16 @@ namespace UniGame.StaticEcs.Network.Tests
                         "value did");
 
                     reappeared.Dispose();
-                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1),
-                        "the replacement cache lease remains live until its cell is released");
+                    AssertCellCacheOwnership(replicator, pool, 1,
+                        "the replacement cache bytes remain live until their cell is released");
                 }
                 finally
                 {
                     replicator.Dispose();
                     replicator.Dispose();
+                    Assert.That(replicator.CellCaptureVariantBytes, Is.Zero);
                     Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero,
-                        "cell cache disposal must release the held baseline lease");
+                        "cell cache disposal must release the held baseline bytes");
                 }
             }
             finally
@@ -942,7 +1253,7 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
-        public void CaptureViaCellsKeepsPublishedLeaseAcrossHookFailureAndRecovery()
+        public void CaptureViaCellsKeepsPublishedBytesAcrossHookFailureAndRecovery()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
             try
@@ -968,7 +1279,7 @@ namespace UniGame.StaticEcs.Network.Tests
                         Is.EqualTo(SnapshotCaptureResult.Success));
                     var firstBytes = first.Bytes.ToArray();
                     first.Dispose();
-                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1));
+                    AssertCellCacheOwnership(replicator, pool, 1);
 
                     entity.Set(new TestComponent { Value = 999 });
                     policy.Throw = true;
@@ -976,7 +1287,7 @@ namespace UniGame.StaticEcs.Network.Tests
                         Is.EqualTo(SnapshotCaptureResult.HookFailed));
                     Assert.That(failed, Is.Null,
                         "a failed capture must not publish a partial cell cache");
-                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1),
+                    AssertCellCacheOwnership(replicator, pool, 1,
                         "the unpublished lease returns while the prior cache stays available");
 
                     policy.Throw = false;
@@ -985,14 +1296,15 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(recovered.Bytes.Span.SequenceEqual(firstBytes), Is.True,
                         "the recovery hold must read the last successfully published cell bytes");
                     recovered.Dispose();
-                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1));
+                    AssertCellCacheOwnership(replicator, pool, 1);
                 }
                 finally
                 {
                     replicator.Dispose();
                     replicator.Dispose();
+                    Assert.That(replicator.CellCaptureVariantBytes, Is.Zero);
                     Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero,
-                        "the recovery cache lease must be released exactly once");
+                        "the recovery cache bytes must be released exactly once");
                 }
             }
             finally
@@ -1002,7 +1314,7 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
-        public void CaptureViaCellsShrinksLeaseFromPriorLogicalLength()
+        public void CaptureViaCellsShrinksLogicalPayloadWithoutGrowingRetainedCapacity()
         {
             World<LargePayloadWorld>.Create(WorldConfig.Default());
             var types = World<LargePayloadWorld>.Types();
@@ -1030,28 +1342,30 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(replicator.Capture(1, scope, out var largeSnapshot),
                         Is.EqualTo(SnapshotCaptureResult.Success));
                     largeSnapshot.Dispose();
+                    var retainedBytes = replicator.CellCaptureVariantBytes;
+                    Assert.That(retainedBytes, Is.GreaterThan(0));
 
                     entity.Set(new LargePayloadComponent { PayloadBytes = 1 });
                     Assert.That(replicator.Capture(2, scope, out var firstSmallSnapshot),
                         Is.EqualTo(SnapshotCaptureResult.Success));
+                    var smallBytes = firstSmallSnapshot.Bytes.ToArray();
                     firstSmallSnapshot.Dispose();
 
                     Assert.That(replicator.Capture(3, scope, out var smallSnapshot),
                         Is.EqualTo(SnapshotCaptureResult.Success));
+                    Assert.That(smallSnapshot.ByteLength, Is.EqualTo(smallBytes.Length));
+                    Assert.That(smallSnapshot.Bytes.Span.SequenceEqual(smallBytes), Is.True);
                     smallSnapshot.Dispose();
 
-                    var diagnostics = pool.CaptureDiagnostics();
-                    Assert.That(replicator.CellCacheEntryCount, Is.EqualTo(1));
-                    Assert.That(diagnostics.OutstandingLeases, Is.EqualTo(1),
-                        "only the small cell's published lease remains live");
-                    Assert.That(diagnostics.OutstandingBytes, Is.EqualTo(256),
-                        "the live cell cache capacity is rounded from its prior logical payload, " +
-                        "not from a retained capacity or global high-water mark");
+                    AssertCellCacheOwnership(replicator, pool, 1);
+                    Assert.That(replicator.CellCaptureVariantBytes, Is.EqualTo(retainedBytes),
+                        "smaller logical payloads reuse the existing managed cell capacity");
                 }
                 finally
                 {
                     replicator.Dispose();
                     replicator.Dispose();
+                    Assert.That(replicator.CellCaptureVariantBytes, Is.Zero);
                     Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
                 }
             }
@@ -1062,7 +1376,7 @@ namespace UniGame.StaticEcs.Network.Tests
         }
 
         [Test]
-        public void CaptureViaCellsKeepsPublishedLeaseAcrossInvalidEntityAndRecovery()
+        public void CaptureViaCellsKeepsPublishedBytesAcrossInvalidEntityAndRecovery()
         {
             CreateReplicationWorld<AuthorityWorld>(true);
             try
@@ -1084,29 +1398,42 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(replicator.Capture(1, scope, out var first), Is.EqualTo(SnapshotCaptureResult.Success));
                     var canonical = first.Bytes.ToArray();
                     first.Dispose();
-                    var publishedBytes = pool.CaptureDiagnostics().OutstandingBytes;
+                    var publishedBytes = replicator.CellCaptureVariantBytes;
                     entity.Set(new TestComponent { Value = 999 });
                     provider.AllowDuplicateEntities = true;
                     provider.CellEntities[cell].Add(entity);
                     Assert.That(replicator.Capture(2, scope, out var invalid), Is.EqualTo(SnapshotCaptureResult.InvalidEntity));
                     Assert.That(invalid, Is.Null);
-                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1));
-                    Assert.That(pool.CaptureDiagnostics().OutstandingBytes, Is.EqualTo(publishedBytes));
+                    AssertCellCacheOwnership(replicator, pool, 1);
+                    Assert.That(replicator.CellCaptureVariantBytes, Is.EqualTo(publishedBytes));
                     provider.CellEntities[cell].RemoveAt(1);
                     Assert.That(replicator.Capture(3, scope, out var recovered), Is.EqualTo(SnapshotCaptureResult.Success));
                     Assert.That(recovered.Bytes.Span.SequenceEqual(canonical), Is.True);
                     recovered.Dispose();
-                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1));
+                    AssertCellCacheOwnership(replicator, pool, 1);
                 }
                 finally
                 {
                     replicator.Dispose();
                     replicator.Dispose();
+                    Assert.That(replicator.CellCaptureVariantBytes, Is.Zero);
                     Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
                     Assert.That(pool.CaptureDiagnostics().OutstandingBytes, Is.Zero);
                 }
             }
             finally { World<AuthorityWorld>.Destroy(); }
+        }
+
+        private static void AssertCellCacheOwnership<TWorld>(
+            NetworkReplicator<TWorld> replicator, NetworkBufferPool pool,
+            int cells, string message = null)
+            where TWorld : struct, IWorldType
+        {
+            Assert.That(replicator.CellCaptureVariantCount, Is.EqualTo(cells), message);
+            Assert.That(replicator.CellCaptureVariantBytes, Is.GreaterThan(0), message);
+            var diagnostics = pool.CaptureDiagnostics();
+            Assert.That(diagnostics.OutstandingLeases, Is.Zero);
+            Assert.That(diagnostics.OutstandingBytes, Is.Zero);
         }
 
         private static int GetOrZero(Dictionary<ScopeId, int> counts, ScopeId key) =>

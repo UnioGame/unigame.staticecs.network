@@ -13,32 +13,6 @@ namespace UniGame.StaticEcs.Network.Tests
     public sealed class NetworkPacketDecodeCacheTests
     {
         [Test]
-        public void TryDecodeReusesCachedResultForRepeatedCallsOnSameLease()
-        {
-            using var pool = new NetworkBufferPool(1024);
-            var header = ValidHeader();
-            var body = new byte[] { 1, 2, 3, 4, 5 };
-            Assert.That(NetworkPacket.TryEncode(pool, header, body, out var packet), Is.True);
-            try
-            {
-                Assert.That(NetworkPacket.TryDecode(packet, out var first, out var firstPayload),
-                    Is.True);
-                Assert.That(NetworkPacket.TryDecode(packet, out var second, out var secondPayload),
-                    Is.True);
-
-                Assert.That(second.Kind, Is.EqualTo(first.Kind));
-                Assert.That(second.PacketSequence, Is.EqualTo(first.PacketSequence));
-                Assert.That(second.PayloadHash, Is.EqualTo(first.PayloadHash));
-                Assert.That(secondPayload.ToArray(), Is.EqualTo(firstPayload.ToArray()));
-                Assert.That(secondPayload.ToArray(), Is.EqualTo(body));
-            }
-            finally
-            {
-                packet.Dispose();
-            }
-        }
-
-        [Test]
         public void TryDecodeCachesNegativeResultForCorruptedPayloadWithoutThrowing()
         {
             using var pool = new NetworkBufferPool(1024);

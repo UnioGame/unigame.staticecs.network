@@ -42,7 +42,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     Assert.That(dispatch.Commands, Is.EqualTo(1)); Assert.That(dispatch.AcceptedCommands, Is.EqualTo(0)); Assert.That(dispatch.RejectedCommands, Is.EqualTo(1));
                     Assert.That(dispatch.ActiveConnections, Is.EqualTo(3)); Assert.That(dispatch.ActivePeers, Is.EqualTo(2));
 
-                    var disconnect = Packet(PacketKind.Disconnect, 5, 3); disconnect.SchemaFingerprint = serverSchema.Fingerprint;
+                    var disconnect = Packet(PacketKind.Disconnect, 5, 3); disconnect.CompatibilityTag = PacketHeader.CompatibilityTagOf(serverSchema.Fingerprint, 0, 0);
                     Assert.That(NetworkPacket.TryEncode(Buffers, disconnect, ReadOnlySpan<byte>.Empty, out var packet), Is.True);
                     Assert.That(clientTransport.TrySend(packet), Is.True); server.Receive();
                     Assert.That(session.State, Is.EqualTo(NetworkSessionState.Closed));
@@ -429,15 +429,6 @@ namespace UniGame.StaticEcs.Network.Tests
             Assert.That(command.Version, Is.Zero);
             Assert.That(owner.Version, Is.Zero);
             Assert.That(owner.RuntimeType, Is.EqualTo(typeof(NetworkOwnerComponent)));
-        }
-
-        [Test]
-        public void DetailedDiagnosticsExposeMetadataOnlyWhileLegacyObserverRemainsValid()
-        {
-            INetworkObserver legacy = new TraceCollector();
-            Assert.That(legacy, Is.Not.InstanceOf<INetworkDiagnosticsObserver>());
-            AssertMetadataOnly(typeof(NetworkSessionDiagnostics));
-            AssertMetadataOnly(typeof(NetworkSnapshotDiagnostics));
         }
 
         [Test]

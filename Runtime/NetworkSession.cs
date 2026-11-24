@@ -242,10 +242,22 @@ namespace UniGame.StaticEcs.Network
             }
             if (header.Kind == PacketKind.SnapshotChunk)
             {
-                if (header.Flags != PacketFlags.ReliableOrdered ||
+                // A delta may arrive on the unreliable channel: the client orders snapshots by
+                // their tick and a lost one is superseded by the next.
+                if ((header.Flags != PacketFlags.ReliableOrdered &&
+                     header.Flags != PacketFlags.UnreliableSequenced) ||
                     header.PacketSequence == 0)
                     return PacketValidationResult.Sequence;
                 return PacketValidationResult.Success;
+            }
+            if (header.Kind == PacketKind.Ack &&
+                header.Flags == PacketFlags.UnreliableSequenced)
+            {
+                // The acknowledged tick orders these, so a late or repeated one changes nothing
+                // and they stay out of the reliable numbering.
+                return header.PacketSequence == 0
+                    ? PacketValidationResult.Sequence
+                    : PacketValidationResult.Success;
             }
             if (header.Flags != PacketFlags.ReliableOrdered ||
                 header.PacketSequence != _nextReceivePacketSequence)
@@ -260,7 +272,8 @@ namespace UniGame.StaticEcs.Network
               kind == PacketKind.Ping || kind == PacketKind.Ack ||
               kind == PacketKind.ResyncRequest || kind == PacketKind.Disconnect
             : kind == PacketKind.SnapshotChunk || kind == PacketKind.Pong ||
-              kind == PacketKind.TransactionReceipt ||
+              kind == PacketKind.TransactionReceipt || kind == PacketKind.OwnerState ||
+              kind == PacketKind.OwnedEntityRefresh ||
               kind == PacketKind.ResyncRequest || kind == PacketKind.Disconnect;
 
         internal void Close() => State = NetworkSessionState.Closed;

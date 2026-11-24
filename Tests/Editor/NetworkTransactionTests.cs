@@ -106,7 +106,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 Flags = PacketFlags.ReliableOrdered,
                 SessionEpoch = harness.Epoch,
                 PacketSequence = 258,
-                SchemaFingerprint = harness.SchemaFingerprint,
+                CompatibilityTag = PacketHeader.CompatibilityTagOf(harness.SchemaFingerprint, 0, 0),
             };
             Assert.That(NetworkPacket.TryEncode(pool, header, payload.Span,
                     out var packet), Is.True);

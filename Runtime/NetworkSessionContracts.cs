@@ -26,7 +26,8 @@ namespace UniGame.StaticEcs.Network
         public ulong Value { get; }
         public bool Equals(ScopeId other) => Value == other.Value;
         public override bool Equals(object obj) => obj is ScopeId other && Equals(other);
-        public override int GetHashCode() => Value.GetHashCode();
+        // A spatial scope packs two cell indices; xor-folding them would map every diagonal to 0.
+        public override int GetHashCode() => unchecked((int)(Value * 0x9E3779B97F4A7C15UL >> 32));
         public static bool operator ==(ScopeId left, ScopeId right) => left.Equals(right);
         public static bool operator !=(ScopeId left, ScopeId right) => !left.Equals(right);
     }

@@ -80,5 +80,34 @@ namespace UniGame.StaticEcs.Network
             packet = lease;
             return true;
         }
+
+        /// <summary>
+        /// Wraps a previously framed chunk payload and a peer-specific trailer with one packet
+        /// header. The trailer changes the payload, so its hash is computed for this packet.
+        /// </summary>
+        internal static bool TryEncodeFromPayload(NetworkBufferPool pool,
+            PacketHeader header, ReadOnlyMemory<byte> payload,
+            ReadOnlySpan<byte> trailer, out NetworkBufferLease packet)
+        {
+            packet = null;
+            if (pool == null || trailer.Length == 0 || trailer.Length > byte.MaxValue ||
+                payload.Length + trailer.Length > ProtocolLimits.MaxWirePayloadBytes)
+                return false;
+            var payloadLength = payload.Length + trailer.Length;
+            var lease = pool.Rent(checked(PacketHeader.Size + payloadLength));
+            var destination = lease.WritableSpan;
+            payload.Span.CopyTo(destination.Slice(PacketHeader.Size));
+            trailer.CopyTo(destination.Slice(PacketHeader.Size + payload.Length));
+            header.PayloadLength = (uint)payloadLength;
+            header.TrailerLength = (byte)trailer.Length;
+            header.PayloadHash = Hashing.XxHash64(destination.Slice(PacketHeader.Size, payloadLength));
+            if (!header.TryWrite(destination))
+            {
+                lease.Dispose();
+                return false;
+            }
+            packet = lease;
+            return true;
+        }
     }
 }

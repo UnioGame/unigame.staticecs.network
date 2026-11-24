@@ -28,9 +28,22 @@ namespace UniGame.StaticEcs.Network
         // (32 MiB / 64 KiB = 512 concurrent scopes); a smaller configured budget or a larger
         // degenerate scope count still trades total memory growth for keeping delta history usable
         // rather than silently evicting every stored tick.
-        private const long MinimumPerScopeHistoryBytes = 64 * 1024;
+        private readonly long _minimumHistoryBytesPerScope;
+        // A dense scope whose single capture is large (a hub with hundreds of entities) must keep
+        // enough ticks of history for its peers' acknowledgements to stay usable as delta
+        // baselines, even when hundreds of sparse scopes divide the shared budget into slices
+        // smaller than a few of its captures. The floor scales with the scope's own newest
+        // capture, so sparse scopes keep their small slice and only a large scope grows past it.
+        // It must outlast an acknowledgement under load: an ack of an evicted tick costs a keyframe,
+        // whose size delays the next acks further, and at 8 ticks (400 ms) that became a keyframe loop.
+        private readonly int _minimumHistoryTicksPerScope;
+        // Queued command bytes one peer may hold before its batches are rejected. The former
+        // default of one full wire payload (8 MiB) let a thousand hostile clients pin gigabytes;
+        // honest input commands are a few bytes each and three batches deep.
         private readonly int _maxPendingCommandsPerPeer;
         private readonly int _maxPendingBytesPerPeer;
+        private readonly uint _commandPastWindowTicks;
+        private readonly uint _commandFutureWindowTicks;
         private long _pendingCommandBytesTotal;
         private int _pendingCommandsHighWater;
         private long _pendingCommandBytesHighWater;
@@ -39,15 +52,18 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Creates a server coordinator with bounded per-scope history.</summary>
         internal NetworkServerCoordinator(int historyCapacity = 64,
             long historyBytes = 32 * 1024 * 1024,
-            int maxPendingCommandsPerPeer = ProtocolLimits.MaxCommandsPerBatch * 3,
-            int maxPendingBytesPerPeer = ProtocolLimits.MaxWirePayloadBytes)
+            NetworkServerSettings settings = null)
         {
+            settings ??= new NetworkServerSettings();
+            settings.Validate();
+            var maxPendingCommandsPerPeer = settings.MaximumPendingCommandsPerPeer;
+            var maxPendingBytesPerPeer = settings.MaximumPendingCommandBytesPerPeer;
+            _minimumHistoryTicksPerScope = settings.MinimumHistoryTicksPerScope;
+            _minimumHistoryBytesPerScope = settings.MinimumHistoryBytesPerScope;
+            _commandPastWindowTicks = (uint)settings.CommandPastWindowTicks;
+            _commandFutureWindowTicks = (uint)settings.CommandFutureWindowTicks;
             if (historyCapacity < 1) throw new ArgumentOutOfRangeException(nameof(historyCapacity));
             if (historyBytes < 1) throw new ArgumentOutOfRangeException(nameof(historyBytes));
-            if (maxPendingCommandsPerPeer < 1)
-                throw new ArgumentOutOfRangeException(nameof(maxPendingCommandsPerPeer));
-            if (maxPendingBytesPerPeer < 1)
-                throw new ArgumentOutOfRangeException(nameof(maxPendingBytesPerPeer));
             _historyCapacity = historyCapacity; _historyBytes = historyBytes;
             _maxPendingCommandsPerPeer = maxPendingCommandsPerPeer;
             _maxPendingBytesPerPeer = maxPendingBytesPerPeer;
@@ -118,7 +134,7 @@ namespace UniGame.StaticEcs.Network
         }
 
         /// <summary>Validates and queues one command for canonical cross-peer ordering.</summary>
-        internal NetworkCommandResult Queue(NetworkCommandEnvelope envelope, uint serverTick, uint pastWindow = 2, uint futureWindow = 8)
+        internal NetworkCommandResult Queue(NetworkCommandEnvelope envelope, uint serverTick)
         {
             if (envelope.ExactBuffer == null || !_sessions.TryGetValue(envelope.Connection, out var session)) return NetworkCommandResult.WrongSession;
             _pendingCommandCounts.TryGetValue(envelope.Connection, out var count);
@@ -126,7 +142,8 @@ namespace UniGame.StaticEcs.Network
             if (count >= _maxPendingCommandsPerPeer ||
                 envelope.ExactLength > _maxPendingBytesPerPeer - bytes)
                 return NetworkCommandResult.LimitExceeded;
-            var result = session.Validate(envelope, serverTick, pastWindow, futureWindow, out var entry);
+            var result = session.Validate(envelope, serverTick, _commandPastWindowTicks,
+                _commandFutureWindowTicks, out var entry);
             if (result == NetworkCommandResult.Queued)
             {
                 _commands.Push(new PendingCommand(session, entry, envelope));
@@ -183,21 +200,33 @@ namespace UniGame.StaticEcs.Network
                 _history.Add(scope, history);
                 RebudgetHistories();
             }
+            var captureFloor = Math.Min(_historyBytes,
+                (long)snapshot.ByteLength * _minimumHistoryTicksPerScope);
+            if (history.MaxBytes < captureFloor)
+                history.Rebudget(captureFloor);
             history.Store(snapshot.ServerTick, snapshot);
         }
+
+        private long SharedPerScopeBytes =>
+            _history.Count == 0
+                ? _historyBytes
+                : Math.Max(_minimumHistoryBytesPerScope, _historyBytes / _history.Count);
 
         // NCORE-15: recomputes and applies the shared per-scope history byte budget across every
         // currently active scope history. Called only when the active-scope count changes (a scope
         // history is created or dropped), not every tick, since the divided cap only depends on that
-        // count. See MinimumPerScopeHistoryBytes for why the divisor is floored.
+        // count. See _minimumHistoryBytesPerScope for why the divisor is floored.
         private void RebudgetHistories()
         {
             if (_history.Count == 0)
                 return;
-            var perScopeBytes = Math.Max(MinimumPerScopeHistoryBytes,
-                _historyBytes / _history.Count);
+            var perScopeBytes = SharedPerScopeBytes;
             foreach (var history in _history.Values)
-                history.Rebudget(perScopeBytes);
+            {
+                var captureFloor = Math.Min(_historyBytes,
+                    history.NewestItemBytes * _minimumHistoryTicksPerScope);
+                history.Rebudget(Math.Max(perScopeBytes, captureFloor));
+            }
         }
 
         /// <summary>Finds one scope-and-tick capture. Per-peer acknowledgement state is never shared here.</summary>

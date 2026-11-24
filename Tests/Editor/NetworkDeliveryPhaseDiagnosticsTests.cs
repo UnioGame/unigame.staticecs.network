@@ -79,6 +79,12 @@ namespace UniGame.StaticEcs.Network.Tests
                 Is.EqualTo(1));
             Assert.That(value.NativeDeliveryEventToOwnerDispatch.Samples,
                 Is.EqualTo(1));
+            Assert.That(value.OutstandingSnapshotIdentities, Is.EqualTo(1));
+            Assert.That(value.OutstandingNativeTickets, Is.Zero);
+
+            recorder.RecordApplicationAck(peer, 100,
+                submission + Stopwatch.Frequency * 4 / 1000);
+            value = recorder.Capture().DeltaFrom(baseline).GetPeer(0);
             Assert.That(value.OutstandingSnapshotIdentities, Is.Zero);
             Assert.That(value.OutstandingNativeTickets, Is.Zero);
         }

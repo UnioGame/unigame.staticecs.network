@@ -15,7 +15,7 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Network v7 protocol number.</summary>
         public const ushort Version = ProtocolLimits.Version;
         /// <summary>Fixed encoded header length.</summary>
-        public const int Size = 84;
+        public const int Size = 56;
         /// <summary>Sentinel used when no tick exists.</summary>
         public const uint NoneTick = uint.MaxValue;
 
@@ -25,6 +25,12 @@ namespace UniGame.StaticEcs.Network
         public PacketFlags Flags { get; set; }
         /// <summary>Gets or sets compression.</summary>
         public NetworkCompression Compression { get; set; }
+        /// <summary>
+        /// Gets or sets how many bytes at the end of the payload are addressed to this peer alone.
+        /// The bytes before them are the payload its <see cref="Kind"/> describes, identical for
+        /// every peer that shares it. Only a <see cref="PacketKind.SnapshotChunk"/> carries a trailer.
+        /// </summary>
+        public byte TrailerLength { get; set; }
         /// <summary>Gets or sets the session epoch.</summary>
         public uint SessionEpoch { get; set; }
         /// <summary>Gets or sets the packet sequence.</summary>
@@ -39,12 +45,8 @@ namespace UniGame.StaticEcs.Network
         public uint ServerProcessedCommandSequence { get; set; }
         /// <summary>Gets or sets exact payload length.</summary>
         public uint PayloadLength { get; set; }
-        /// <summary>Gets or sets the generated schema fingerprint.</summary>
-        public SchemaFingerprint SchemaFingerprint { get; set; }
-        /// <summary>Gets or sets the deterministic simulation configuration fingerprint.</summary>
-        public ulong SimulationFingerprint { get; set; }
-        /// <summary>Gets or sets the baked grid and content fingerprint.</summary>
-        public ulong ContentFingerprint { get; set; }
+        /// <summary>Gets or sets the tag of the compatibility fingerprints, see <see cref="CompatibilityTagOf"/>.</summary>
+        public uint CompatibilityTag { get; set; }
         /// <summary>Gets or sets xxHash64 of the canonical payload.</summary>
         public ulong PayloadHash { get; set; }
 
@@ -60,6 +62,7 @@ namespace UniGame.StaticEcs.Network
             bytes[8] = (byte)Kind;
             bytes[9] = (byte)Flags;
             bytes[10] = (byte)Compression;
+            bytes[11] = TrailerLength;
             Hashing.Write32(bytes, 12, SessionEpoch);
             Hashing.Write32(bytes, 16, PacketSequence);
             Hashing.Write32(bytes, 20, ServerTick);
@@ -67,12 +70,24 @@ namespace UniGame.StaticEcs.Network
             Hashing.Write32(bytes, 28, ServerProcessedCommandTick);
             Hashing.Write32(bytes, 32, ServerProcessedCommandSequence);
             Hashing.Write32(bytes, 36, PayloadLength);
-            SchemaFingerprint.WriteBytes(bytes.Slice(40, 16));
-            Hashing.Write64(bytes, 56, SimulationFingerprint);
-            Hashing.Write64(bytes, 64, ContentFingerprint);
-            Hashing.Write64(bytes, 72, PayloadHash);
-            Hashing.Write32(bytes, 80, Hashing.Crc32(bytes));
+            Hashing.Write32(bytes, 40, CompatibilityTag);
+            Hashing.Write64(bytes, 44, PayloadHash);
+            Hashing.Write32(bytes, 52, Hashing.Crc32(bytes));
             return true;
+        }
+
+        /// <summary>
+        /// Folds the schema, simulation and content fingerprints into the tag every packet carries.
+        /// The client states the full fingerprints once, in its <see cref="HandshakeFingerprints"/>
+        /// payload, so admission still names the exact mismatch; later packets only prove they belong
+        /// to the same compatible pair.
+        /// </summary>
+        public static uint CompatibilityTagOf(SchemaFingerprint schema, ulong simulation, ulong content)
+        {
+            Span<byte> bytes = stackalloc byte[HandshakeFingerprints.Size];
+            new HandshakeFingerprints(schema, simulation, content).TryWrite(bytes);
+            var hash = Hashing.XxHash64(bytes);
+            return unchecked((uint)hash ^ (uint)(hash >> 32));
         }
 
         /// <summary>Checks whether a complete valid packet declares a different wire protocol version.</summary>
@@ -107,25 +122,24 @@ namespace UniGame.StaticEcs.Network
             header = default;
             version = default;
             if (source.Length < Size || Hashing.Read32(source, 0) != 0x53434553 ||
-                Read16(source, 6) != Size || source[11] != 0) return false;
+                Read16(source, 6) != Size) return false;
             Span<byte> copy = stackalloc byte[Size];
             source.Slice(0, Size).CopyTo(copy);
-            var expected = Hashing.Read32(copy, 80);
-            copy.Slice(80, 4).Clear();
+            var expected = Hashing.Read32(copy, 52);
+            copy.Slice(52, 4).Clear();
             if (Hashing.Crc32(copy) != expected) return false;
             version = Read16(source, 4);
             header = new PacketHeader
             {
                 Kind = (PacketKind)source[8], Flags = (PacketFlags)source[9], Compression = (NetworkCompression)source[10],
+                TrailerLength = source[11],
                 SessionEpoch = Hashing.Read32(source, 12), PacketSequence = Hashing.Read32(source, 16),
                 ServerTick = Hashing.Read32(source, 20), AcknowledgedSnapshotTick = Hashing.Read32(source, 24),
                 ServerProcessedCommandTick = Hashing.Read32(source, 28),
                 ServerProcessedCommandSequence = Hashing.Read32(source, 32),
                 PayloadLength = Hashing.Read32(source, 36),
-                SchemaFingerprint = SchemaFingerprint.ReadBytes(source.Slice(40, 16)),
-                SimulationFingerprint = Hashing.Read64(source, 56),
-                ContentFingerprint = Hashing.Read64(source, 64),
-                PayloadHash = Hashing.Read64(source, 72)
+                CompatibilityTag = Hashing.Read32(source, 40),
+                PayloadHash = Hashing.Read64(source, 44)
             };
             return true;
         }
@@ -136,7 +150,9 @@ namespace UniGame.StaticEcs.Network
             IsKnownKind(value.Kind) &&
             (value.Flags == PacketFlags.ReliableOrdered ||
              value.Flags == PacketFlags.UnreliableSequenced) &&
-            value.Compression == NetworkCompression.None && value.PayloadLength <= ProtocolLimits.MaxWirePayloadBytes;
+            value.Compression == NetworkCompression.None && value.PayloadLength <= ProtocolLimits.MaxWirePayloadBytes &&
+            (value.TrailerLength == 0 ||
+             (value.Kind == PacketKind.SnapshotChunk && value.TrailerLength < value.PayloadLength));
 
         private static bool IsKnownKind(PacketKind kind) => kind == PacketKind.Hello ||
             kind == PacketKind.Ready || kind == PacketKind.CommandBatch ||
@@ -144,7 +160,9 @@ namespace UniGame.StaticEcs.Network
             kind == PacketKind.ResyncRequest || kind == PacketKind.Disconnect ||
             kind == PacketKind.SnapshotChunk || kind == PacketKind.Ping ||
             kind == PacketKind.Pong || kind == PacketKind.TransactionCommand ||
-            kind == PacketKind.TransactionReceipt;
+            kind == PacketKind.TransactionReceipt ||
+            kind == PacketKind.OwnerState ||
+            kind == PacketKind.OwnedEntityRefresh;
     }
 
     /// <summary>Encodes and validates exact Network v7 packets.</summary>
@@ -172,11 +190,11 @@ namespace UniGame.StaticEcs.Network
 
         /// <summary>Validates framing, exact length, fingerprint and payload hash before exposing payload bytes.</summary>
         public static bool TryDecode(NetworkBufferLease packet,
-            SchemaFingerprint expectedFingerprint, out PacketHeader header,
+            uint expectedCompatibilityTag, out PacketHeader header,
             out ReadOnlyMemory<byte> payload)
         {
             if (!TryDecode(packet, out header, out payload)) return false;
-            if (header.SchemaFingerprint == expectedFingerprint) return true;
+            if (header.CompatibilityTag == expectedCompatibilityTag) return true;
             header = default; payload = default; return false;
         }
 

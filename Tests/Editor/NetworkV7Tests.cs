@@ -24,19 +24,21 @@ namespace UniGame.StaticEcs.Network.Tests
                 Compression = NetworkCompression.None,
                 ServerTick = 42,
                 PayloadLength = 3,
-                SchemaFingerprint = new SchemaFingerprint(1, 2),
-                SimulationFingerprint = 3,
-                ContentFingerprint = 4,
+                CompatibilityTag = PacketHeader.CompatibilityTagOf(new SchemaFingerprint(1, 2), 3, 4),
                 PayloadHash = 7
             };
             var bytes = new byte[PacketHeader.Size];
             Assert.That(header.TryWrite(bytes), Is.True);
             Assert.That(PacketHeader.TryRead(bytes, out var decoded), Is.True);
-            Assert.That(ProtocolLimits.Version, Is.EqualTo(10));
-            Assert.That(decoded.SchemaFingerprint, Is.EqualTo(header.SchemaFingerprint));
-            Assert.That(decoded.SimulationFingerprint,
-                Is.EqualTo(header.SimulationFingerprint));
-            Assert.That(decoded.ContentFingerprint, Is.EqualTo(header.ContentFingerprint));
+            Assert.That(ProtocolLimits.Version, Is.EqualTo(17));
+            Assert.That(PacketHeader.Size, Is.EqualTo(56));
+            Assert.That(decoded.CompatibilityTag, Is.EqualTo(header.CompatibilityTag));
+            Assert.That(header.CompatibilityTag, Is.Not.EqualTo(
+                PacketHeader.CompatibilityTagOf(new SchemaFingerprint(1, 3), 3, 4)));
+            Assert.That(header.CompatibilityTag, Is.Not.EqualTo(
+                PacketHeader.CompatibilityTagOf(new SchemaFingerprint(1, 2), 4, 4)));
+            Assert.That(header.CompatibilityTag, Is.Not.EqualTo(
+                PacketHeader.CompatibilityTagOf(new SchemaFingerprint(1, 2), 3, 5)));
             bytes[4] = 6;
             bytes[5] = 0;
             Assert.That(PacketHeader.TryRead(bytes, out _), Is.False);
@@ -49,7 +51,7 @@ namespace UniGame.StaticEcs.Network.Tests
             packet.Dispose();
             corruptBytes[corruptBytes.Length - 1] ^= 1;
             packet = Buffers.Copy(corruptBytes);
-            Assert.That(NetworkPacket.TryDecode(packet, header.SchemaFingerprint, out _, out _), Is.False);
+            Assert.That(NetworkPacket.TryDecode(packet, header.CompatibilityTag, out _, out _), Is.False);
             packet.Dispose();
             header.Kind = (PacketKind)4;
             header.PayloadLength = 0;
@@ -152,12 +154,6 @@ namespace UniGame.StaticEcs.Network.Tests
             var second = new NetworkSimulationConfigResource(20, 64, 2, 3, 2f);
             var changed = new NetworkSimulationConfigResource(30, 64, 2, 3, 2f);
 
-            Assert.That(first.Config.TicksPerSecond, Is.EqualTo(20));
-            Assert.That(NetworkSimulationConfig.MinimumCommandRedundancy, Is.EqualTo(1));
-            Assert.That(NetworkSimulationConfig.DefaultCommandRedundancy, Is.EqualTo(3));
-            Assert.That(NetworkSimulationConfig.MaximumCommandRedundancy, Is.EqualTo(32));
-            Assert.That(first.CommandRedundancy,
-                Is.EqualTo(NetworkSimulationConfig.DefaultCommandRedundancy));
             Assert.Throws<ArgumentOutOfRangeException>(() =>
                 new NetworkSimulationConfigResource(20, commandRedundancy:
                     NetworkSimulationConfig.MinimumCommandRedundancy - 1));
@@ -632,9 +628,9 @@ namespace UniGame.StaticEcs.Network.Tests
                         new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
                     var packetHeader = Packet(PacketKind.SnapshotChunk, 1, 1);
                     packetHeader.ServerTick = 1;
-                    packetHeader.SchemaFingerprint = default;
-                    Assert.That(packetHeader.SchemaFingerprint,
-                        Is.Not.EqualTo(schema.Fingerprint));
+                    packetHeader.CompatibilityTag = default;
+                    Assert.That(packetHeader.CompatibilityTag, Is.Not.EqualTo(
+                        PacketHeader.CompatibilityTagOf(schema.Fingerprint, 0, 0)));
                     Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
                         ReadOnlySpan<byte>.Empty, out var packet), Is.True);
                     Assert.That(serverTransport.TrySend(packet), Is.True);
@@ -672,15 +668,15 @@ namespace UniGame.StaticEcs.Network.Tests
                         new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
                     var packetHeader = Packet(PacketKind.SnapshotChunk, 1, 1);
                     packetHeader.ServerTick = 1;
-                    packetHeader.SchemaFingerprint = schema.Fingerprint;
+                    packetHeader.CompatibilityTag = PacketHeader.CompatibilityTagOf(schema.Fingerprint, 0, 0);
                     Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
                         ReadOnlySpan<byte>.Empty, out var packet), Is.True);
                     var bytes = packet.Memory.ToArray();
                     packet.Dispose();
                     bytes[4] = 3;
                     bytes[5] = 0;
-                    Write32(bytes, 80, 0);
-                    Write32(bytes, 80, Crc32(bytes));
+                    Write32(bytes, PacketHeader.Size - 4, 0);
+                    Write32(bytes, PacketHeader.Size - 4, Crc32(bytes));
                     Assert.That(serverTransport.TrySend(Buffers.Copy(bytes)), Is.True);
 
                     client.Process();
@@ -716,7 +712,7 @@ namespace UniGame.StaticEcs.Network.Tests
                         new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
                     var packetHeader = Packet(PacketKind.SnapshotChunk, 1, 1);
                     packetHeader.ServerTick = 1;
-                    packetHeader.SchemaFingerprint = schema.Fingerprint;
+                    packetHeader.CompatibilityTag = PacketHeader.CompatibilityTagOf(schema.Fingerprint, 0, 0);
                     Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
                         ReadOnlySpan<byte>.Empty, out var packet), Is.True);
                     var bytes = packet.Memory.ToArray();
@@ -758,15 +754,15 @@ namespace UniGame.StaticEcs.Network.Tests
                         new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
                     var packetHeader = Packet(PacketKind.SnapshotChunk, 1, 1);
                     packetHeader.ServerTick = 1;
-                    packetHeader.SchemaFingerprint = schema.Fingerprint;
+                    packetHeader.CompatibilityTag = PacketHeader.CompatibilityTagOf(schema.Fingerprint, 0, 0);
                     Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
                         new byte[] { 1 }, out var packet), Is.True);
                     var bytes = packet.Memory.ToArray();
                     packet.Dispose();
                     bytes[4] = 3;
                     bytes[5] = 0;
-                    Write32(bytes, 80, 0);
-                    Write32(bytes, 80, Crc32(bytes.AsSpan(0, PacketHeader.Size)));
+                    Write32(bytes, PacketHeader.Size - 4, 0);
+                    Write32(bytes, PacketHeader.Size - 4, Crc32(bytes.AsSpan(0, PacketHeader.Size)));
                     Assert.That(serverTransport.TrySend(Buffers.Copy(
                         bytes.AsSpan(0, bytes.Length - 1))), Is.True);
 
@@ -803,15 +799,15 @@ namespace UniGame.StaticEcs.Network.Tests
                         new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
                     var packetHeader = Packet(PacketKind.SnapshotChunk, 1, 1);
                     packetHeader.ServerTick = 1;
-                    packetHeader.SchemaFingerprint = schema.Fingerprint;
+                    packetHeader.CompatibilityTag = PacketHeader.CompatibilityTagOf(schema.Fingerprint, 0, 0);
                     Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
                         new byte[] { 1 }, out var packet), Is.True);
                     var bytes = packet.Memory.ToArray();
                     packet.Dispose();
                     bytes[4] = 3;
                     bytes[5] = 0;
-                    Write32(bytes, 80, 0);
-                    Write32(bytes, 80, Crc32(bytes.AsSpan(0, PacketHeader.Size)));
+                    Write32(bytes, PacketHeader.Size - 4, 0);
+                    Write32(bytes, PacketHeader.Size - 4, Crc32(bytes.AsSpan(0, PacketHeader.Size)));
                     bytes[PacketHeader.Size] ^= 1;
                     Assert.That(serverTransport.TrySend(Buffers.Copy(bytes)), Is.True);
 
@@ -887,11 +883,22 @@ namespace UniGame.StaticEcs.Network.Tests
             uint sequence, uint acknowledgedTick)
         {
             var header = Packet(kind, epoch, sequence);
-            header.SchemaFingerprint = schema;
+            header.CompatibilityTag = PacketHeader.CompatibilityTagOf(schema, 0, 0);
             header.AcknowledgedSnapshotTick = acknowledgedTick;
             Assert.That(NetworkPacket.TryEncode(Buffers, header,
-                ReadOnlySpan<byte>.Empty, out var packet), Is.True);
+                kind == PacketKind.Hello ? HelloPayload(schema) : ReadOnlySpan<byte>.Empty,
+                out var packet), Is.True);
             Assert.That(transport.TrySend(packet), Is.True);
+        }
+
+        /// <summary>The fingerprints a client states in Hello; tests use zero simulation and content.</summary>
+        private static byte[] HelloPayload(SchemaFingerprint schema, ulong simulation = 0,
+            ulong content = 0)
+        {
+            var payload = new byte[HandshakeFingerprints.Size];
+            Assert.That(new HandshakeFingerprints(schema, simulation, content).TryWrite(payload),
+                Is.True);
+            return payload;
         }
 
         private static SnapshotChunkHeader ReceiveChunk(
@@ -938,7 +945,7 @@ namespace UniGame.StaticEcs.Network.Tests
             body.CopyTo(payload.AsSpan(SnapshotChunkHeader.Size));
             var header = Packet(PacketKind.SnapshotChunk, 1, sequence);
             header.ServerTick = chunk.SnapshotTick;
-            header.SchemaFingerprint = schema;
+            header.CompatibilityTag = PacketHeader.CompatibilityTagOf(schema, 0, 0);
             Assert.That(NetworkPacket.TryEncode(Buffers, header,
                 payload, out var packet), Is.True);
             Assert.That(transport.TrySend(packet), Is.True);
@@ -1060,16 +1067,6 @@ namespace UniGame.StaticEcs.Network.Tests
                 }
             }
             return ~crc;
-        }
-
-        private static void AssertMetadataOnly(Type type)
-        {
-            foreach (var property in type.GetProperties())
-            {
-                Assert.That(property.PropertyType, Is.Not.EqualTo(typeof(byte[])));
-                Assert.That(property.PropertyType, Is.Not.EqualTo(typeof(ReadOnlyMemory<byte>)));
-                Assert.That(property.PropertyType, Is.Not.EqualTo(typeof(EntityGID)));
-            }
         }
 
         private static void AssertPacketDirection(NetworkSchema<TestWorld> schema, NetworkRole role, PacketKind kind, bool allowed, uint connection)

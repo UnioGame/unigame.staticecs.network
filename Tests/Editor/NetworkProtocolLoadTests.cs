@@ -368,7 +368,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 SessionEpoch = 1,
                 PacketSequence = sequence,
                 ServerTick = tick,
-                SchemaFingerprint = fingerprint,
+                CompatibilityTag = PacketHeader.CompatibilityTagOf(fingerprint, 0, 0),
             };
             Assert.That(NetworkPacket.TryEncode(Buffers, header, payload,
                 out var packet), Is.True);

@@ -43,6 +43,18 @@ namespace UniGame.StaticEcs.Network
         public int Capacity => _capacity;
         /// <summary>Gets the configured maximum retained byte count.</summary>
         public long MaxBytes => _maxBytes;
+        /// <summary>Gets the byte size of the newest retained item, or zero when empty.</summary>
+        public long NewestItemBytes
+        {
+            get
+            {
+                if (_count == 0)
+                    return 0;
+                var newest = FindBoundary(true);
+                var index = (int)(newest % (uint)_capacity);
+                return _occupied[index] && _ticks[index] == newest ? _sizes[index] : 0;
+            }
+        }
 
         /// <summary>
         /// Lowers or raises this history's own byte cap (NCORE-15) and immediately evicts oldest

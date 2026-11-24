@@ -400,7 +400,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 Admit(client2, serverSchema, 2); Admit(server2, clientSchema, 2);
 
                 var coordinator = new NetworkServerCoordinator<IsolationWorld>(
-                    maxPendingCommandsPerPeer: 3);
+                    settings: new NetworkServerSettings { MaximumPendingCommandsPerPeer = 3 });
                 coordinator.Add(server1);
                 coordinator.Add(server2);
                 var dispatched = 0;
@@ -452,7 +452,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 commandClient.CreateCommand(new IsolationCommand { Value = 2 }, 1, out var b);
                 commandClient.CreateCommand(new IsolationCommand { Value = 3 }, 1, out var c);
                 var commandLimited = new NetworkServerCoordinator<IsolationWorld>(
-                    maxPendingCommandsPerPeer: 2);
+                    settings: new NetworkServerSettings { MaximumPendingCommandsPerPeer = 2 });
                 commandLimited.Add(commandServer);
                 Assert.That(commandLimited.Queue(a, 1), Is.EqualTo(NetworkCommandResult.Queued));
                 Assert.That(commandLimited.Queue(b, 1), Is.EqualTo(NetworkCommandResult.Queued));
@@ -469,7 +469,7 @@ namespace UniGame.StaticEcs.Network.Tests
                 byteClient.CreateCommand(new IsolationCommand { Value = 4 }, 1, out var d);
                 byteClient.CreateCommand(new IsolationCommand { Value = 5 }, 1, out var e);
                 var byteLimited = new NetworkServerCoordinator<IsolationWorld>(
-                    maxPendingBytesPerPeer: 6);
+                    settings: new NetworkServerSettings { MaximumPendingCommandBytesPerPeer = 6 });
                 byteLimited.Add(byteServer);
                 Assert.That(byteLimited.Queue(d, 1), Is.EqualTo(NetworkCommandResult.Queued));
                 Assert.That(byteLimited.Queue(e, 1), Is.EqualTo(NetworkCommandResult.LimitExceeded));
@@ -479,6 +479,55 @@ namespace UniGame.StaticEcs.Network.Tests
 
                 commandLimited.Clear();
                 byteLimited.Clear();
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+            }
+            finally
+            {
+                World<IsolationWorld>.Destroy();
+            }
+        }
+
+        // A command for tick 5: the future window decides at server tick 3, the past window at 9.
+        [TestCase(3u, 2, 1, false, Description = "Two ticks ahead of a window of one.")]
+        [TestCase(3u, 2, 2, true, Description = "Two ticks ahead of a window of two.")]
+        [TestCase(9u, 3, 8, false, Description = "Four ticks behind a window of three.")]
+        [TestCase(9u, 4, 8, true, Description = "Four ticks behind a window of four.")]
+        public void QueueUsesTheCommandTickWindowsOfTheSettings(uint serverTick, int pastWindow,
+            int futureWindow, bool queued)
+        {
+            World<IsolationWorld>.Create(WorldConfig.Default());
+            World<IsolationWorld>.Types()
+                .Event<IsolationCommand>()
+                .Event<NetworkCommandAcceptedEvent<IsolationCommand>>()
+                .Event<NetworkCommandRejectedEvent<IsolationCommand>>();
+            World<IsolationWorld>.Initialize();
+            try
+            {
+                using var pool = new NetworkBufferPool(1 << 20);
+                var clientSchema = Schema(false);
+                var serverSchema = Schema(true);
+                var client = new NetworkSession<IsolationWorld>(
+                    new ConnectionId(71), NetworkRole.Client, clientSchema, pool);
+                var server = new NetworkSession<IsolationWorld>(
+                    new ConnectionId(71), NetworkRole.Server, serverSchema, pool);
+                Admit(client, serverSchema, 1); Admit(server, clientSchema, 1);
+                client.CreateCommand(new IsolationCommand { Value = 1 }, 5, out var command);
+                var coordinator = new NetworkServerCoordinator<IsolationWorld>(
+                    settings: new NetworkServerSettings
+                    {
+                        CommandPastWindowTicks = pastWindow,
+                        CommandFutureWindowTicks = futureWindow,
+                    });
+                coordinator.Add(server);
+
+                var result = coordinator.Queue(command, serverTick);
+
+                Assert.That(result, Is.EqualTo(queued
+                    ? NetworkCommandResult.Queued
+                    : NetworkCommandResult.TickWindow));
+                if (!queued)
+                    command.Dispose();
+                coordinator.Clear();
                 Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
             }
             finally

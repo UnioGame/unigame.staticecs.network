@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Reflection;
 using FFS.Libraries.StaticEcs;
 using NUnit.Framework;
 
@@ -99,7 +100,7 @@ namespace UniGame.StaticEcs.Network.Tests
                     new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
                 var packetHeader = Packet(PacketKind.SnapshotChunk, 1, 1);
                 packetHeader.ServerTick = 1;
-                packetHeader.SchemaFingerprint = schema.Fingerprint;
+                packetHeader.CompatibilityTag = PacketHeader.CompatibilityTagOf(schema.Fingerprint, 0, 0);
                 // One byte is too short to even be a SnapshotChunkHeader (Size > 1): the exact
                 // same malformed-payload shape CurrentVersionMalformedSnapshotRequestsKeyframe
                 // exercises for a full client.
@@ -121,6 +122,39 @@ namespace UniGame.StaticEcs.Network.Tests
                 Assert.That(client.History.Count, Is.Zero);
             }
             Assert.That(World<LightClientWorld>.Status, Is.EqualTo(WorldStatus.NotCreated));
+        }
+
+        [Test]
+        public void EstimatedServerTickNeverRunsBackWhenTheRoundTripEstimateShrinks()
+        {
+            var schema = Schema<LightClientWorld>(false);
+            MemoryNetworkTransport.CreatePair(new ConnectionId(203),
+                out var clientTransport, out var serverTransport);
+            using (clientTransport)
+            using (serverTransport)
+            using (var client = new NetworkClient<LightClientWorld>(clientTransport,
+                       schema, new ScopeId(1), canonicalOnlyApply: true))
+            {
+                Assert.That(client.Session.Admit(schema.Fingerprint, 1, 1,
+                    new ScopeId(1)), Is.EqualTo(NetworkAdmissionResult.Accepted));
+                var packetHeader = Packet(PacketKind.SnapshotChunk, 1, 1);
+                packetHeader.ServerTick = 100;
+                packetHeader.CompatibilityTag = PacketHeader.CompatibilityTagOf(schema.Fingerprint, 0, 0);
+                Assert.That(NetworkPacket.TryEncode(Buffers, packetHeader,
+                    new byte[] { 1 }, out var packet), Is.True);
+                Assert.That(serverTransport.TrySend(packet), Is.True);
+                client.Process();
+                Assert.That(client.ServerTick, Is.EqualTo(100u));
+
+                var roundTrip = typeof(NetworkClient<LightClientWorld>).GetField(
+                    "_roundTripSeconds", BindingFlags.Instance | BindingFlags.NonPublic);
+                roundTrip.SetValue(client, 2d);
+                uint highest = client.EstimatedServerTick;
+                roundTrip.SetValue(client, 0d);
+
+                Assert.That(highest, Is.GreaterThan(101u));
+                Assert.That(client.EstimatedServerTick, Is.GreaterThanOrEqualTo(highest));
+            }
         }
 
         [Test]
@@ -290,6 +324,68 @@ namespace UniGame.StaticEcs.Network.Tests
                 World<AuthorityWorld>.Destroy();
             }
         }
+
+        [TestCase(1d, true)]
+        [TestCase(3d, false)]
+        public void AcknowledgementSendTimeoutComesFromTheSettings(double timeoutSeconds,
+            bool closedAfterTwoSeconds)
+        {
+            CreateReplicationWorld<AuthorityWorld>(true);
+            try
+            {
+                var authoritySchema = Schema<AuthorityWorld>(true);
+                var lightSchema = Schema<LightClientWorld>(false);
+                var authority = World<AuthorityWorld>.NewEntity<TestEntity>();
+                authority.Set(new TestComponent { Value = 1 });
+                MemoryNetworkTransport.CreatePair(new ConnectionId(207),
+                    out var clientEndpoint, out var serverEndpoint);
+                using (var transport = new RejectAcknowledgementTransport(clientEndpoint))
+                using (serverEndpoint)
+                using (var server = new NetworkServer<AuthorityWorld>(authoritySchema,
+                           static (_, _) => true,
+                           snapshotAdmissionMode: NetworkSnapshotAdmissionMode.ApplicationAck))
+                using (var client = new NetworkClient<LightClientWorld>(transport,
+                           lightSchema, new ScopeId(1), canonicalOnlyApply: true,
+                           settings: new NetworkClientSettings
+                           {
+                               AcknowledgementSendTimeoutSeconds = timeoutSeconds,
+                           }))
+                {
+                    server.AddConnection(serverEndpoint, 1, 1, new ScopeId(1));
+                    Assert.That(client.BeginHandshake(), Is.True);
+                    server.Receive();
+                    transport.RejectNextAcknowledgements = int.MaxValue;
+                    server.Tick(_ => { });
+                    client.Process();
+                    client.Process(Stopwatch.GetTimestamp() + 2L * Stopwatch.Frequency);
+                    Assert.That(client.Session.State == NetworkSessionState.Closed,
+                        Is.EqualTo(closedAfterTwoSeconds));
+                }
+            }
+            finally
+            {
+                World<AuthorityWorld>.Destroy();
+            }
+        }
+
+        [Test]
+        public void ClientSettingsRejectValuesTheClientCannotRunWith()
+        {
+            Assert.DoesNotThrow(() => new NetworkClientSettings().Validate());
+            AssertInvalid(new NetworkClientSettings { SnapshotAssemblyTimeoutSeconds = 0d });
+            AssertInvalid(new NetworkClientSettings { AcknowledgementSendTimeoutSeconds = -1d });
+            AssertInvalid(new NetworkClientSettings { ClockProbeIntervalSeconds = double.NaN });
+            AssertInvalid(new NetworkClientSettings
+            {
+                ClockProbeIntervalSeconds = double.PositiveInfinity,
+            });
+            AssertInvalid(new NetworkClientSettings { RoundTripSmoothing = 0d });
+            AssertInvalid(new NetworkClientSettings { RoundTripSmoothing = 1.01d });
+            AssertInvalid(new NetworkClientSettings { MaximumPendingOwnedEntityRefreshes = 0 });
+        }
+
+        private static void AssertInvalid(NetworkClientSettings settings) =>
+            Assert.Throws<ArgumentOutOfRangeException>(settings.Validate);
 
         private sealed class RejectAcknowledgementTransport : INetworkTransport
         {

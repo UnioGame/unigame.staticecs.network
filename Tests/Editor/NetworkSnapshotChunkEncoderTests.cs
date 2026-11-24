@@ -247,6 +247,84 @@ namespace UniGame.StaticEcs.Network.Tests
             }
         }
 
+        [Test]
+        public void TrailerEncodingAppendsThePeerBytesToTheSharedPayload()
+        {
+            using var pool = new NetworkBufferPool(1L << 20);
+            var chunk = Chunk(SnapshotPayloadKind.Delta);
+            var body = Body(512);
+            var trailer = new byte[] { 1, 2, 3, 4, 5 };
+            Assert.That(SnapshotChunkEncoder.TryEncodePayload(pool, in chunk,
+                body, out var shared, out _), Is.True);
+            Assert.That(SnapshotChunkEncoder.TryEncodeFromPayload(pool, Header(),
+                shared.Memory, trailer, out var packet), Is.True);
+            try
+            {
+                Assert.That(NetworkPacket.TryDecode(packet, out var header, out var payload),
+                    Is.True, "The packet hash covers the trailer.");
+                Assert.That(header.TrailerLength, Is.EqualTo(trailer.Length));
+                Assert.That(payload.Length, Is.EqualTo(shared.Length + trailer.Length));
+                Assert.That(payload.Slice(0, shared.Length).Span.SequenceEqual(shared.Span),
+                    Is.True);
+                Assert.That(payload.Slice(shared.Length).Span.SequenceEqual(trailer), Is.True);
+
+                var corrupt = packet.Memory.ToArray();
+                corrupt[corrupt.Length - 1] ^= 1;
+                using var corrupted = pool.Copy(corrupt);
+                Assert.That(NetworkPacket.TryDecode(corrupted, out _, out _), Is.False);
+            }
+            finally
+            {
+                packet.Dispose();
+                shared.Dispose();
+            }
+
+            AssertReleased(pool);
+        }
+
+        [TestCase(0)]
+        [TestCase(byte.MaxValue + 1)]
+        public void TrailerEncodingRejectsATrailerTheHeaderCannotDescribe(int trailerLength)
+        {
+            using var pool = new NetworkBufferPool(1L << 20);
+            var chunk = Chunk(SnapshotPayloadKind.Delta);
+            Assert.That(SnapshotChunkEncoder.TryEncodePayload(pool, in chunk,
+                Body(64), out var shared, out _), Is.True);
+            try
+            {
+                Assert.That(SnapshotChunkEncoder.TryEncodeFromPayload(pool, Header(),
+                    shared.Memory, new byte[trailerLength], out var packet), Is.False);
+                Assert.That(packet, Is.Null);
+            }
+            finally
+            {
+                shared.Dispose();
+            }
+
+            AssertReleased(pool);
+        }
+
+        [Test]
+        public void PacketHeaderAcceptsATrailerOnlyInsideASnapshotChunkPayload()
+        {
+            var bytes = new byte[PacketHeader.Size];
+            var header = Header();
+            header.PayloadLength = 64;
+            header.TrailerLength = 63;
+            Assert.That(header.TryWrite(bytes), Is.True);
+            Assert.That(PacketHeader.TryRead(bytes, out var decoded), Is.True);
+            Assert.That(decoded.TrailerLength, Is.EqualTo(63));
+
+            header.TrailerLength = 64;
+            Assert.That(header.TryWrite(bytes), Is.False,
+                "A trailer leaves at least one byte of the shared payload.");
+
+            header.TrailerLength = 1;
+            header.Kind = PacketKind.OwnerState;
+            Assert.That(header.TryWrite(bytes), Is.False,
+                "No other packet kind has a payload shared between peers.");
+        }
+
         private static PacketHeader Header() => new PacketHeader
         {
             Kind = PacketKind.SnapshotChunk,
@@ -258,8 +336,7 @@ namespace UniGame.StaticEcs.Network.Tests
             AcknowledgedSnapshotTick = PacketHeader.NoneTick,
             ServerProcessedCommandTick = 41,
             ServerProcessedCommandSequence = 7,
-            SimulationFingerprint = 0x0123456789abcdefUL,
-            ContentFingerprint = 0xfedcba9876543210UL
+            CompatibilityTag = 0x89abcdefu
         };
 
         private static SnapshotChunkHeader Chunk(SnapshotPayloadKind kind) =>

@@ -66,4 +66,62 @@ namespace UniGame.StaticEcs.Network
         /// <summary>Returns whether this entity's encoded snapshot records belong to the metric.</summary>
         bool ShouldAttribute(in World<TWorld>.Entity entity, EntityGID gid);
     }
+
+    /// <summary>Constants of <see cref="INetworkScopeCaptureBudgetPolicy{TWorld}"/>.</summary>
+    public static class NetworkScopeCaptureBudget
+    {
+        /// <summary>A weight that refreshes the entity whatever the allowance of the tick.</summary>
+        public const int AlwaysRefresh = int.MaxValue;
+    }
+
+    /// <summary>
+    /// Opt-in. Limits how many bytes of changed entities one cellular scope snapshot refreshes per
+    /// tick, so a crowded scope stays within the datagrams the game allows it. Changed entities
+    /// compete by weight multiplied by the captures they have waited; the ones that do not fit keep
+    /// the bytes of the scope's previous snapshot, which costs a delta nothing, and wait.
+    /// <para>
+    /// An entity whose fresh bytes equal the previous snapshot takes no allowance. An entity new to
+    /// the scope and one that has waited <see cref="MaximumWaitTicks"/> captures are always
+    /// refreshed and still count against the allowance. The decision is per entity and observing
+    /// scope, never per peer, so peers of one scope keep sharing its capture.
+    /// </para>
+    /// <para>
+    /// A peer predicts its own entity and compares it with every applied snapshot of the same tick,
+    /// so it never sees that entity stale: either the scope it observes refreshes the entity
+    /// always, or (<see cref="RefreshesObserversPersonally"/>) the entity waits like any other and
+    /// the server sends its current block to the owner alone, ahead of the snapshot.
+    /// </para>
+    /// </summary>
+    public interface INetworkScopeCaptureBudgetPolicy<TWorld> where TWorld : struct, IWorldType
+    {
+        /// <summary>Changed-entity bytes one scope capture may refresh per tick; zero or less lifts the limit.</summary>
+        int BudgetBytes { get; }
+
+        /// <summary>Captures after which a waiting changed entity is refreshed whatever the allowance.</summary>
+        int MaximumWaitTicks { get; }
+
+        /// <summary>
+        /// Queued entities one capture may price and find too large for what is left of the
+        /// allowance before the rest of its queue waits for the next capture; at least 1. A
+        /// candidate that does not fit leaves room a cheaper one may still take, but every try
+        /// walks the records of an entity.
+        /// </summary>
+        int MaximumMisses { get; }
+
+        /// <summary>
+        /// Whether an entity owned by a peer observing the scope may wait in the shared snapshot
+        /// while its owner receives the current block in an <c>OwnedEntityRefresh</c> packet. False
+        /// refreshes such an entity in every capture of that scope.
+        /// </summary>
+        bool RefreshesObserversPersonally { get; }
+
+        /// <summary>Called once per tick before its first scope capture, after peers received their scopes.</summary>
+        void BeginTick(uint serverTick);
+
+        /// <summary>
+        /// Returns the priority of one changed entity for the observing scope; a larger weight
+        /// refreshes sooner and <see cref="NetworkScopeCaptureBudget.AlwaysRefresh"/> bypasses the queue.
+        /// </summary>
+        int Weight(ScopeId scope, in World<TWorld>.Entity entity, EntityGID gid);
+    }
 }

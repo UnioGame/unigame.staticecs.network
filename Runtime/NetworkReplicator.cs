@@ -23,6 +23,10 @@ namespace UniGame.StaticEcs.Network
         private readonly List<EntityGID> _removed = new List<EntityGID>();
         private readonly List<NetworkReplicaEntry> _replicaScratch =
             new List<NetworkReplicaEntry>();
+        private readonly HashSet<EntityGID> _privateReplicas = new HashSet<EntityGID>();
+        // NetworkSnapshot copies the attributed GIDs into its own array, so one scratch list
+        // serves every capture instead of allocating a list per scope per tick.
+        private readonly List<ulong> _attributedScratch = new List<ulong>();
         private readonly object _owner = new object();
         private readonly NetworkScopeSelector<TWorld> _scopeSelector;
         private readonly INetworkScopeProvider<TWorld> _scopeProvider;
@@ -60,11 +64,31 @@ namespace UniGame.StaticEcs.Network
         internal long CellMergeStopwatchTicks { get; private set; }
         // Cells not touched by any scope for this many ticks are evicted from _cellCache so a
         // world with many transient cells (players passing through) does not grow it forever.
-        private const uint CellCacheStaleAfterTicks = 64;
+        private readonly uint _cellCacheStaleTicks = 64;
         private uint _lastCellCacheSweepTick = uint.MaxValue;
         private readonly NetworkSnapshotPool _snapshotPool;
         private int _captureCapacity = 4096;
         private int _cellCaptureCapacity = 4096;
+        private readonly INetworkScopeCaptureBudgetPolicy<TWorld> _budgetPolicy;
+        private readonly Dictionary<ScopeId, ScopeBudgetState> _budgetStates =
+            new Dictionary<ScopeId, ScopeBudgetState>();
+        private readonly List<BudgetMergeEntry> _budgetEntries = new List<BudgetMergeEntry>();
+        private readonly List<BudgetCandidate> _budgetCandidates = new List<BudgetCandidate>();
+        private IReadOnlyDictionary<uint, ScopeId> _budgetPeerScopes;
+        private bool _budgetOwnersRegistered;
+        internal long CaptureBudgetRefreshedEntities { get; private set; }
+        internal long CaptureBudgetDeferredEntities { get; private set; }
+        internal long CaptureBudgetOverflowCaptures { get; private set; }
+        internal long CaptureBudgetMergeStopwatchTicks { get; private set; }
+        internal long CaptureBudgetCompareStopwatchTicks { get; private set; }
+        internal long CaptureBudgetMeasureStopwatchTicks { get; private set; }
+        internal long CaptureBudgetWeightStopwatchTicks { get; private set; }
+        internal long CaptureBudgetSelectStopwatchTicks { get; private set; }
+        internal long CaptureBudgetWriteStopwatchTicks { get; private set; }
+        internal int CaptureBudgetBytes => _budgetPolicy?.BudgetBytes ?? 0;
+        internal int CaptureBudgetMaximumWaitTicks => _budgetPolicy?.MaximumWaitTicks ?? 0;
+        internal bool CaptureBudgetRefreshesObserversPersonally =>
+            _budgetPolicy != null && _budgetPolicy.RefreshesObserversPersonally;
         internal bool UseExactCellMergeBufferForDiagnostics = true;
         // NCORE-16: 4 (typeId) + 1 (schema kind) + 1 (version) + 1 (disabled) + 4 (payload length),
         // exactly the fixed record header Capture() itself writes below, before the payload bytes.
@@ -117,9 +141,15 @@ namespace UniGame.StaticEcs.Network
             int historyTicks = 64, long historyBytes = 32 * 1024 * 1024,
             NetworkBufferPool bufferPool = null,
             INetworkScopeProvider<TWorld> scopeProvider = null,
-            INetworkUpdatePolicy<TWorld> updatePolicy = null)
+            INetworkUpdatePolicy<TWorld> updatePolicy = null,
+            INetworkScopeCaptureBudgetPolicy<TWorld> captureBudgetPolicy = null,
+            int cellCacheStaleTicks = 64)
             : this(schema, scope, historyTicks, historyBytes, bufferPool)
         {
+            if (cellCacheStaleTicks < 1)
+                throw new ArgumentOutOfRangeException(nameof(cellCacheStaleTicks));
+            _cellCacheStaleTicks = (uint)cellCacheStaleTicks;
+            _budgetPolicy = captureBudgetPolicy;
             _scopeSelector = scopeSelector ??
                 throw new ArgumentNullException(nameof(scopeSelector));
             _scopeProvider = scopeProvider;
@@ -140,6 +170,7 @@ namespace UniGame.StaticEcs.Network
         internal void ForgetScope(ScopeId scope)
         {
             _updateCache.Remove(scope);
+            _budgetStates.Remove(scope);
             if (_scopeCaptureVariantPolicy == null || _cellCache.Count == 0)
                 return;
 
@@ -217,6 +248,40 @@ namespace UniGame.StaticEcs.Network
                     if (!_scopeSelector(scope, _captureEntities[i]))
                         _captureEntities.RemoveAt(i);
             }
+            RemovePrivateEntities();
+            return CaptureCollected(serverTick, scope, true, out snapshot);
+        }
+
+        /// <summary>Captures the given entities as one canonical block list for a single peer.</summary>
+        internal SnapshotCaptureResult CaptureOwnerState(uint serverTick, ScopeId scope,
+            List<World<TWorld>.Entity> entities, out NetworkSnapshot snapshot)
+        {
+            snapshot = null;
+            if (World<TWorld>.Status != WorldStatus.Initialized)
+                return SnapshotCaptureResult.WorldUnavailable;
+            _captureEntities.Clear();
+            _captureEntities.AddRange(entities);
+            return CaptureCollected(serverTick, scope, false, out snapshot);
+        }
+
+        // A private entity reaches only its owner through owner state, never a shared scope snapshot.
+        private void RemovePrivateEntities()
+        {
+            if (!World<TWorld>.HasResource<NetworkOwnerStateResource<TWorld>>())
+                return;
+            var provider = World<TWorld>.GetResource<NetworkOwnerStateResource<TWorld>>().Provider;
+            var kept = 0;
+            for (var i = 0; i < _captureEntities.Count; i++)
+                if (!provider.IsPrivate(_captureEntities[i]))
+                    _captureEntities[kept++] = _captureEntities[i];
+            _captureEntities.RemoveRange(kept, _captureEntities.Count - kept);
+        }
+
+        private SnapshotCaptureResult CaptureCollected(uint serverTick, ScopeId scope,
+            bool useUpdatePolicy, out NetworkSnapshot snapshot)
+        {
+            snapshot = null;
+            var entries = _schema.RetainedEntries;
             if (_captureEntities.Count > ProtocolLimits.MaxEntities)
                 return SnapshotCaptureResult.LimitExceeded;
             _captureEntities.Sort(EntityComparer.Instance);
@@ -227,7 +292,10 @@ namespace UniGame.StaticEcs.Network
             List<ulong> attributedGids = null;
             long attributedBytes = 0;
             if (_attributionPolicy != null)
-                attributedGids = new List<ulong>();
+            {
+                attributedGids = _attributedScratch;
+                attributedGids.Clear();
+            }
 
             // NCORE-16: read side of the update-policy hold cache. `previousBytes`/`previousIndex`
             // are this scope's own last successful capture, untouched for the rest of this call, so
@@ -237,7 +305,7 @@ namespace UniGame.StaticEcs.Network
             byte[] previousBytes = null;
             Dictionary<EntityGID, HeldRecordRange> previousIndex = null;
             Dictionary<EntityGID, HeldRecordRange> freshIndex = null;
-            if (_updatePolicy != null)
+            if (useUpdatePolicy && _updatePolicy != null)
             {
                 if (!_updateCache.TryGetValue(scope, out updateCache))
                 {
@@ -249,7 +317,10 @@ namespace UniGame.StaticEcs.Network
                     previousBytes = updateCache.Bytes;
                     previousIndex = updateCache.Index;
                 }
-                freshIndex = new Dictionary<EntityGID, HeldRecordRange>(_captureEntities.Count);
+                // The spare index was last tick's `previousIndex`; nothing reads it any more, so
+                // it is rebuilt in place instead of allocating a dictionary per scope per tick.
+                freshIndex = updateCache.SpareIndex;
+                freshIndex.Clear();
             }
 
             try
@@ -395,6 +466,7 @@ namespace UniGame.StaticEcs.Network
                     updateCache.Bytes = new byte[finalLength];
                 Array.Copy(writer.Buffer, 0, updateCache.Bytes, 0, finalLength);
                 updateCache.Length = finalLength;
+                updateCache.SpareIndex = updateCache.Index;
                 updateCache.Index = freshIndex;
             }
             if (!ReferenceEquals(writer.Buffer, buffer.Buffer))
@@ -458,7 +530,10 @@ namespace UniGame.StaticEcs.Network
             List<ulong> attributedGids = null;
             long attributedBytes = 0;
             if (_attributionPolicy != null)
-                attributedGids = new List<ulong>();
+            {
+                attributedGids = _attributedScratch;
+                attributedGids.Clear();
+            }
             for (var i = 0; i < cellCount; i++)
             {
                 var cacheKey = GetCellCaptureKey(cellIds[i], scope);
@@ -504,6 +579,10 @@ namespace UniGame.StaticEcs.Network
             if (UseExactCellMergeBufferForDiagnostics &&
                 exactMergeBytes > ProtocolLimits.MaxDecodedPayloadBytes)
                 return SnapshotCaptureResult.LimitExceeded;
+
+            if (_budgetPolicy != null && _budgetPolicy.BudgetBytes > 0)
+                return MergeCellsWithinBudget(serverTick, scope, cellCount, totalEntities,
+                    totalRecords, out snapshot);
 
             var buffer = _bufferPool.Rent(UseExactCellMergeBufferForDiagnostics
                 ? checked((int)exactMergeBytes)
@@ -585,6 +664,398 @@ namespace UniGame.StaticEcs.Network
             return SnapshotCaptureResult.Success;
         }
 
+        /// <summary>
+        /// Gives the allowance policy the scope of every established peer for this tick, so an entity
+        /// owned by an observer of a scope is never held in that scope's snapshot.
+        /// </summary>
+        internal void BeginCaptureBudgetTick(uint serverTick,
+            IReadOnlyDictionary<uint, ScopeId> peerScopes)
+        {
+            if (_budgetPolicy == null)
+                return;
+            _budgetPeerScopes = peerScopes;
+            _budgetOwnersRegistered =
+                World<TWorld>.Components<NetworkOwnerComponent>.IsTypeRegistered;
+            _budgetPolicy.BeginTick(serverTick);
+        }
+
+        // Bytes from the block start to its 2-byte record count: GID, kind, disabled flag.
+        private const int BlockRecordCountOffset = sizeof(ulong) + sizeof(uint) + sizeof(bool);
+
+        // Merges the cell block lists like CaptureViaCells, but a changed entity that loses the
+        // tick's byte allowance keeps the bytes this scope's previous snapshot had for it.
+        private SnapshotCaptureResult MergeCellsWithinBudget(uint serverTick, ScopeId scope,
+            int cellCount, int totalEntities, int totalRecords, out NetworkSnapshot snapshot)
+        {
+            snapshot = null;
+            if (!_budgetStates.TryGetValue(scope, out var state))
+            {
+                state = new ScopeBudgetState();
+                _budgetStates.Add(scope, state);
+            }
+
+            // The stages below are separate loops so each is timed without a timestamp per entity.
+            var stageStarted = Stopwatch.GetTimestamp();
+            var entries = _budgetEntries;
+            entries.Clear();
+            var hasPrevious = false;
+            EntityGID previousGid = default;
+            while (true)
+            {
+                var bestSlot = -1;
+                for (var i = 0; i < cellCount; i++)
+                {
+                    var cache = _cellCacheRefs[i];
+                    if (_cellCursors[i] >= cache.Blocks.Count)
+                        continue;
+                    if (bestSlot < 0 || Compare(cache.Blocks[_cellCursors[i]].Gid,
+                            _cellCacheRefs[bestSlot].Blocks[_cellCursors[bestSlot]].Gid) < 0)
+                        bestSlot = i;
+                }
+                if (bestSlot < 0)
+                    break;
+                var bestCache = _cellCacheRefs[bestSlot];
+                var block = bestCache.Blocks[_cellCursors[bestSlot]];
+                _cellCursors[bestSlot]++;
+                if (hasPrevious && Compare(previousGid, block.Gid) >= 0)
+                    return SnapshotCaptureResult.InvalidEntity;
+                previousGid = block.Gid;
+                hasPrevious = true;
+                entries.Add(new BudgetMergeEntry { Cache = bestCache, Block = block });
+            }
+            if (entries.Count != totalEntities)
+                return SnapshotCaptureResult.InvalidEntity;
+            var stageEnded = Stopwatch.GetTimestamp();
+            CaptureBudgetMergeStopwatchTicks += stageEnded - stageStarted;
+            stageStarted = stageEnded;
+
+            var budget = _budgetPolicy.BudgetBytes;
+            var maximumWait = _budgetPolicy.MaximumWaitTicks;
+            var maximumMisses = Math.Max(1, _budgetPolicy.MaximumMisses);
+            long spent = 0;
+            for (var i = 0; i < entries.Count; i++)
+            {
+                var entry = entries[i];
+                if (!state.Index.TryGetValue(entry.Block.Gid, out var held))
+                {
+                    // New to this scope: a delta carries the whole block.
+                    spent += entry.Block.Length;
+                    continue;
+                }
+                entry.Held = held;
+                entry.Changed = !new ReadOnlySpan<byte>(entry.Cache.Bytes, entry.Block.Offset,
+                    entry.Block.Length).SequenceEqual(
+                    new ReadOnlySpan<byte>(state.Bytes, held.Offset, held.Length));
+                entries[i] = entry;
+            }
+            stageEnded = Stopwatch.GetTimestamp();
+            CaptureBudgetCompareStopwatchTicks += stageEnded - stageStarted;
+            stageStarted = stageEnded;
+
+            var candidates = _budgetCandidates;
+            candidates.Clear();
+            try
+            {
+                for (var i = 0; i < entries.Count; i++)
+                {
+                    var entry = entries[i];
+                    if (!entry.Changed)
+                        continue;
+                    var weight = entry.Held.Wait >= maximumWait
+                        ? NetworkScopeCaptureBudget.AlwaysRefresh
+                        : BudgetWeight(scope, entry.Block.Gid, out entry.Observed,
+                            out entry.OwnerPeerId);
+                    entry.Hold = weight != NetworkScopeCaptureBudget.AlwaysRefresh;
+                    entries[i] = entry;
+                    if (entry.Hold)
+                        candidates.Add(new BudgetCandidate(i,
+                            (long)weight * (entry.Held.Wait + 1L)));
+                }
+            }
+            catch
+            {
+                return SnapshotCaptureResult.HookFailed;
+            }
+            stageEnded = Stopwatch.GetTimestamp();
+            CaptureBudgetWeightStopwatchTicks += stageEnded - stageStarted;
+            stageStarted = stageEnded;
+
+            candidates.Sort();
+            stageEnded = Stopwatch.GetTimestamp();
+            CaptureBudgetSelectStopwatchTicks += stageEnded - stageStarted;
+            stageStarted = stageEnded;
+
+            // Pricing an entity walks its records, so only the entities the allowance can still
+            // take are priced: the ones refreshed whatever it says, then the queue in priority
+            // order until the allowance is spent or the policy's MaximumMisses candidates did not fit.
+            try
+            {
+                for (var i = 0; i < entries.Count; i++)
+                {
+                    var entry = entries[i];
+                    if (!entry.Changed || entry.Hold)
+                        continue;
+                    spent += MeasureHeldPatch(state, in entry);
+                    CaptureBudgetRefreshedEntities++;
+                }
+                if (spent > budget)
+                    CaptureBudgetOverflowCaptures++;
+                var next = 0;
+                var misses = 0;
+                for (; next < candidates.Count; next++)
+                {
+                    if (budget - spent < SnapshotDeltaCodec.MinimumEntityPatchBytes ||
+                        misses == maximumMisses)
+                        break;
+                    var index = candidates[next].Index;
+                    var entry = entries[index];
+                    var cost = MeasureHeldPatch(state, in entry);
+                    if (spent + cost > budget)
+                    {
+                        misses++;
+                        CaptureBudgetDeferredEntities++;
+                        continue;
+                    }
+                    spent += cost;
+                    entry.Hold = false;
+                    entries[index] = entry;
+                    CaptureBudgetRefreshedEntities++;
+                }
+                CaptureBudgetDeferredEntities += candidates.Count - next;
+            }
+            catch
+            {
+                return SnapshotCaptureResult.HookFailed;
+            }
+            stageEnded = Stopwatch.GetTimestamp();
+            CaptureBudgetMeasureStopwatchTicks += stageEnded - stageStarted;
+            stageStarted = stageEnded;
+
+            long mergedBytes = sizeof(int);
+            var records = totalRecords;
+            for (var i = 0; i < entries.Count; i++)
+            {
+                var entry = entries[i];
+                if (!entry.Hold)
+                {
+                    mergedBytes += entry.Block.Length;
+                    continue;
+                }
+                mergedBytes += entry.Held.Length;
+                records += RecordCountAt(state.Bytes, entry.Held.Offset) -
+                           RecordCountAt(entry.Cache.Bytes, entry.Block.Offset);
+            }
+            if (mergedBytes > ProtocolLimits.MaxDecodedPayloadBytes)
+                return SnapshotCaptureResult.LimitExceeded;
+
+            var length = checked((int)mergedBytes);
+            var buffer = _bufferPool.Rent(length);
+            var writer = BinaryPackWriter.Create(buffer.Buffer);
+            var freshIndex = state.SpareIndex;
+            freshIndex.Clear();
+            List<ulong> attributedGids = null;
+            long attributedBytes = 0;
+            if (_attributionPolicy != null)
+            {
+                attributedGids = _attributedScratch;
+                attributedGids.Clear();
+            }
+            var mergeStarted = Stopwatch.GetTimestamp();
+            state.OwnerBlocks.Clear();
+            state.OwnerLength = 0;
+            state.OwnerTick = serverTick;
+            try
+            {
+                writer.WriteInt(totalEntities);
+                for (var i = 0; i < entries.Count; i++)
+                {
+                    var entry = entries[i];
+                    if (entry.Hold && entry.Observed)
+                        state.KeepOwnerBlock(entry.OwnerPeerId, entry.Block.Gid, entry.Cache.Bytes,
+                            entry.Block.Offset, entry.Block.Length);
+                    var source = entry.Hold ? state.Bytes : entry.Cache.Bytes;
+                    var offset = entry.Hold ? entry.Held.Offset : entry.Block.Offset;
+                    var blockLength = entry.Hold ? entry.Held.Length : entry.Block.Length;
+                    freshIndex[entry.Block.Gid] = new HeldBlock(checked((int)writer.Position),
+                        blockLength, entry.Hold ? entry.Held.Wait + 1 : 0);
+                    writer.EnsureSize((uint)blockLength);
+                    Array.Copy(source, offset, writer.Buffer, (int)writer.Position, blockLength);
+                    writer.Position += (uint)blockLength;
+                    if (entry.Block.Attributed)
+                    {
+                        attributedGids.Add(entry.Block.Gid.Raw);
+                        attributedBytes += blockLength;
+                    }
+                }
+            }
+            catch
+            {
+                return FailCapture(buffer, writer.Buffer, SnapshotCaptureResult.HookFailed);
+            }
+            finally
+            {
+                CellMergeStopwatchTicks += Stopwatch.GetTimestamp() - mergeStarted;
+            }
+            if (writer.Position != length)
+                return FailCapture(buffer, writer.Buffer, SnapshotCaptureResult.InvalidEntity);
+
+            if (!ReferenceEquals(writer.Buffer, buffer.Buffer))
+            {
+                buffer.Dispose();
+                buffer = _bufferPool.Adopt(writer.Buffer, length);
+            }
+            else
+            {
+                buffer.SetLength(length);
+            }
+            if (state.SpareBytes.Length < length)
+                state.SpareBytes = new byte[length + length / 2];
+            Array.Copy(buffer.Buffer, 0, state.SpareBytes, 0, length);
+            var previousBytes = state.Bytes;
+            state.Bytes = state.SpareBytes;
+            state.SpareBytes = previousBytes;
+            state.SpareIndex = state.Index;
+            state.Index = freshIndex;
+            CaptureBudgetWriteStopwatchTicks += Stopwatch.GetTimestamp() - stageStarted;
+            _captureCapacity = Math.Max(_captureCapacity, buffer.Capacity);
+            snapshot = _snapshotPool.Rent(serverTick, _schema.Fingerprint, scope,
+                buffer, totalEntities, records);
+            snapshot.SetAttributedEntities(attributedGids, attributedBytes);
+            return SnapshotCaptureResult.Success;
+        }
+
+        private int MeasureHeldPatch(ScopeBudgetState state, in BudgetMergeEntry entry) =>
+            SnapshotDeltaCodec.MeasureEntityPatch(
+                new ReadOnlySpan<byte>(state.Bytes, entry.Held.Offset, entry.Held.Length),
+                new ReadOnlySpan<byte>(entry.Cache.Bytes, entry.Block.Offset, entry.Block.Length),
+                _schema.DeltaHooks);
+
+        private int BudgetWeight(ScopeId scope, EntityGID gid, out bool observed,
+            out uint ownerPeerId)
+        {
+            observed = false;
+            ownerPeerId = 0;
+            if (!gid.TryUnpack<TWorld>(out World<TWorld>.Entity entity))
+                return NetworkScopeCaptureBudget.AlwaysRefresh;
+            // The owner predicts this entity and compares it with every applied snapshot of the same
+            // tick: a scope its owner observes either never holds it or hands the owner the
+            // current block personally.
+            if (_budgetOwnersRegistered && _budgetPeerScopes != null &&
+                entity.Has<NetworkOwnerComponent>())
+            {
+                ownerPeerId = entity.Read<NetworkOwnerComponent>().PeerId;
+                observed = _budgetPeerScopes.TryGetValue(ownerPeerId, out var ownerScope) &&
+                           ownerScope == scope;
+                if (observed && !_budgetPolicy.RefreshesObserversPersonally)
+                    return NetworkScopeCaptureBudget.AlwaysRefresh;
+            }
+            var weight = _budgetPolicy.Weight(scope, entity, gid);
+            return weight < 1 ? 1 : weight;
+        }
+
+        /// <summary>
+        /// Finds the current block of the entity <paramref name="peerId"/> owns when the capture of
+        /// <paramref name="scope"/> at <paramref name="serverTick"/> kept an older state of it, and
+        /// that older block as the snapshot carries it.
+        /// </summary>
+        internal bool TryGetHeldOwnerBlock(ScopeId scope, uint serverTick, uint peerId,
+            out ReadOnlySpan<byte> current, out ReadOnlySpan<byte> held, out int recordCount)
+        {
+            current = default;
+            held = default;
+            recordCount = 0;
+            if (!_budgetStates.TryGetValue(scope, out var state) || state.OwnerTick != serverTick ||
+                !state.OwnerBlocks.TryGetValue(peerId, out var range) ||
+                !state.Index.TryGetValue(range.Gid, out var kept))
+                return false;
+            current = new ReadOnlySpan<byte>(state.OwnerBytes, range.Offset, range.Length);
+            held = new ReadOnlySpan<byte>(state.Bytes, kept.Offset, kept.Length);
+            recordCount = RecordCountAt(state.OwnerBytes, range.Offset);
+            return true;
+        }
+
+        private static int RecordCountAt(byte[] bytes, int blockOffset) =>
+            bytes[blockOffset + BlockRecordCountOffset] |
+            bytes[blockOffset + BlockRecordCountOffset + 1] << 8;
+
+        // One occupied scope's last merged snapshot: the bytes a held entity keeps, and how many
+        // captures in a row each entity has been held.
+        private sealed class ScopeBudgetState
+        {
+            internal byte[] Bytes = Array.Empty<byte>();
+            internal byte[] SpareBytes = Array.Empty<byte>();
+            internal Dictionary<EntityGID, HeldBlock> Index =
+                new Dictionary<EntityGID, HeldBlock>();
+            internal Dictionary<EntityGID, HeldBlock> SpareIndex =
+                new Dictionary<EntityGID, HeldBlock>();
+
+            // Current blocks of the held entities whose owners observe this scope, for OwnerTick only.
+            internal readonly Dictionary<uint, OwnerBlock> OwnerBlocks =
+                new Dictionary<uint, OwnerBlock>();
+            internal byte[] OwnerBytes = Array.Empty<byte>();
+            internal int OwnerLength;
+            internal uint OwnerTick;
+
+            internal void KeepOwnerBlock(uint peerId, EntityGID gid, byte[] source, int offset,
+                int length)
+            {
+                if (OwnerBytes.Length < OwnerLength + length)
+                    Array.Resize(ref OwnerBytes, Math.Max(OwnerLength + length, OwnerBytes.Length * 2));
+                Array.Copy(source, offset, OwnerBytes, OwnerLength, length);
+                OwnerBlocks[peerId] = new OwnerBlock { Gid = gid, Offset = OwnerLength, Length = length };
+                OwnerLength += length;
+            }
+        }
+
+        private struct OwnerBlock
+        {
+            internal EntityGID Gid;
+            internal int Offset;
+            internal int Length;
+        }
+
+        private readonly struct HeldBlock
+        {
+            internal HeldBlock(int offset, int length, int wait)
+            {
+                Offset = offset;
+                Length = length;
+                Wait = wait;
+            }
+
+            internal readonly int Offset;
+            internal readonly int Length;
+            internal readonly int Wait;
+        }
+
+        private struct BudgetMergeEntry
+        {
+            internal ScopeCaptureCache Cache;
+            internal EntityBlockRange Block;
+            internal HeldBlock Held;
+            internal bool Changed;
+            internal bool Hold;
+            internal bool Observed;
+            internal uint OwnerPeerId;
+        }
+
+        private readonly struct BudgetCandidate : IComparable<BudgetCandidate>
+        {
+            internal BudgetCandidate(int index, long priority)
+            {
+                Index = index;
+                Priority = priority;
+            }
+
+            internal readonly int Index;
+            internal readonly long Priority;
+
+            // Highest priority first; merge order breaks ties so the choice is deterministic.
+            public int CompareTo(BudgetCandidate other) => Priority != other.Priority
+                ? other.Priority.CompareTo(Priority)
+                : Index.CompareTo(other.Index);
+        }
+
         // Serializes exactly one cell's entities into `cache`, applying the NCORE-16
         // update-hold policy (keyed by this cell id, if a policy is configured) against that
         // same cell's previous capture, then publishing this tick's bytes/index/blocks as its
@@ -597,18 +1068,19 @@ namespace UniGame.StaticEcs.Network
             _captureEntities.Clear();
             _captureSeen.Clear();
             _cellularProvider.CollectCellEntities(cellId, _captureEntities, _captureSeen);
+            RemovePrivateEntities();
             if (_captureEntities.Count > ProtocolLimits.MaxEntities)
                 return SnapshotCaptureResult.LimitExceeded;
 
-            // Fast path for an empty cell -- common in a spread population, where most of a
-            // scope's 3x3 neighbourhood is unoccupied: publish "nothing here this tick" without
-            // renting a buffer, creating a writer, or touching Blocks/Index at all. Cheap enough
-            // that CaptureViaCells does not need to special-case unoccupied cells itself.
+            // A hold policy needs the last nonempty records when entities return to this cell.
             if (_captureEntities.Count == 0)
             {
                 cache.Blocks.Clear();
-                cache.Index.Clear();
-                SetCellCacheBytes(cache, Array.Empty<byte>());
+                if (_updatePolicy == null)
+                {
+                    cache.Index.Clear();
+                    SetCellCacheBytes(cache, Array.Empty<byte>());
+                }
                 cache.Length = 0;
                 cache.RecordCount = 0;
                 cache.CapturedTick = serverTick;
@@ -640,7 +1112,8 @@ namespace UniGame.StaticEcs.Network
                     previousBytes = cache.Bytes;
                     previousIndex = cache.Index;
                 }
-                freshIndex = new Dictionary<EntityGID, HeldRecordRange>(_captureEntities.Count);
+                freshIndex = cache.SpareIndex;
+                freshIndex.Clear();
             }
 
             try
@@ -771,7 +1244,10 @@ namespace UniGame.StaticEcs.Network
             cache.CapturedTick = serverTick;
             cache.HasCapturedTick = true;
             if (freshIndex != null)
+            {
+                cache.SpareIndex = cache.Index;
                 cache.Index = freshIndex;
+            }
 
             if (!ReferenceEquals(writer.Buffer, buffer.Buffer))
             {
@@ -815,9 +1291,9 @@ namespace UniGame.StaticEcs.Network
 
         private void EvictStaleCellCache(uint serverTick)
         {
-            if (serverTick <= CellCacheStaleAfterTicks || _cellCache.Count == 0)
+            if (serverTick <= _cellCacheStaleTicks || _cellCache.Count == 0)
                 return;
-            var threshold = serverTick - CellCacheStaleAfterTicks;
+            var threshold = serverTick - _cellCacheStaleTicks;
             _staleCellIds.Clear();
             foreach (var pair in _cellCache)
                 if (!pair.Value.HasCapturedTick || pair.Value.CapturedTick < threshold)
@@ -1007,7 +1483,7 @@ namespace UniGame.StaticEcs.Network
                 _incoming.Add(staged.Entities[i].Gid);
             _removed.Clear();
             foreach (var pair in _replicas)
-                if (!_incoming.Contains(pair.Key))
+                if (!_incoming.Contains(pair.Key) && !_privateReplicas.Contains(pair.Key))
                     _removed.Add(pair.Key);
             for (var i = 0; i < _removed.Count; i++)
             {
@@ -1019,108 +1495,166 @@ namespace UniGame.StaticEcs.Network
                 _replicas.Remove(sourceGid);
             }
 
-            var buffer = staged.Snapshot.Buffer;
-            var baseOffset = staged.Snapshot.Offset;
-            var entries = _schema.RetainedEntries;
             for (var i = 0; i < staged.EntityCount; i++)
             {
                 var source = staged.Entities[i];
-                World<TWorld>.Entity entity;
-                var hasReplica = _replicas.TryGetValue(source.Gid, out var replica);
-                if (hasReplica)
-                {
-                    if (!replica.LocalGid.TryUnpack<TWorld>(out entity))
-                        return SnapshotApplyResult.EntityConflict;
-                }
-                else
-                {
-                    entity = ((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Create();
-                }
-                if (!((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Matches(entity))
-                    return SnapshotApplyResult.EntityConflict;
-
-                // A canonical snapshot always carries every replicated entity's full current
-                // record set, not only what changed on the wire (delta encoding only shrinks
-                // the packet; SnapshotDeltaCodec reconstructs the complete per-entity byte
-                // range before Stage() ever sees it). Re-decoding and re-applying that
-                // unchanged byte-for-byte range every tick is the dominant per-snapshot
-                // allocation on this path (NCORE-24): each record apply rents a scratch
-                // buffer and re-runs the StaticPack read hook.
-                //
-                // Skipping that work when bytes are unchanged is only correct for an entity
-                // no client-side system writes between applies: today's apply is also this
-                // client's only correction mechanism for local writes (prediction,
-                // reconciliation, interpolation) into replicated components, so skipping an
-                // entity such a system can touch would let a local write persist uncorrected
-                // until the server's bytes for it next change. _skipPolicy is null unless a
-                // caller explicitly opted in per entity (see NetworkReplicaSkipPolicy), so by
-                // default `unchanged` is always false here and every entity is fully
-                // re-applied every tick, exactly as before this optimization existed.
-                var unchanged = false;
-                if (_skipPolicy != null && hasReplica &&
-                    replica.Disabled == source.Disabled &&
-                    replica.AppliedBytes != null &&
-                    replica.AppliedBytes.Length == source.ByteLength)
-                {
-                    var sourceBytes = new ReadOnlySpan<byte>(buffer,
-                        checked(baseOffset + source.ByteOffset), source.ByteLength);
-                    unchanged = replica.AppliedBytes.Span.SequenceEqual(sourceBytes) &&
-                        _skipPolicy(entity);
-                }
-
-                if (!unchanged)
-                {
-                    var sourceIndex = source.RecordStart;
-                    var sourceEnd = source.RecordStart + source.RecordCount;
-                    for (var j = 0; j < entries.Length; j++)
-                    {
-                        if (entries[j].Invoker is not IRecordNetworkInvoker<TWorld> invoker)
-                            continue;
-                        while (sourceIndex < sourceEnd &&
-                               Compare(staged.Records[sourceIndex].Entry, entries[j]) < 0)
-                            sourceIndex++;
-                        if (sourceIndex >= sourceEnd ||
-                            staged.Records[sourceIndex].Entry.TypeId != entries[j].TypeId)
-                            invoker.Remove(entity);
-                    }
-                    for (var j = source.RecordStart; j < sourceEnd; j++)
-                    {
-                        var record = staged.Records[j];
-                        ((IRecordNetworkInvoker<TWorld>)record.Entry.Invoker).Apply(entity,
-                            buffer, checked(baseOffset + record.Offset), record.Length,
-                            record.Entry.Version, record.Disabled);
-                    }
-                    if (source.Disabled)
-                        entity.Disable();
-                    else
-                        entity.Enable();
-                    entity.Set(new NetworkReplicaIdentityComponent
-                    {
-                        AuthorityGid = source.Gid,
-                        KindId = source.Kind.TypeId,
-                    });
-
-                    // Only retain comparison bytes when a skip policy is actually in use:
-                    // with no policy, `unchanged` above is always false, so this branch runs
-                    // for every entity every tick, and retaining a lease here would add the
-                    // exact per-tick lease churn NCORE-24 removes elsewhere for zero benefit.
-                    // Once a policy is in use, only move the retained bytes forward when
-                    // something actually applied — an unchanged entity's existing
-                    // AppliedBytes are already byte-identical to this tick's bytes (that is
-                    // what made it "unchanged"), so re-retaining here would be redundant.
-                    NetworkBufferLease retainedBytes = null;
-                    if (_skipPolicy != null)
-                    {
-                        retainedBytes = staged.Snapshot.RetainBytes(source.ByteOffset,
-                            source.ByteLength);
-                        if (hasReplica)
-                            replica.AppliedBytes?.Dispose();
-                    }
-                    _replicas[source.Gid] = new NetworkReplicaEntry(entity.GID,
-                        source.Kind.TypeId, source.Disabled, retainedBytes);
-                }
+                // Owner state is newer than any public snapshot still in flight.
+                if (_privateReplicas.Contains(source.Gid))
+                    continue;
+                var result = ApplyEntity(in staged, in source);
+                if (result != SnapshotApplyResult.Success)
+                    return result;
             }
             History.Store(staged.ServerTick, staged.Snapshot);
+            return SnapshotApplyResult.Success;
+        }
+
+        /// <summary>Applies the full list of entities only this client sees; none of them is part of
+        /// a scope snapshot, so an entity missing from the list leaves this list and the next public
+        /// snapshot decides whether its replica stays.</summary>
+        public SnapshotApplyResult ApplyOwnerState(in StagedNetworkSnapshot staged)
+        {
+            if (staged.Snapshot == null || !ReferenceEquals(staged.Owner, _owner) ||
+                staged.Fingerprint != _schema.Fingerprint || staged.Scope != Scope)
+                return SnapshotApplyResult.SchemaMismatch;
+            if (World<TWorld>.Status != WorldStatus.Initialized)
+                return SnapshotApplyResult.Malformed;
+
+            _privateReplicas.Clear();
+            for (var i = 0; i < staged.EntityCount; i++)
+            {
+                var source = staged.Entities[i];
+                var result = ApplyEntity(in staged, in source);
+                if (result != SnapshotApplyResult.Success)
+                    return result;
+                _privateReplicas.Add(source.Gid);
+            }
+            return SnapshotApplyResult.Success;
+        }
+
+        /// <summary>
+        /// Applies the current state of this client's own entity over the older one the scope
+        /// snapshot of the same tick carried. An entity without a replica is left to that snapshot.
+        /// </summary>
+        public SnapshotApplyResult ApplyOwnedEntityRefresh(in StagedNetworkSnapshot staged)
+        {
+            if (staged.Snapshot == null || !ReferenceEquals(staged.Owner, _owner) ||
+                staged.Fingerprint != _schema.Fingerprint || staged.Scope != Scope)
+                return SnapshotApplyResult.SchemaMismatch;
+            if (World<TWorld>.Status != WorldStatus.Initialized)
+                return SnapshotApplyResult.Malformed;
+
+            for (var i = 0; i < staged.EntityCount; i++)
+            {
+                var source = staged.Entities[i];
+                if (!_replicas.ContainsKey(source.Gid) || _privateReplicas.Contains(source.Gid))
+                    continue;
+                var result = ApplyEntity(in staged, in source);
+                if (result != SnapshotApplyResult.Success)
+                    return result;
+            }
+            return SnapshotApplyResult.Success;
+        }
+
+        private SnapshotApplyResult ApplyEntity(in StagedNetworkSnapshot staged, in StagedEntity source)
+        {
+            var buffer = staged.Snapshot.Buffer;
+            var baseOffset = staged.Snapshot.Offset;
+            var entries = _schema.RetainedEntries;
+            World<TWorld>.Entity entity;
+            var hasReplica = _replicas.TryGetValue(source.Gid, out var replica);
+            if (hasReplica)
+            {
+                if (!replica.LocalGid.TryUnpack<TWorld>(out entity))
+                    return SnapshotApplyResult.EntityConflict;
+            }
+            else
+            {
+                entity = ((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Create();
+            }
+            if (!((IEntityNetworkInvoker<TWorld>)source.Kind.Invoker).Matches(entity))
+                return SnapshotApplyResult.EntityConflict;
+
+            // A canonical snapshot always carries every replicated entity's full current
+            // record set, not only what changed on the wire (delta encoding only shrinks
+            // the packet; SnapshotDeltaCodec reconstructs the complete per-entity byte
+            // range before Stage() ever sees it). Re-decoding and re-applying that
+            // unchanged byte-for-byte range every tick is the dominant per-snapshot
+            // allocation on this path (NCORE-24): each record apply rents a scratch
+            // buffer and re-runs the StaticPack read hook.
+            //
+            // Skipping that work when bytes are unchanged is only correct for an entity
+            // no client-side system writes between applies: today's apply is also this
+            // client's only correction mechanism for local writes (prediction,
+            // reconciliation, interpolation) into replicated components, so skipping an
+            // entity such a system can touch would let a local write persist uncorrected
+            // until the server's bytes for it next change. _skipPolicy is null unless a
+            // caller explicitly opted in per entity (see NetworkReplicaSkipPolicy), so by
+            // default `unchanged` is always false here and every entity is fully
+            // re-applied every tick, exactly as before this optimization existed.
+            var unchanged = false;
+            if (_skipPolicy != null && hasReplica &&
+                replica.Disabled == source.Disabled &&
+                replica.AppliedBytes != null &&
+                replica.AppliedBytes.Length == source.ByteLength)
+            {
+                var sourceBytes = new ReadOnlySpan<byte>(buffer,
+                    checked(baseOffset + source.ByteOffset), source.ByteLength);
+                unchanged = replica.AppliedBytes.Span.SequenceEqual(sourceBytes) &&
+                    _skipPolicy(entity);
+            }
+
+            if (!unchanged)
+            {
+                var sourceIndex = source.RecordStart;
+                var sourceEnd = source.RecordStart + source.RecordCount;
+                for (var j = 0; j < entries.Length; j++)
+                {
+                    if (entries[j].Invoker is not IRecordNetworkInvoker<TWorld> invoker)
+                        continue;
+                    while (sourceIndex < sourceEnd &&
+                           Compare(staged.Records[sourceIndex].Entry, entries[j]) < 0)
+                        sourceIndex++;
+                    if (sourceIndex >= sourceEnd ||
+                        staged.Records[sourceIndex].Entry.TypeId != entries[j].TypeId)
+                        invoker.Remove(entity);
+                }
+                for (var j = source.RecordStart; j < sourceEnd; j++)
+                {
+                    var record = staged.Records[j];
+                    ((IRecordNetworkInvoker<TWorld>)record.Entry.Invoker).Apply(entity,
+                        buffer, checked(baseOffset + record.Offset), record.Length,
+                        record.Entry.Version, record.Disabled);
+                }
+                if (source.Disabled)
+                    entity.Disable();
+                else
+                    entity.Enable();
+                entity.Set(new NetworkReplicaIdentityComponent
+                {
+                    AuthorityGid = source.Gid,
+                    KindId = source.Kind.TypeId,
+                });
+
+                // Only retain comparison bytes when a skip policy is actually in use:
+                // with no policy, `unchanged` above is always false, so this branch runs
+                // for every entity every tick, and retaining a lease here would add the
+                // exact per-tick lease churn NCORE-24 removes elsewhere for zero benefit.
+                // Once a policy is in use, only move the retained bytes forward when
+                // something actually applied — an unchanged entity's existing
+                // AppliedBytes are already byte-identical to this tick's bytes (that is
+                // what made it "unchanged"), so re-retaining here would be redundant.
+                NetworkBufferLease retainedBytes = null;
+                if (_skipPolicy != null)
+                {
+                    retainedBytes = staged.Snapshot.RetainBytes(source.ByteOffset,
+                        source.ByteLength);
+                    if (hasReplica)
+                        replica.AppliedBytes?.Dispose();
+                }
+                _replicas[source.Gid] = new NetworkReplicaEntry(entity.GID,
+                    source.Kind.TypeId, source.Disabled, retainedBytes);
+            }
             return SnapshotApplyResult.Success;
         }
 
@@ -1132,6 +1666,7 @@ namespace UniGame.StaticEcs.Network
                 foreach (var replica in _replicas.Values)
                     replica.AppliedBytes?.Dispose();
                 _replicas.Clear();
+                _privateReplicas.Clear();
                 History.Clear();
                 return;
             }
@@ -1145,6 +1680,7 @@ namespace UniGame.StaticEcs.Network
                 _replicaScratch[i].AppliedBytes?.Dispose();
             }
             _replicas.Clear();
+            _privateReplicas.Clear();
             History.Clear();
         }
 
@@ -1297,6 +1833,10 @@ namespace UniGame.StaticEcs.Network
             internal byte[] Bytes = Array.Empty<byte>();
             internal int Length;
             internal Dictionary<EntityGID, HeldRecordRange> Index =
+                new Dictionary<EntityGID, HeldRecordRange>();
+            // Swapped with Index after every capture so the two dictionaries alternate between
+            // "previous" and "fresh" without a per-tick allocation.
+            internal Dictionary<EntityGID, HeldRecordRange> SpareIndex =
                 new Dictionary<EntityGID, HeldRecordRange>();
             internal List<EntityBlockRange> Blocks = new List<EntityBlockRange>();
             internal int RecordCount;

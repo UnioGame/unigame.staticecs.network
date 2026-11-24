@@ -18,7 +18,9 @@ namespace UniGame.StaticEcs.Network
         Ping = 9,
         Pong = 10,
         TransactionCommand = 11,
-        TransactionReceipt = 12
+        TransactionReceipt = 12,
+        OwnerState = 13,
+        OwnedEntityRefresh = 14
     }
     /// <summary>Identifies a measured networking phase.</summary>
     public enum NetworkPhase : byte

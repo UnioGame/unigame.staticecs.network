@@ -90,14 +90,26 @@ namespace UniGame.StaticEcs.Network
 
         private sealed class SnapshotDeltaAttributionAccumulator
         {
-            internal static readonly SnapshotDeltaAttributionAccumulator Disabled =
-                new SnapshotDeltaAttributionAccumulator(null);
+            // One reusable instance per thread keeps unattributed encodes allocation-free.
+            [ThreadStatic]
+            private static SnapshotDeltaAttributionAccumulator t_unattributed;
             private readonly NetworkSnapshot _target;
             private long _attributedRecordBytes;
+            private int _adds;
+            private int _removes;
+            private int _patches;
 
             internal SnapshotDeltaAttributionAccumulator(NetworkSnapshot target)
             {
                 _target = target;
+            }
+
+            internal static SnapshotDeltaAttributionAccumulator Unattributed()
+            {
+                var accumulator = t_unattributed ??=
+                    new SnapshotDeltaAttributionAccumulator(null);
+                accumulator.Reset();
+                return accumulator;
             }
 
             internal void Record(ulong gid, long start, long end)
@@ -106,12 +118,29 @@ namespace UniGame.StaticEcs.Network
                     _attributedRecordBytes += end - start;
             }
 
-            internal void Reset() => _attributedRecordBytes = 0;
+            internal void Count(EntityOperation operation)
+            {
+                if (operation == EntityOperation.Add)
+                    _adds++;
+                else if (operation == EntityOperation.Remove)
+                    _removes++;
+                else
+                    _patches++;
+            }
+
+            internal void Reset()
+            {
+                _attributedRecordBytes = 0;
+                _adds = 0;
+                _removes = 0;
+                _patches = 0;
+            }
 
             internal SnapshotDeltaAttribution Complete(long encodedSnapshotBytes) =>
                 new SnapshotDeltaAttribution(_attributedRecordBytes,
                     encodedSnapshotBytes, _attributedRecordBytes >= 0 &&
-                    _attributedRecordBytes <= encodedSnapshotBytes);
+                    _attributedRecordBytes <= encodedSnapshotBytes,
+                    _adds, _removes, _patches);
         }
 
         internal static bool TryEncode(NetworkBufferPool pool,
@@ -149,7 +178,7 @@ namespace UniGame.StaticEcs.Network
                     var writer = new SnapshotWriter(candidate.WritableSpan);
                     var accumulator = target.HasAttributedEntities
                         ? new SnapshotDeltaAttributionAccumulator(target)
-                        : SnapshotDeltaAttributionAccumulator.Disabled;
+                        : SnapshotDeltaAttributionAccumulator.Unattributed();
                     if (!TryEncodePlan(baseline, target, hooks, candidate, accumulator,
                             ref writer, out _) ||
                         writer.Length >= target.ByteLength)
@@ -278,8 +307,7 @@ namespace UniGame.StaticEcs.Network
                 snapshot.EntityCount > ProtocolLimits.MaxEntities ||
                 snapshot.RecordCount < 0 ||
                 snapshot.RecordCount > ProtocolLimits.MaxEntities *
-                    ProtocolLimits.MaxRecordsPerEntity ||
-                Hashing.XxHash64(snapshot.Bytes.Span) != snapshot.PayloadHash)
+                    ProtocolLimits.MaxRecordsPerEntity)
                 return false;
 
             var indexBytes = checked((long)snapshot.EntityCount *
@@ -635,6 +663,7 @@ namespace UniGame.StaticEcs.Network
                     if (op.TargetIndex >= 0)
                         attribution.Record(targetEntities[op.TargetIndex].Gid,
                             operationStart, writer.Length);
+                    attribution.Count((EntityOperation)op.Opcode);
                     operations++;
                 }
 
@@ -685,6 +714,7 @@ namespace UniGame.StaticEcs.Network
                     if (!TryWriteVarUInt(ref writer, pendingSkip) ||
                         !writer.TryWriteByte((byte)EntityOperation.Remove))
                         return false;
+                    attribution.Count(EntityOperation.Remove);
                     pendingSkip = 0;
                     operationCount++;
                     baselineIndex++;
@@ -701,6 +731,7 @@ namespace UniGame.StaticEcs.Network
                             added.RawLength)))
                         return false;
                     attribution.Record(added.Gid, operationStart, writer.Length);
+                    attribution.Count(EntityOperation.Add);
                     pendingSkip = 0;
                     operationCount++;
                     targetIndex++;
@@ -721,6 +752,7 @@ namespace UniGame.StaticEcs.Network
                         return false;
                     attribution.Record(targetEntities[targetIndex].Gid,
                         operationStart, writer.Length);
+                    attribution.Count(EntityOperation.PatchFull);
                     operationCount++;
                 }
                 else
@@ -1074,6 +1106,7 @@ namespace UniGame.StaticEcs.Network
                     if (!TryWriteVarUInt(ref writer, pendingSkip) ||
                         !writer.TryWriteByte((byte)EntityOperation.Remove))
                         return false;
+                    attribution.Count(EntityOperation.Remove);
                     pendingSkip = 0;
                     operationCount++;
                     if (!TryMoveNext(ref baselineCursor, out baselineEntity,
@@ -1089,6 +1122,7 @@ namespace UniGame.StaticEcs.Network
                         !writer.TryWrite(targetEntity.Raw))
                         return false;
                     attribution.Record(targetEntity.Gid, operationStart, writer.Length);
+                    attribution.Count(EntityOperation.Add);
                     pendingSkip = 0;
                     operationCount++;
                     if (!TryMoveNext(ref targetCursor, out targetEntity,
@@ -1108,6 +1142,7 @@ namespace UniGame.StaticEcs.Network
                             ref writer))
                         return false;
                     attribution.Record(targetEntity.Gid, operationStart, writer.Length);
+                    attribution.Count(EntityOperation.PatchFull);
                     operationCount++;
                 }
                 else
@@ -1487,6 +1522,91 @@ namespace UniGame.StaticEcs.Network
         internal static int MaskByteCount(int recordCount) =>
             (2 * (recordCount + 1) + 7) / 8;
 
+        // The skip count of an operation and its opcode.
+        private const int OperationFramingBytes = 2;
+
+        /// <summary>The least <see cref="MeasureEntityPatch"/> returns: the operation framing and a one-byte mask.</summary>
+        internal const int MinimumEntityPatchBytes = OperationFramingBytes + 1;
+        // Type id and schema kind, the pair RecordSequenceMatchesIndexed compares.
+        private const int RecordIdentityBytes = sizeof(uint) + sizeof(byte);
+        private const int MeasureScratchBytes = 256;
+
+        /// <summary>
+        /// Bytes one changed entity adds to a delta whose baseline holds
+        /// <paramref name="baseline"/> for it: the skip count and opcode, then what
+        /// <c>TryWritePatchFastIndexed</c> writes. An entity whose record sequence differs is
+        /// measured as its whole block.
+        /// </summary>
+        internal static int MeasureEntityPatch(ReadOnlySpan<byte> baseline,
+            ReadOnlySpan<byte> target, NetworkComponentDeltaHooks hooks)
+        {
+            var whole = target.Length + OperationFramingBytes;
+            if (baseline.Length < EntityHeaderSize || target.Length < EntityHeaderSize)
+                return whole;
+            var count = ReadRecordCount(target);
+            if (count != ReadRecordCount(baseline))
+                return whole;
+
+            var bytes = OperationFramingBytes + MaskByteCount(count);
+            Span<byte> scratch = stackalloc byte[MeasureScratchBytes];
+            var baselineCursor = EntityHeaderSize;
+            var targetCursor = EntityHeaderSize;
+            for (var i = 0; i < count; i++)
+            {
+                if (!TryMeasureRawRecord(baseline, baselineCursor, out var baselineLength) ||
+                    !TryMeasureRawRecord(target, targetCursor, out var targetLength) ||
+                    !baseline.Slice(baselineCursor, RecordIdentityBytes)
+                        .SequenceEqual(target.Slice(targetCursor, RecordIdentityBytes)))
+                    return whole;
+                var targetRecord = target.Slice(targetCursor, targetLength);
+                if (!targetRecord.SequenceEqual(baseline.Slice(baselineCursor, baselineLength)))
+                {
+                    var payload = targetRecord.Slice(RecordHeaderSize);
+                    var sent = payload.Length;
+                    var tagged = hooks.TryGet(Hashing.Read32(target, targetCursor), out var hook);
+                    if (tagged && payload.Length <= MeasureScratchBytes)
+                    {
+                        var deltaLength = hook.TryWriteValueDelta(
+                            baseline.Slice(baselineCursor + RecordHeaderSize,
+                                baselineLength - RecordHeaderSize),
+                            payload, scratch.Slice(0, payload.Length));
+                        if (deltaLength >= 0 && deltaLength < payload.Length)
+                            sent = deltaLength;
+                    }
+                    bytes += VarUIntBytes(tagged ? (uint)sent << 1 : (uint)sent) + sent;
+                }
+                baselineCursor += baselineLength;
+                targetCursor += targetLength;
+            }
+            return baselineCursor == baseline.Length && targetCursor == target.Length
+                ? bytes
+                : whole;
+        }
+
+        private static int ReadRecordCount(ReadOnlySpan<byte> entity) =>
+            entity[EntityHeaderSize - 2] | entity[EntityHeaderSize - 1] << 8;
+
+        private static bool TryMeasureRawRecord(ReadOnlySpan<byte> bytes, int offset,
+            out int length)
+        {
+            length = 0;
+            if (bytes.Length - offset < RecordHeaderSize)
+                return false;
+            var payload = Hashing.Read32(bytes, offset + RecordHeaderSize - sizeof(uint));
+            if (payload > (uint)(bytes.Length - offset - RecordHeaderSize))
+                return false;
+            length = RecordHeaderSize + (int)payload;
+            return true;
+        }
+
+        private static int VarUIntBytes(uint value)
+        {
+            var bytes = 1;
+            while ((value >>= 7) != 0)
+                bytes++;
+            return bytes;
+        }
+
         private static bool GetBit(ReadOnlySpan<byte> mask, int bitIndex) =>
             (mask[bitIndex >> 3] & (1 << (bitIndex & 7))) != 0;
 
@@ -1668,7 +1788,11 @@ namespace UniGame.StaticEcs.Network
             return true;
         }
 
-        private static int CompareGid(ulong leftRaw, ulong rightRaw)
+        internal static uint ReadEntityKind(ReadOnlySpan<byte> bytes,
+            in SnapshotEntityLayout entity) =>
+            Hashing.Read32(bytes, entity.RawOffset + sizeof(ulong));
+
+        internal static int CompareGid(ulong leftRaw, ulong rightRaw)
         {
             var left = new EntityGID(leftRaw);
             var right = new EntityGID(rightRaw);
